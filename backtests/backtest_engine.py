@@ -41,9 +41,8 @@ def run_sma_crossover_strategy(df, fast_window=10, slow_window=30):
     df.loc[df['SMA_Fast'] > df['SMA_Slow'], 'Signal'] = 1
     df.loc[df['SMA_Fast'] < df['SMA_Slow'], 'Signal'] = -1
     
-    df['Position'] = df['Signal'].diff()
     df['Returns'] = df['Close'].pct_change()
-    df['Strategy_Returns'] = df['Position'].shift(1) * df['Returns']
+    df['Strategy_Returns'] = df['Signal'].shift(1) * df['Returns']
     
     strategy_returns = df['Strategy_Returns'].dropna()
     return calculate_metrics(strategy_returns)

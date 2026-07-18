@@ -12,7 +12,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-BASE_DIR = Path("/opt/data/sandbox-alpha")
+BASE_DIR = Path(__file__).resolve().parent  # リポジトリ相対パス
 RESULTS_DIR = BASE_DIR / "results"
 STRATEGIES_DIR = BASE_DIR / "strategies"
 KNOWLEDGE_FILE = BASE_DIR / "knowledge.json"
@@ -60,7 +60,7 @@ def load_knowledge():
     """過去の戦略テスト結果を読み込む"""
     if KNOWLEDGE_FILE.exists():
         return json.loads(KNOWLEDGE_FILE.read_text())
-    return {"tested": [], "adopted": [], "rejected": [], "iterations": 0}
+    return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [], "iterations": 0}
 
 
 def save_knowledge(knowledge):
@@ -71,24 +71,96 @@ def save_knowledge(knowledge):
 def generate_hypothesis(knowledge):
     """
     仮説生成フェーズ
-    ナレッジベースを参照して、まだ試していない戦略パラメータを生成
+    ナレッジベースを参照して、まだ試していない戦略パラメータを生成。
+    既にテスト済みの(strategy, symbol, params)の組み合わせはスキップ。
+    30%の確率でadopted戦略のパラメータ近傍を探索する。
     """
+    max_attempts = 50  # 重複回避の試行上限
+
+    for _ in range(max_attempts):
+        # 30%の確率で adopted 戦略の近傍を探索
+        if knowledge.get("adopted") and random.random() < 0.3:
+            adopted = random.choice(knowledge["adopted"])
+            adopted_params = adopted["hypothesis"]["params"]
+            strategy_name = adopted["hypothesis"]["strategy"]
+            symbol = adopted["hypothesis"]["symbol"]
+            template = STRATEGY_TEMPLATES[strategy_name]
+
+            # adoptedパラメータの近傍を生成
+            params = {}
+            for param_name, param_space in template["param_space"].items():
+                base_val = adopted_params.get(param_name)
+                if base_val is None:
+                    if isinstance(param_space, range):
+                        params[param_name] = random.choice(list(param_space))
+                    else:
+                        params[param_name] = random.choice(param_space)
+                elif isinstance(param_space, range):
+                    # 近傍 ±30% の範囲でサンプリング
+                    offset = int(base_val * random.uniform(-0.3, 0.3))
+                    candidate = base_val + offset
+                    params[param_name] = max(param_space.start, min(param_space.stop - 1, candidate))
+                else:
+                    # リストの場合はランダムにずらす
+                    idx = param_space.index(base_val) if base_val in param_space else len(param_space) // 2
+                    offset = random.randint(-2, 2)
+                    new_idx = max(0, min(len(param_space) - 1, idx + offset))
+                    params[param_name] = param_space[new_idx]
+        else:
+            strategy_name = random.choice(list(STRATEGY_TEMPLATES.keys()))
+            template = STRATEGY_TEMPLATES[strategy_name]
+            symbol = random.choice(SYMBOL_POOL)
+
+            # パラメータをランダムサンプリング
+            params = {}
+            for param_name, param_space in template["param_space"].items():
+                if isinstance(param_space, range):
+                    params[param_name] = random.choice(list(param_space))
+                else:
+                    params[param_name] = random.choice(param_space)
+
+        # 追加制約: SMA crossoverでは fast < slow
+        if strategy_name == "sma_crossover":
+            params["fast_window"] = min(params["fast_window"], params["slow_window"] - 5)
+
+        # 重複チェック: 既にテスト済みの(strategy, symbol, params)はスキップ
+        duplicate = False
+        for tested in knowledge.get("tested_combinations", []):
+            if (tested["strategy"] == strategy_name and
+                tested["symbol"] == symbol and
+                tested["params"] == params):
+                duplicate = True
+                break
+        if duplicate:
+            continue
+
+        hypothesis = {
+            "id": f"hyp_{int(time.time())}_{random.randint(1000,9999)}",
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "params": params,
+            "description": f"{template['description']} on {symbol}",
+            "generated_at": datetime.now().isoformat()
+        }
+
+        print(f"  💡 仮説: {hypothesis['description']}")
+        print(f"     パラメータ: {params}")
+        return hypothesis
+
+    # 全組み合わせ枯渇時のフォールバック（重複許容）
     strategy_name = random.choice(list(STRATEGY_TEMPLATES.keys()))
     template = STRATEGY_TEMPLATES[strategy_name]
     symbol = random.choice(SYMBOL_POOL)
-    
-    # パラメータをランダムサンプリング
     params = {}
     for param_name, param_space in template["param_space"].items():
         if isinstance(param_space, range):
             params[param_name] = random.choice(list(param_space))
         else:
             params[param_name] = random.choice(param_space)
-    
-    # 追加制約: SMA crossoverでは fast < slow
+
     if strategy_name == "sma_crossover":
         params["fast_window"] = min(params["fast_window"], params["slow_window"] - 5)
-    
+
     hypothesis = {
         "id": f"hyp_{int(time.time())}_{random.randint(1000,9999)}",
         "strategy": strategy_name,
@@ -97,7 +169,7 @@ def generate_hypothesis(knowledge):
         "description": f"{template['description']} on {symbol}",
         "generated_at": datetime.now().isoformat()
     }
-    
+    print(f"  ⚠️ 全組み合わせ枯渇、重複許容で仮説生成")
     print(f"  💡 仮説: {hypothesis['description']}")
     print(f"     パラメータ: {params}")
     return hypothesis
@@ -113,7 +185,7 @@ def run_backtest(hypothesis):
     params = hypothesis["params"]
     
     cmd = [
-        "/opt/data/sandbox-alpha/.venv/bin/python3",
+        sys.executable,
         str(BASE_DIR / "backtests" / "backtest_engine.py"),
         strategy, symbol
     ]
@@ -275,6 +347,11 @@ def run_loop(num_iterations=3):
             knowledge["rejected"].append(record)
         
         knowledge["tested"].append(hypothesis["id"])
+        knowledge["tested_combinations"].append({
+            "strategy": hypothesis["strategy"],
+            "symbol": hypothesis["symbol"],
+            "params": hypothesis["params"]
+        })
         save_knowledge(knowledge)
         
         # 少し待機（APIレート制限対策）
