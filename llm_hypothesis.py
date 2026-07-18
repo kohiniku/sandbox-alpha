@@ -81,15 +81,20 @@ def _build_prompt(knowledge, templates):
 Current Knowledge Base:
 {knowledge_text}
 
-Already-Tested Combinations:
+Already-Tested Combinations (exact duplicates to avoid):
 {avoid_text}
 
 Your task: propose exactly ONE new hypothesis. It must use one of the strategies above,
 with parameters strictly within the specified ranges/lists. The symbol must be a valid
 ticker like AAPL, MSFT, SPY, BTC-USD, etc.
 
+CRITICAL: Prefer hypotheses that respond to WHY previous ones failed:
+- Holdout failures → suspect overfitting; try a different symbol or strategy family.
+- Validation/drawdown failures → try lower-risk parameter regions (longer windows, smaller thresholds).
+- EXHAUSTED families → do NOT propose params near those already-attempted ranges.
+
 Return ONLY this strict JSON (no other text):
-{{"strategy": "<name>", "symbol": "<TICKER>", "params": {{...}}, "rationale": "one sentence explaining why"}}"""
+{{"strategy": "<name>", "symbol": "<TICKER>", "params": {{...}}, "rationale": "one sentence explaining why this addresses past failures or explores new ground"}}"""
 
     return [
         {"role": "system", "content": system_prompt},
@@ -111,35 +116,77 @@ def _describe_param_space(param_space):
 
 
 def _build_knowledge_summary(knowledge):
-    """Build a compact summary of the knowledge base for the prompt."""
+    """Build a compact summary: families table + last 5 adopted + last 5 rejected with gate reasons."""
     lines = []
 
-    # Adopted strategies
+    # --- Families table (ALL families, no window) ---
+    families = knowledge.get("families", {})
+    if families:
+        lines.append("Family aggregates (ALL):")
+        for fam_key, fam in sorted(families.items()):
+            strategy, symbol = fam_key.split("|", 1)
+            n = fam.get("n_trials", 0)
+            best_sharpe = fam.get("best_val_sharpe", -999)
+            gf = fam.get("gate_failures", {})
+            v = gf.get("validation", 0)
+            d = gf.get("deflation", 0)
+            h = gf.get("holdout", 0)
+            dc = gf.get("duplicate_cluster", 0)
+            ec = gf.get("exhausted_cluster", 0)
+            total_fails = v + d + h + dc + ec
+            exhausted_marker = ""
+            if n >= 3 and best_sharpe < 0:
+                exhausted_marker = " EXHAUSTED — do not propose params near previous attempts"
+            lines.append(
+                f"  {strategy} on {symbol}: {n} trials, best val Sharpe {best_sharpe:.2f}, "
+                f"failures: validation={v} deflation={d} holdout={h}{exhausted_marker}"
+            )
+    else:
+        lines.append("Family aggregates: none yet")
+
+    # --- Adopted (last 5) ---
     adopted = knowledge.get("adopted", [])
     if adopted:
-        lines.append(f"Adopted ({len(adopted)}):")
-        for a in adopted[-5:]:  # last 5
+        lines.append(f"Adopted ({len(adopted)}, showing last 5):")
+        for a in adopted[-5:]:
             hyp = a.get("hypothesis", {})
             ev = a.get("evaluation", {})
             lines.append(
                 f"  - {hyp.get('strategy')} on {hyp.get('symbol')} "
                 f"params={json.dumps(hyp.get('params', {}))} | "
-                f"Sharpe={ev.get('sharpe_ratio', '?'):.2f}, Return={ev.get('total_return_pct', '?'):.1f}%"
+                f"Val Sharpe={ev.get('sharpe_ratio', '?'):.2f}, "
+                f"Holdout Sharpe={ev.get('holdout_sharpe', '?'):.2f}"
             )
     else:
         lines.append("Adopted: none yet")
 
-    # Rejected (last ~15)
+    # --- Rejected (last 5) WITH gate reasons ---
     rejected = knowledge.get("rejected", [])
     if rejected:
-        lines.append(f"Rejected ({len(rejected)}, showing last 15):")
-        for r in rejected[-15:]:
+        lines.append(f"Rejected ({len(rejected)}, showing last 5 with failure gates):")
+        for r in rejected[-5:]:
             hyp = r.get("hypothesis", {})
             ev = r.get("evaluation", {})
+            gate = ev.get("gate_results", {})
+            val_sharpe = ev.get("sharpe_ratio", "?")
+            holdout_sharpe = ev.get("holdout_sharpe", "?")
+            # Build gate-reason string
+            gate_parts = []
+            if not gate.get("validation", True):
+                gate_parts.append(f"validation failed (val Sharpe {val_sharpe})")
+            elif not gate.get("holdout", True):
+                gate_parts.append(f"holdout failed (val Sharpe {val_sharpe} passed, holdout Sharpe {holdout_sharpe} failed)")
+            elif gate.get("cluster") == "duplicate_cluster":
+                gate_parts.append(f"duplicate_cluster (holdout Sharpe {holdout_sharpe} ≤ incumbent)")
+            elif gate.get("cluster") == "exhausted_cluster":
+                gate_parts.append("exhausted_cluster (pre-block skip)")
+            else:
+                gate_parts.append(f"unknown gate (val Sharpe {val_sharpe})")
+            gate_str = ", ".join(gate_parts)
             lines.append(
                 f"  - {hyp.get('strategy')} on {hyp.get('symbol')} "
                 f"params={json.dumps(hyp.get('params', {}))} | "
-                f"Sharpe={ev.get('sharpe_ratio', '?'):.2f}, Return={ev.get('total_return_pct', '?'):.1f}%"
+                f"rejected at: {gate_str}"
             )
     else:
         lines.append("Rejected: none yet")
