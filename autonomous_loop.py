@@ -120,8 +120,124 @@ def load_knowledge():
         data = json.loads(KNOWLEDGE_FILE.read_text())
         # 後方互換: 古いナレッジファイルに不足キーを補完
         data.setdefault("tested_combinations", [])
+        data.setdefault("superseded", [])
+        # Migration: rebuild "families" from history if missing
+        if "families" not in data:
+            data["families"] = _rebuild_families_from_history(data)
+            # persist the rebuilt families immediately so the migration is idempotent
+            KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2, default=str))
         return data
-    return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [], "iterations": 0}
+    return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
+            "superseded": [], "families": {}, "iterations": 0}
+
+
+def _rebuild_families_from_history(knowledge):
+    """One-time idempotent rebuild of families aggregate from full history."""
+    families = {}
+    all_entries = (
+        knowledge.get("adopted", []) +
+        knowledge.get("rejected", []) +
+        knowledge.get("superseded", [])
+    )
+    for entry in all_entries:
+        hyp = entry.get("hypothesis", {})
+        key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""))
+        if not hyp.get("strategy") or not hyp.get("symbol"):
+            continue
+        families.setdefault(key, {
+            "n_trials": 0,
+            "best_val_sharpe": -999.0,
+            "best_params": {},
+            "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
+                              "duplicate_cluster": 0, "exhausted_cluster": 0},
+            "last_tried": ""
+        })
+        _apply_entry_to_family(families, key, entry, hyp)
+    return families
+
+
+def _family_key(strategy, symbol):
+    return f"{strategy}|{symbol}"
+
+
+def _apply_entry_to_family(families, key, entry, hyp):
+    """Incrementally update a single family aggregate record from one evaluation entry."""
+    fam = families.setdefault(key, {
+        "n_trials": 0,
+        "best_val_sharpe": -999.0,
+        "best_params": {},
+        "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
+                          "duplicate_cluster": 0, "exhausted_cluster": 0},
+        "last_tried": ""
+    })
+    fam["n_trials"] += 1
+    ev = entry.get("evaluation", {})
+    val_sharpe = ev.get("sharpe_ratio", -999)
+    if val_sharpe > fam["best_val_sharpe"]:
+        fam["best_val_sharpe"] = val_sharpe
+        fam["best_params"] = hyp.get("params", {})
+    tested_at = entry.get("tested_at", "")
+    if tested_at > fam["last_tried"]:
+        fam["last_tried"] = tested_at
+    # Tally gate failures
+    gate_results = ev.get("gate_results", {})
+    if not gate_results:
+        return
+    # Determine why it was rejected (or if it passed everything)
+    verdict = ev.get("verdict", entry.get("verdict", ""))
+    if verdict == "adopted":
+        return  # adopted entries don't count as gate failures
+    # Count individual gate failures
+    if not gate_results.get("validation", True):
+        fam["gate_failures"]["validation"] += 1
+    elif not gate_results.get("holdout", True):
+        fam["gate_failures"]["holdout"] += 1
+    elif gate_results.get("cluster") == "duplicate_cluster":
+        fam["gate_failures"]["duplicate_cluster"] += 1
+    elif gate_results.get("cluster") == "exhausted_cluster":
+        fam["gate_failures"]["exhausted_cluster"] += 1
+    # deflation gate is informational — count if explicitly failed
+    if not gate_results.get("deflation", True):
+        fam["gate_failures"]["deflation"] += 1
+
+
+def update_family_aggregates(knowledge, record):
+    """Update families dict after every evaluation (adopted and rejected both count)."""
+    hyp = record.get("hypothesis", {})
+    key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""))
+    if not hyp.get("strategy") or not hyp.get("symbol"):
+        return
+    families = knowledge.setdefault("families", {})
+    _apply_entry_to_family(families, key, record, hyp)
+
+
+def _check_exhausted_cluster(hypothesis, knowledge):
+    """Pre-backtest check: if >=3 rejected entries in the same param cluster
+    and best val Sharpe among them < 0, skip the backtest entirely.
+    Returns (is_exhausted: bool, member_count: int, best_sharpe: float)."""
+    strategy = hypothesis["strategy"]
+    symbol = hypothesis["symbol"]
+    params = hypothesis["params"]
+
+    matching = []
+    for entry in knowledge.get("rejected", []):
+        eh = entry.get("hypothesis", {})
+        if eh.get("strategy") != strategy or eh.get("symbol") != symbol:
+            continue
+        if _params_within_cluster(params, eh.get("params", {}), STRATEGY_TEMPLATES):
+            matching.append(entry)
+
+    if len(matching) < 3:
+        return False, len(matching), None
+
+    best_sharpe = max(
+        (e.get("evaluation", {}).get("sharpe_ratio", -999) for e in matching),
+        default=-999
+    )
+    if best_sharpe >= 0:
+        return False, len(matching), best_sharpe
+
+    return True, len(matching), best_sharpe
 
 
 def save_knowledge(knowledge):
@@ -595,10 +711,36 @@ def run_loop(num_iterations=3):
             hypothesis = generate_hypothesis(knowledge)
             source_label = "(random)"
         
-        # 2. バックテスト実行
+        # 2. Exhausted-cluster pre-block check
+        exhausted, n_failures, best_fail_sharpe = _check_exhausted_cluster(hypothesis, knowledge)
+        if exhausted:
+            print(f"  ⛔ 枯渇クラスタ ({n_failures} failures, best Sharpe {best_fail_sharpe:.2f}) → バックテスト省略")
+            evaluation = {
+                "verdict": "rejected",
+                "sharpe_ratio": best_fail_sharpe,
+                "total_return_pct": -999,
+                "max_drawdown_pct": -999,
+                "reasons": [f"⛔ Exhausted cluster: {n_failures} nearby failures, best val Sharpe {best_fail_sharpe:.2f} < 0"],
+                "gate_results": {"validation": False, "cluster": "exhausted_cluster"},
+                "effective_min_sharpe": 0,
+            }
+            verdict = "rejected"
+            record = save_result(hypothesis, {"error": "exhausted_cluster_pre_block"}, verdict, evaluation)
+            knowledge["tested"].append(hypothesis["id"])
+            knowledge["tested_combinations"].append({
+                "strategy": hypothesis["strategy"],
+                "symbol": hypothesis["symbol"],
+                "params": hypothesis["params"]
+            })
+            knowledge["rejected"].append(record)
+            update_family_aggregates(knowledge, record)
+            save_knowledge(knowledge)
+            continue
+
+        # 3. バックテスト実行
         result = run_backtest(hypothesis)
         
-        # 3. 評価
+        # 4. 評価
         verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
         
         print(f"  📋 判定: {verdict.upper()}")
@@ -606,7 +748,7 @@ def run_loop(num_iterations=3):
             for reason in evaluation["reasons"]:
                 print(f"     {reason}")
         
-        # 4. 蓄積
+        # 5. 蓄積
         record = save_result(hypothesis, result, verdict, evaluation)
         
         if verdict == "adopted":
@@ -614,6 +756,8 @@ def run_loop(num_iterations=3):
             knowledge["adopted"].append(record)
         else:
             knowledge["rejected"].append(record)
+        
+        update_family_aggregates(knowledge, record)
         
         knowledge["tested"].append(hypothesis["id"])
         knowledge["tested_combinations"].append({
@@ -664,8 +808,10 @@ def run_revalidation(knowledge):
             demoted += 1
             entry["verdict"] = "rejected"
             entry["evaluation"] = {"verdict": "rejected", "error": result["error"],
-                                   "reasons": [f"revalidation_failed: {result['error']}"]}
+                                   "reasons": [f"revalidation_failed: {result['error']}"],
+                                   "gate_results": {}}
             knowledge["rejected"].append(entry)
+            update_family_aggregates(knowledge, entry)
             continue
 
         # Re-evaluate with current gates
@@ -688,6 +834,7 @@ def run_revalidation(knowledge):
             entry["rejected_reason"] = "revalidation_failed"
             knowledge["rejected"].append(entry)
             demoted += 1
+        update_family_aggregates(knowledge, entry)
 
     knowledge["adopted"] = survivors
     save_knowledge(knowledge)

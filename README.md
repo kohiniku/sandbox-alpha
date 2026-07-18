@@ -198,6 +198,41 @@ effective_min_sharpe = max(0.5, √(2 × ln(max(N, 2))) × √(252 / T_val))
 
 **再検証モード**: `python3 autonomous_loop.py --revalidate` で全採用戦略を最新パイプラインで再評価し、不合格のものを降格する。
 
+#### 失敗知識の蒸留 (Failure Knowledge Distillation)
+
+過去の失敗から学習し、LLM仮説生成にフィードバックする仕組み。単純な直近N件の表示では時間経過で古い失敗が流れてしまう問題を解決する。
+
+**4. Family Aggregates（戦略×銘柄の集計）**
+
+各 `(strategy, symbol)` の組み合わせ（family）ごとに累積統計を `knowledge.json` の `families` キーに保持：
+
+- `n_trials`: 試行回数
+- `best_val_sharpe`: 最高の validation Sharpe
+- `best_params`: 最高スコア時のパラメータ
+- `gate_failures`: ゲート別の失敗回数（validation / holdout / duplicate_cluster / exhausted_cluster）
+- `last_tried`: 最終試行日時
+
+採用・棄却を問わず、全評価後にインクリメンタルに更新。初回起動時に `families` が存在しない場合は全履歴から自動再構築（マイグレーション）。
+
+**5. Exhausted-Cluster Pre-Block（枯渇クラスタの事前遮断）**
+
+バックテスト実行前に、同一クラスタ（パラメータが ±15% 以内 / リスト1ステップ以内）の棄却履歴を確認。以下の条件を**両方**満たす場合、バックテストを省略して即座に棄却：
+
+- 同一クラスタ内の棄却エントリが 3 件以上
+- その中での最高 validation Sharpe が 0 未満
+
+該当時は `⛔ 枯渇クラスタ (N failures, best Sharpe X.XX) → バックテスト省略` をログ出力し、`exhausted_cluster` として記録。LLM生成・ランダム生成の両方に適用。
+
+**6. Distilled LLM Prompt（蒸留プロンプト）**
+
+`llm_hypothesis.py` のプロンプトを改良し、以下の情報をLLMに提供：
+
+- **Familyテーブル（全件・無制限）**: 各 family の試行回数・最高Sharpe・ゲート別失敗数。3件以上失敗かつ最高Sharpe < 0 の family には `EXHAUSTED — do not propose params near previous attempts` マーカー
+- **直近5件の棄却理由（ゲート付き）**: `rejected at: holdout (val Sharpe 1.4 passed, holdout Sharpe -0.2 failed)` のように、どのゲートで落ちたか明示
+- **学習指示**: `Prefer hypotheses that respond to WHY previous ones failed` — holdout失敗なら別銘柄・別戦略、validation失敗なら低リスク領域を探索するよう誘導
+
+従来の「直近15件の棄却」や「直近30件の重複回避」を置き換え、LLMが蓄積された失敗知識から学習できるようにする。
+
 ---
 
 ## 🔬 実験結果（2026-07-17時点）
