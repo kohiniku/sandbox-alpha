@@ -65,6 +65,27 @@ python3 backtests/backtest_engine.py \
   --params '{"fast_window": 10, "slow_window": 30}'
 ```
 
+### 結果レポート生成
+
+`report.py` で knowledge.json と results/ から Markdown レポートを生成できます：
+
+```bash
+# 標準出力に表示
+python3 report.py
+
+# ファイルに出力
+python3 report.py --output report.md
+
+# 直近20件の履歴 + タイトル付き
+python3 report.py --recent 20 --title "週次レポート"
+```
+
+レポート内容：
+- 採用/棄却サマリー（件数・採用率）
+- 戦略別・銘柄別の集計表（平均Sharpe・平均Return）
+- 上位採用戦略の IS/OOS 指標比較
+- 直近N件のテスト履歴
+
 ### 出力例
 
 ```
@@ -101,6 +122,7 @@ sandbox-alpha/
 ├── .gitignore                   # gitignore
 │
 ├── autonomous_loop.py           # メインPDCAループ
+├── report.py                    # 結果レポート生成
 ├── knowledge.json               # ナレッジベース（自動生成）
 │
 ├── backtests/
