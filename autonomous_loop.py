@@ -45,7 +45,15 @@ STRATEGY_TEMPLATES = {
             "lookback": range(5, 60),
             "hold_period": range(1, 20)
         }
-    }
+    },
+    "rsi": {
+        "description": "RSI平均回帰",
+        "param_space": {
+            "rsi_window": range(7, 28),
+            "oversold": [20, 25, 30, 35],
+            "overbought": [65, 70, 75, 80]
+        }
+    },
 }
 
 # 採用閾値
