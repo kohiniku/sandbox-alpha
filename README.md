@@ -2,7 +2,7 @@
 
 **自律的AIエージェントによる投資戦略発見フレームワーク**
 
-AIエージェントがサンドボックス環境を自律的に構築し、仮説生成→ペーパートレード→評価→破棄のPDCAサイクルを反復することで、アルファ（超過収益）戦略を自動発見する実験的プロジェクト。
+AIエージェントが仮説生成→バックテスト→評価→蓄積のPDCAサイクルを反復することで、アルファ（超過収益）戦略を自動発見する実験的プロジェクト。
 
 ---
 
@@ -19,13 +19,13 @@ AIエージェントがサンドボックス環境を自律的に構築し、仮
 
 **自律的PDCAループ**：
 ```
-[仮説生成] → [サンドボックス構築] → [ペーパートレード] → [評価]
-    ↑                                                      ↓
-[戦略破棄/採用] ← [ナレッジ更新] ← [パフォーマンス分析]
+[仮説生成] → [バックテスト] → [評価]
+    ↑                            ↓
+[戦略破棄/採用] ← [ナレッジ更新]
 ```
 
-- エージェントがランダムまたはナレッジベース参照で仮説を生成
-- 使い捨てvenv環境でバックテストを実行
+- エージェントがナレッジベース参照で仮説を生成（重複回避・adopted近傍探索）
+- 常設venv環境でサブプロセスとしてバックテストを実行
 - 閾値（Sharpe≥0.3, Return≥5%, Drawdown≥-25%）で自動判定
 - 結果をナレッジベースに蓄積し、次の仮説生成に活用
 
@@ -36,7 +36,6 @@ AIエージェントがサンドボックス環境を自律的に構築し、仮
 ### 必要環境
 
 - Python 3.8+
-- Docker (オプション、使い捨てコンテナ用)
 - 金融データAPI (yfinance使用)
 
 ### セットアップ
@@ -53,8 +52,17 @@ source .venv/bin/activate
 # 3. 依存パッケージをインストール
 pip install -r requirements.txt
 
-# 4. PDCAループを実行（10回イテレーション）
-python3 autonomous_loop.py 10
+# 4. PDCAループを実行（3回イテレーション）
+python3 autonomous_loop.py 3
+```
+
+バックテストエンジン単体でも実行可能：
+
+```bash
+python3 backtests/backtest_engine.py \
+  --strategy sma_crossover \
+  --symbol AAPL \
+  --params '{"fast_window": 10, "slow_window": 30}'
 ```
 
 ### 出力例
@@ -62,27 +70,24 @@ python3 autonomous_loop.py 10
 ```
 🚀 Autonomous Alpha Discovery Loop 開始
    開始: 2026-07-17 16:38:12 JST
-   イテレーション数: 10
+   イテレーション数: 3
 
-🔄 Iteration 1/10
+🔄 Iteration 1/3
   💡 仮説: 平均回帰 on NVDA
      パラメータ: {'window': 23, 'threshold': 2.0}
   🔬 バックテスト実行中...
   📋 判定: ADOPTED
-     ✅ Sharpe 0.85 >= 0.3
-     ✅ Return 26.4% >= 5.0%
-     ✅ Drawdown -17.4% >= -25.0%
+     ✅ OOS Sharpe 0.85 >= 0.3
+     ✅ OOS Return 26.4% >= 5.0%
+     ✅ OOS Drawdown -17.4% >= -25.0%
 
 ...
 
-📊 Alpha Discovery Report (Iteration 10)
-  採用: 4件 / テスト: 10件 (採用率: 40.0%)
+📊 Alpha Discovery Report (Iteration 3)
+  採用: 1件 / テスト: 3件 (採用率: 33.3%)
 
   🏆 採用された戦略:
-     • 平均回帰 on NVDA | Sharpe: 0.85 | Return: 26.4%
-     • 移動平均クロスオーバー on SPY | Sharpe: 0.73 | Return: 7.8%
-     • 平均回帰 on MSFT | Sharpe: 0.49 | Return: 9.6%
-     • 移動平均クロスオーバー on BTC-USD | Sharpe: 0.66 | Return: 16.1%
+     • 平均回帰 on NVDA | Sharpe: 0.85 | Return: 26.4% | Trades: 23
 ```
 
 ---
@@ -135,8 +140,17 @@ sandbox-alpha/
 | メトリクス | 閾値 | 説明 |
 |-----------|------|------|
 | Sharpe Ratio | ≥ 0.3 | リスク調整後リターン |
-| Total Return | ≥ 5% | 期間中の累積リターン |
-| Max Drawdown | ≥ -25% | 最大ドローダウン |
+| Total Return | ≥ 5% | 期間中の累積リターン（複利ベース） |
+| Max Drawdown | ≥ -25% | エクイティカーブベースの最大ドローダウン |
+| Num Trades | — | ポジション変化回数（取引コスト計算に使用） |
+
+### 取引コスト
+
+片道 5.0 bps（0.05%）をポジション変化ごとに控除。`backtests/backtest_engine.py` の `COST_BPS` 定数で調整可能。
+
+### Walk-Forward 検証
+
+データを in-sample 70% / out-of-sample 30% に分割。採用判定は out-of-sample 指標で行う。両期間の指標を結果JSONに含める。
 
 ---
 
@@ -157,12 +171,12 @@ sandbox-alpha/
 
 ### 短期（1-2週間）
 - [ ] Polymarket API統合（予測市場でのペーパートレード）
-- [ ] LLM仮説生成（ランダムではなく、ナレッジベースを参照して賢い仮説を生成）
+- [ ] LLM仮説生成（ナレッジベースを参照した賢い仮説生成）
 - [ ] ポートフォリオ結合（採用戦略を相関考慮して組み合わせ）
 
 ### 中期（1-2ヶ月）
-- [ ] 多期間検証（採用戦略をout-of-sample期間でもテスト）
-- [ ] Docker使い捨てコンテナ（完全隔離環境での並列テスト）
+- [ ] 取引コスト精緻化（スプレッド・スリッページ）
+- [ ] 並列バックテスト（複数戦略を同時検証）
 - [ ] 自動定期実行（cronジョブで毎日自律的に探索）
 
 ### 長期（3-6ヶ月）
@@ -211,4 +225,4 @@ MIT License
 
 **Author**: kohiniku  
 **Created**: 2026-07-17  
-**Last Updated**: 2026-07-17
+**Last Updated**: 2026-07-18

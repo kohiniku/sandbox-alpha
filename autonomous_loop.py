@@ -59,7 +59,10 @@ THRESHOLDS = {
 def load_knowledge():
     """過去の戦略テスト結果を読み込む"""
     if KNOWLEDGE_FILE.exists():
-        return json.loads(KNOWLEDGE_FILE.read_text())
+        data = json.loads(KNOWLEDGE_FILE.read_text())
+        # 後方互換: 古いナレッジファイルに不足キーを補完
+        data.setdefault("tested_combinations", [])
+        return data
     return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [], "iterations": 0}
 
 
@@ -178,24 +181,22 @@ def generate_hypothesis(knowledge):
 def run_backtest(hypothesis):
     """
     バックテスト実行フェーズ
-    使い捨てvenvプロセスで戦略を検証
+    サブプロセスで戦略を検証（名前付き引数 + JSONパラメータ）
     """
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
     params = hypothesis["params"]
-    
+
     cmd = [
         sys.executable,
         str(BASE_DIR / "backtests" / "backtest_engine.py"),
-        strategy, symbol
+        "--strategy", strategy,
+        "--symbol", symbol,
+        "--params", json.dumps(params),
     ]
-    
-    # パラメータを追加
-    for val in params.values():
-        cmd.append(str(val))
-    
+
     print(f"  🔬 バックテスト実行中: {strategy} on {symbol}...")
-    
+
     try:
         result = subprocess.run(
             cmd, 
@@ -227,14 +228,24 @@ def run_backtest(hypothesis):
 def evaluate_result(hypothesis, result):
     """
     評価フェーズ
-    閾値に基づいて戦略の採否を判定
+    閾値に基づいて戦略の採否を判定。
+    walk-forward有効時は out-of-sample 指標で判定する。
     """
     if "error" in result:
         return "rejected", result["error"]
-    
-    sharpe = result.get("sharpe_ratio", -999)
-    total_return = result.get("total_return_pct", -999)
-    max_dd = result.get("max_drawdown_pct", -999)
+
+    # walk-forward有効時はOOS指標を使用
+    if result.get("walkforward", {}).get("enabled"):
+        metrics = result.get("out_of_sample", {})
+        is_metrics = result.get("in_sample", {})
+    else:
+        metrics = result
+        is_metrics = None
+
+    sharpe = metrics.get("sharpe_ratio", -999)
+    total_return = metrics.get("total_return_pct", -999)
+    max_dd = metrics.get("max_drawdown_pct", -999)
+    num_trades = metrics.get("num_trades", 0)
     
     reasons = []
     
@@ -266,8 +277,11 @@ def evaluate_result(hypothesis, result):
         "sharpe_ratio": sharpe,
         "total_return_pct": total_return,
         "max_drawdown_pct": max_dd,
-        "reasons": reasons
+        "num_trades": num_trades,
+        "reasons": reasons,
     }
+    if is_metrics:
+        evaluation["in_sample"] = is_metrics
     
     return verdict, evaluation
 
