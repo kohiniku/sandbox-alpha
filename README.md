@@ -189,16 +189,29 @@ sandbox-alpha/
 
 ---
 
-## 🚧 今後の拡張
+## 🔒 サンドボックス実行（Trusted Runner）
 
-### 次PR: Sandbox Isolation 🛡️
+LLM生成コードを安全に実行するための隔離実行モード。環境変数 `SANDBOX_RUNNER_URL` を設定すると、バックテストはローカルの subprocess ではなく、信頼済みの外部 sandbox-runner サービスに HTTP で委譲される。
 
-LLMによる戦略コード生成を安全に導入するための隔離実行基盤。
+```bash
+# サンドボックスモードで実行
+export SANDBOX_RUNNER_URL="http://sandbox-runner:8080"
+python3 autonomous_loop.py 10
+
+# 未設定の場合は従来の subprocess / venv 実行（開発・テスト用）
+python3 autonomous_loop.py 10
+```
+
+**仕組み**:
+- `autonomous_loop.py` の `run_backtest()` が `SANDBOX_RUNNER_URL` を検出すると、`urllib.request`（stdlibのみ）で `POST /run` を送信
+- sandbox-runner は strategy / symbol / params だけを受け取り、固定イメージを `--network=none --read-only --cap-drop=ALL` で起動
+- エージェント（Hermes）は Docker に一切アクセスしない ― データ送信のみ
+
 詳細は [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) の "Future Work: Sandbox Isolation" を参照。
 
-- 現状: 固定テンプレートのみ実行（任意コード実行なし）
-- 目標: docker-socket-proxy経由で隔離コンテナ実行（--read-only, --network=none）
-- LLM仮説生成は隔離実装後に導入
+---
+
+## 🚧 今後の拡張
 
 ### 短期（1-2週間）
 - [ ] Polymarket API統合（予測市場でのペーパートレード）
