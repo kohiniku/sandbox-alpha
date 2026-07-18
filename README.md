@@ -211,6 +211,29 @@ python3 autonomous_loop.py 10
 
 ---
 
+## 🧠 LLM仮説生成（データのみ・バリデーション付き）
+
+LLMによるインテリジェントな仮説生成モード。戦略テンプレートのパラメータ空間とナレッジベースをDeepSeek APIに送信し、未テストかつ有望なパラメータを提案させる。
+
+```bash
+# 環境変数で有効化
+export USE_LLM_HYPOTHESIS=1
+export DEEPSEEK_API_KEY="sk-..."
+python3 autonomous_loop.py 5
+```
+
+**動作**: LLMは戦略名・銘柄・パラメータ（データのみ）をJSONで返す。コードを出力することは一切ない。提案は厳格にバリデーションされ（戦略存在チェック、パラメータ範囲チェック、重複チェック）、失敗時は自動でランダム生成にフォールバック。
+
+**設定用環境変数**:
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `USE_LLM_HYPOTHESIS` | — | `1` でLLMパスを有効化 |
+| `HYPO_LLM_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI互換APIのベースURL |
+| `HYPO_LLM_MODEL` | `deepseek-v4-pro` | 使用するモデル名 |
+| `HYPO_LLM_API_KEY_ENV` | `DEEPSEEK_API_KEY` | APIキーを持つ環境変数名 |
+
+---
+
 ## 🚧 今後の拡張
 
 ### 短期（1-2週間）

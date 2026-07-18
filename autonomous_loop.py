@@ -383,14 +383,41 @@ def print_report(knowledge):
     print(f"{'='*60}\n")
 
 
+def _generate_with_llm_fallback(knowledge):
+    """
+    LLM-driven hypothesis generation with transparent fallback to random.
+    Returns (hypothesis, source_label) where source_label is "(llm)" or "(random)".
+    Never raises — always returns a valid hypothesis.
+    """
+    try:
+        from llm_hypothesis import generate as llm_generate
+        hypothesis = llm_generate(knowledge, STRATEGY_TEMPLATES)
+
+        # Duplicate check against already-tested combinations
+        for tested in knowledge.get("tested_combinations", []):
+            if (tested["strategy"] == hypothesis["strategy"] and
+                tested["symbol"] == hypothesis["symbol"] and
+                tested["params"] == hypothesis["params"]):
+                print(f"  ⚠️ LLM提案が既存と重複 → (random) にフォールバック")
+                return generate_hypothesis(knowledge), "(random)"
+
+        return hypothesis, "(llm)"
+    except Exception as e:
+        print(f"  ⚠️ LLM仮説生成失敗: {e} → (random) にフォールバック")
+        return generate_hypothesis(knowledge), "(random)"
+
+
 def run_loop(num_iterations=3):
     """
     メインPDCAループ
     """
+    use_llm = os.environ.get("USE_LLM_HYPOTHESIS") == "1"
+
     print("=" * 60)
     print("🚀 Autonomous Alpha Discovery Loop 開始")
     print(f"   開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
     print(f"   イテレーション数: {num_iterations}")
+    print(f"   LLM仮説生成: {'有効' if use_llm else '無効'}")
     print("=" * 60)
     
     knowledge = load_knowledge()
@@ -401,7 +428,14 @@ def run_loop(num_iterations=3):
         print("-" * 40)
         
         # 1. 仮説生成
-        hypothesis = generate_hypothesis(knowledge)
+        if use_llm:
+            hypothesis, source_label = _generate_with_llm_fallback(knowledge)
+            print(f"  🧠 ソース: {source_label}")
+            if "rationale" in hypothesis:
+                print(f"  💭 根拠: {hypothesis['rationale']}")
+        else:
+            hypothesis = generate_hypothesis(knowledge)
+            source_label = "(random)"
         
         # 2. バックテスト実行
         result = run_backtest(hypothesis)
