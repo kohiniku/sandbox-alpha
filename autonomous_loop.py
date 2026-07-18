@@ -9,6 +9,8 @@ import sys
 import time
 import subprocess
 import random
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -189,12 +191,64 @@ def generate_hypothesis(knowledge):
 def run_backtest(hypothesis):
     """
     バックテスト実行フェーズ
-    サブプロセスで戦略を検証（名前付き引数 + JSONパラメータ）
+    SANDBOX_RUNNER_URL が設定されている場合は信頼済みサンドボックスランナーにHTTPリクエストを送信。
+    未設定の場合はサブプロセスで戦略を検証（従来の venv 実行パス）。
     """
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
     params = hypothesis["params"]
+    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
 
+    if runner_url:
+        return _run_backtest_sandbox(runner_url, strategy, symbol, params)
+    else:
+        return _run_backtest_subprocess(strategy, symbol, params)
+
+
+def _run_backtest_sandbox(runner_url, strategy, symbol, params):
+    """信頼済みサンドボックスランナー（Trusted Runner）経由でバックテストを実行"""
+    url = f"{runner_url.rstrip('/')}/run"
+    body = json.dumps({
+        "strategy": strategy,
+        "symbol": symbol,
+        "params": params
+    }).encode("utf-8")
+
+    print(f"  🔬 バックテスト実行中 (sandbox): {strategy} on {symbol}...")
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            response_body = resp.read().decode("utf-8")
+            status = resp.status
+
+        if status != 200:
+            return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}"}
+
+        return json.loads(response_body)
+
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")[:500]
+        except Exception:
+            pass
+        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}"}
+    except urllib.error.URLError as e:
+        return {"error": f"Sandbox runner connection error: {e.reason}"}
+    except json.JSONDecodeError as e:
+        return {"error": f"Sandbox runner JSON parse error: {e}"}
+    except Exception as e:
+        return {"error": f"Sandbox runner error: {e}"}
+
+
+def _run_backtest_subprocess(strategy, symbol, params):
+    """サブプロセスでバックテストを実行（従来の venv 実行パス）"""
     cmd = [
         sys.executable,
         str(BASE_DIR / "backtests" / "backtest_engine.py"),
@@ -207,26 +261,26 @@ def run_backtest(hypothesis):
 
     try:
         result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
+            cmd,
+            capture_output=True,
+            text=True,
             timeout=120
         )
-        
+
         if result.returncode != 0:
             return {"error": result.stderr}
-        
+
         # stdoutからJSONブロックを抽出（最初の{から最後の}まで）
         stdout = result.stdout
         start_idx = stdout.find('{')
         end_idx = stdout.rfind('}')
-        
+
         if start_idx >= 0 and end_idx > start_idx:
             json_str = stdout[start_idx:end_idx + 1]
             return json.loads(json_str)
-        
+
         return {"error": "Could not parse output", "raw": stdout[:500]}
-        
+
     except subprocess.TimeoutExpired:
         return {"error": "Timeout (120s)"}
     except json.JSONDecodeError as e:

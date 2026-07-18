@@ -295,65 +295,91 @@ with ThreadPoolExecutor(max_workers=4) as executor:
     results = [f.result() for f in futures]
 ```
 
-#### 3. Docker隔離並列（次PR）
+#### 3. サンドボックス隔離並列（Trusted Runner）
 
 ```python
 # 各イテレーションを独立した隔離コンテナで実行
-# docker-socket-proxy経由で安全に操作
-docker run --rm --read-only --network=none \
-  --memory=512m --cpus=1 \
-  alpha-sandbox:v1 --strategy mean_reversion --symbol NVDA \
-  --params '{"window":23,"threshold":2.0}'
+# エージェントは戦略パラメータ（データ）のみを信頼済み
+# sandbox-runner にHTTP送信。Dockerアクセスは持たない。
+export SANDBOX_RUNNER_URL="http://sandbox-runner:8080"
+python3 autonomous_loop.py 10
+# → run_backtest() が urllib.request で POST /run を呼び出す
 ```
 
 ---
 
-## Future Work: Sandbox Isolation（次PRで実装予定）
+## Future Work: Sandbox Isolation
 
-### 現状の実行モデル
+### 設計原則
 
-現在、バックテストエンジンは hermes コンテナ内の常設 venv からサブプロセスとして実行されている。戦略ロジックは3種類の固定テンプレート（SMAクロスオーバー、平均回帰、モメンタム）のみであり、任意コード実行は一切行われていない。
+**DockerソケットをLLM駆動エージェントに一切渡さない。** Dockerソケットへのアクセス（raw でも docker-socket-proxy 経由でも）は、コンテナ作成ペイロードによるバインドマウント脱出（bind-mount escape）が可能であるため、実質的にホスト root 権限と同等である。エンドポイントレベルのプロキシではマウント指定を確実にフィルタリングできず、安全性を保証できない。
 
-### 隔離が必要な理由
-
-LLMによる戦略コード生成を導入する段階で、以下のリスクが顕在化する：
-
-- LLMが生成するコードに悪意ある処理や予期せぬ副作用が含まれる可能性
-- ファイルシステム、ネットワーク、プロセス空間を共有するとホスト環境が汚染される
-- 生成コードの実行前検証（静的解析）だけでは完全な安全性は担保できない
-
-### 実装方針
+このため、アーキテクチャは以下の **Trusted Runner** パターンを採用する：
 
 ```
-┌────────────────────────────────────┐
-│          hermes コンテナ            │
-│                                    │
-│  autonomous_loop.py                │
-│       │                            │
-│       │ docker-socket-proxy経由     │
-│       ▼                            │
-│  ┌──────────────────────────┐     │
-│  │  Docker (sibling container)│     │
-│  │                            │     │
-│  │  alpha-sandbox-runner      │     │
-│  │  - 既存Dockerfileのイメージ │     │
-│  │  - 読み取り専用rootfs       │     │
-│  │  - ネットワーク: none       │     │
-│  │  - 秘密情報マウントなし     │     │
-│  │  - cpu/memory制限          │     │
-│  │  - タイムアウト120秒        │     │
-│  └──────────────────────────┘     │
-└────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│               hermes コンテナ                      │
+│                                                  │
+│  autonomous_loop.py                              │
+│       │                                          │
+│       │ SANDBOX_RUNNER_URL 環境変数               │
+│       │ HTTP POST (strategy, symbol, params)      │
+│       │ JSON only — no socket, no image spec      │
+│       ▼                                          │
+└───────┬──────────────────────────────────────────┘
+        │
+        │ ネットワーク越しのHTTP API
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│          sandbox-runner（信頼済みサービス）         │
+│          ※ エージェントとは別プロセス・別権限       │
+│                                                  │
+│  - Docker アクセスを単独で保持                      │
+│  - 受信するのは strategy / symbol / params のみ    │
+│  - 固定イメージを起動（任意イメージの pull 禁止）   │
+│  - 起動オプションはハードコード:                    │
+│      --network=none                               │
+│      --read-only                                  │
+│      --cap-drop=ALL                               │
+│      --memory=512m --cpus=1                       │
+│      --tmpfs /tmp:size=64M,noexec                 │
+│  - シークレット・ボリュームマウントなし               │
+│  - 事前取得データは読み取り専用でマウント             │
+│  - タイムアウト: 180秒                              │
+│  - レスポンス: stdout JSON をそのまま返す            │
+└──────────────────────────────────────────────────┘
 ```
 
-**設計上の決定事項**:
+### Runner API 契約
 
-1. **docker-socket-proxy 経由のAPI呼び出し**: Dockerソケットを直接マウントせず、許可されたAPIエンドポイントのみをプロキシする（コンテナ起動・停止のみ許可）
-2. **特定イメージのみ実行**: 既存 `Dockerfile` からビルドしたイメージのみを実行対象とし、任意イメージのpull/runは禁止
-3. **厳格な隔離**: 読み取り専用ファイルシステム、ネットワーク遮断（--network=none）、ボリュームマウントなし
-4. **結果の受け渡し**: stdout経由のJSON出力のみ（現行のsubprocessモデルと互換）
+```
+POST {SANDBOX_RUNNER_URL}/run
+Content-Type: application/json
 
-### 現在のセキュリティ対策
+{
+  "strategy": "sma_crossover|mean_reversion|momentum|rsi",
+  "symbol": "AAPL",
+  "params": {"fast_window": 10, "slow_window": 30}
+}
+
+→ 200: バックテスト結果 JSON（metrics with in_sample/out_of_sample）
+→ 4xx: バリデーションエラー
+→ 5xx: 実行時エラー
+→ タイムアウト: 180秒
+```
+
+### クライアント側の実装（autonomous_loop.py）
+
+`run_backtest()` は環境変数 `SANDBOX_RUNNER_URL` が設定されている場合、`urllib.request`（stdlibのみ、依存なし）で runner に POST し、レスポンス JSON を既存の subprocess パスと同一形状で返す。未設定時は従来の subprocess / venv パスをそのまま使用する。
+
+エラーハンドリング：
+- 接続エラー → `{"error": "Sandbox runner connection error: …"}`
+- タイムアウト → `{"error": "Sandbox runner connection error: …"}`
+- HTTP 4xx/5xx → `{"error": "Sandbox runner HTTP {code}: …"}`
+- JSON パース失敗 → `{"error": "Sandbox runner JSON parse error: …"}`
+
+### 現在のセキュリティ対策（サンドボックス未使用時）
 
 - venv隔離（依存関係の衝突防止）
 - subprocessタイムアウト（無限ループ防止、120秒）
@@ -450,12 +476,12 @@ source .venv/bin/activate
 python3 autonomous_loop.py 10
 ```
 
-### Docker実行（将来：Sandbox Isolation実装後）
+### Docker実行（Trusted Runner経由）
 
 ```bash
-docker build -t alpha-sandbox:v1 .
-docker run --rm --read-only --network=none alpha-sandbox:v1 \
-  --strategy sma_crossover --symbol AAPL --params '{"fast_window":10,"slow_window":30}'
+# sandbox-runner が固定イメージを起動（--network=none, --read-only, --cap-drop=ALL）
+export SANDBOX_RUNNER_URL="http://localhost:8080"
+python3 autonomous_loop.py 5
 ```
 
 ### クラウド実行（将来）
@@ -477,6 +503,6 @@ gcloud run jobs execute alpha-search --region=asia-northeast1
 4. **スケーラブル**: 将来的に分散実行に対応可能
 
 **次のステップ**:
-- **Sandbox Isolation（次PR）**: Docker隔離によるLLM生成コードの安全な実行基盤
+- **Trusted Runner サンドボックス（実装済み）**: `SANDBOX_RUNNER_URL` 環境変数による隔離実行基盤。LLM生成コードの安全な実行を可能にする。
 - Polymarket API統合
-- LLM仮説生成（隔離実装後に導入）
+- LLM仮説生成（サンドボックス隔離実装後に導入）
