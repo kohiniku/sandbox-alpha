@@ -169,9 +169,17 @@ sandbox-alpha/
 
 ## 🚧 今後の拡張
 
+### 次PR: Sandbox Isolation 🛡️
+
+LLMによる戦略コード生成を安全に導入するための隔離実行基盤。
+詳細は [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) の "Future Work: Sandbox Isolation" を参照。
+
+- 現状: 固定テンプレートのみ実行（任意コード実行なし）
+- 目標: docker-socket-proxy経由で隔離コンテナ実行（--read-only, --network=none）
+- LLM仮説生成は隔離実装後に導入
+
 ### 短期（1-2週間）
 - [ ] Polymarket API統合（予測市場でのペーパートレード）
-- [ ] LLM仮説生成（ナレッジベースを参照した賢い仮説生成）
 - [ ] ポートフォリオ結合（採用戦略を相関考慮して組み合わせ）
 
 ### 中期（1-2ヶ月）

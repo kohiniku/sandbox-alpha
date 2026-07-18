@@ -295,28 +295,70 @@ with ThreadPoolExecutor(max_workers=4) as executor:
     results = [f.result() for f in futures]
 ```
 
-#### 3. Docker並列
+#### 3. Docker隔離並列（次PR）
 
 ```python
-# 各イテレーションを独立コンテナで実行
-docker run --rm alpha-sandbox:v1 mean_reversion NVDA 23 2.0
+# 各イテレーションを独立した隔離コンテナで実行
+# docker-socket-proxy経由で安全に操作
+docker run --rm --read-only --network=none \
+  --memory=512m --cpus=1 \
+  alpha-sandbox:v1 --strategy mean_reversion --symbol NVDA \
+  --params '{"window":23,"threshold":2.0}'
 ```
 
 ---
 
-## セキュリティ考慮事項
+## Future Work: Sandbox Isolation（次PRで実装予定）
 
-### 現在の対策
+### 現状の実行モデル
+
+現在、バックテストエンジンは hermes コンテナ内の常設 venv からサブプロセスとして実行されている。戦略ロジックは3種類の固定テンプレート（SMAクロスオーバー、平均回帰、モメンタム）のみであり、任意コード実行は一切行われていない。
+
+### 隔離が必要な理由
+
+LLMによる戦略コード生成を導入する段階で、以下のリスクが顕在化する：
+
+- LLMが生成するコードに悪意ある処理や予期せぬ副作用が含まれる可能性
+- ファイルシステム、ネットワーク、プロセス空間を共有するとホスト環境が汚染される
+- 生成コードの実行前検証（静的解析）だけでは完全な安全性は担保できない
+
+### 実装方針
+
+```
+┌────────────────────────────────────┐
+│          hermes コンテナ            │
+│                                    │
+│  autonomous_loop.py                │
+│       │                            │
+│       │ docker-socket-proxy経由     │
+│       ▼                            │
+│  ┌──────────────────────────┐     │
+│  │  Docker (sibling container)│     │
+│  │                            │     │
+│  │  alpha-sandbox-runner      │     │
+│  │  - 既存Dockerfileのイメージ │     │
+│  │  - 読み取り専用rootfs       │     │
+│  │  - ネットワーク: none       │     │
+│  │  - 秘密情報マウントなし     │     │
+│  │  - cpu/memory制限          │     │
+│  │  - タイムアウト120秒        │     │
+│  └──────────────────────────┘     │
+└────────────────────────────────────┘
+```
+
+**設計上の決定事項**:
+
+1. **docker-socket-proxy 経由のAPI呼び出し**: Dockerソケットを直接マウントせず、許可されたAPIエンドポイントのみをプロキシする（コンテナ起動・停止のみ許可）
+2. **特定イメージのみ実行**: 既存 `Dockerfile` からビルドしたイメージのみを実行対象とし、任意イメージのpull/runは禁止
+3. **厳格な隔離**: 読み取り専用ファイルシステム、ネットワーク遮断（--network=none）、ボリュームマウントなし
+4. **結果の受け渡し**: stdout経由のJSON出力のみ（現行のsubprocessモデルと互換）
+
+### 現在のセキュリティ対策
 
 - venv隔離（依存関係の衝突防止）
-- subprocessタイムアウト（無限ループ防止）
+- subprocessタイムアウト（無限ループ防止、120秒）
 - エラー時のグレースフルデグラデーション
-
-### 将来の対策
-
-- Docker完全隔離（ネットワーク制限、リソース制限）
-- サンドボックス内でのみ実行可能なコード検証
-- 悪意のある戦略コードの検出（静的解析）
+- 固定テンプレートのみ実行（任意コード実行なし）
 
 ---
 
@@ -408,11 +450,12 @@ source .venv/bin/activate
 python3 autonomous_loop.py 10
 ```
 
-### Docker実行
+### Docker実行（将来：Sandbox Isolation実装後）
 
 ```bash
 docker build -t alpha-sandbox:v1 .
-docker run --rm -v $(pwd)/results:/results alpha-sandbox:v1 10
+docker run --rm --read-only --network=none alpha-sandbox:v1 \
+  --strategy sma_crossover --symbol AAPL --params '{"fast_window":10,"slow_window":30}'
 ```
 
 ### クラウド実行（将来）
@@ -434,6 +477,6 @@ gcloud run jobs execute alpha-search --region=asia-northeast1
 4. **スケーラブル**: 将来的に分散実行に対応可能
 
 **次のステップ**:
+- **Sandbox Isolation（次PR）**: Docker隔離によるLLM生成コードの安全な実行基盤
 - Polymarket API統合
-- LLM仮説生成
-- Docker完全隔離
+- LLM仮説生成（隔離実装後に導入）
