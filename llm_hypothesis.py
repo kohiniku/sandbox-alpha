@@ -255,7 +255,10 @@ def generate(knowledge, templates):
             "model": cfg["model"],
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 512,
+            # DeepSeek v4系はflashでも隠れreasoningがトークンを消費するため、
+            # 512では finish_reason=length で content が空になるケースが多発した
+            "max_tokens": int(os.environ.get("HYPO_LLM_MAX_TOKENS", "2048")),
+            "response_format": {"type": "json_object"},
         },
         timeout=30,
     )
