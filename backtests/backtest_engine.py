@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Minimal backtest engine for sandbox testing
-Usage: python backtest_engine.py --strategy sma_crossover --symbol AAPL --params '{"fast_window": 10, "slow_window": 30}'
+Minimal backtest engine for sandbox testing.
+Usage:
+  python backtest_engine.py --strategy sma_crossover --symbol AAPL --params '{"fast_window": 10, "slow_window": 30}'
+  python backtest_engine.py --fetch-only --symbol AAPL --data-dir /cache
+  python backtest_engine.py --strategy momentum --symbol AAPL --data-dir /cache
 """
 import argparse
 import json
+import os
 import sys
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from datetime import datetime
 
 # 取引コスト: 片道 bps（デフォルト 5.0 = 0.05%）
@@ -16,10 +19,33 @@ COST_BPS = 5.0
 
 
 def fetch_data(symbol, period="2y"):
-    """Fetch historical data"""
+    """Fetch historical data from yfinance (lazy import — only when needed)."""
+    import yfinance as yf
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period)
     return df
+
+
+def load_cached_data(symbol, data_dir):
+    """Load data from a cached CSV file. No network dependency."""
+    path = os.path.join(data_dir, f"{symbol}.csv")
+    if not os.path.isfile(path):
+        print(json.dumps({"error": f"data not cached: {symbol}"}))
+        sys.exit(1)
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"], utc=True)
+    df = df.set_index("Date")
+    return df
+
+
+def fetch_and_cache(symbol, data_dir):
+    """Fetch 2y daily OHLCV and save to CSV. Returns JSON info dict."""
+    df = fetch_data(symbol)
+    path = os.path.join(data_dir, f"{symbol}.csv")
+    os.makedirs(data_dir, exist_ok=True)
+    df.to_csv(path, index=True)
+    info = {"fetched": symbol, "rows": len(df), "path": path}
+    return info
 
 
 def split_walkforward(df, train_ratio=0.7):
@@ -138,7 +164,6 @@ def run_momentum_strategy(df, lookback=20, hold_period=5):
     return df
 
 
-
 def run_rsi_strategy(df, rsi_window=14, oversold=30, overbought=70):
     """
     RSI Mean-Reversion Strategy
@@ -191,13 +216,16 @@ STRATEGIES = {
 }
 
 
-def run_backtest(strategy_name, symbol, params, walkforward=True):
+def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None):
     """
     Run full backtest with optional walk-forward validation.
-    Returns dict with IS and OOS metrics.
+    data_dir: if set, load cached CSV from this dir instead of calling yfinance.
     """
-    print(f"Fetching data for {symbol}...", file=sys.stderr)
-    df = fetch_data(symbol)
+    if data_dir:
+        df = load_cached_data(symbol, data_dir)
+    else:
+        print(f"Fetching data for {symbol}...", file=sys.stderr)
+        df = fetch_data(symbol)
 
     if df.empty:
         return {"error": f"No data for {symbol}"}
@@ -249,7 +277,7 @@ def run_backtest(strategy_name, symbol, params, walkforward=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest Engine")
-    parser.add_argument("--strategy", required=True, help="Strategy name")
+    parser.add_argument("--strategy", default=None, help="Strategy name")
     parser.add_argument("--symbol", required=True, help="Ticker symbol")
     parser.add_argument("--params", default="{}", help="JSON string of strategy parameters")
     parser.add_argument(
@@ -259,19 +287,34 @@ if __name__ == "__main__":
         "--walkforward", dest="walkforward", action="store_true", default=True,
         help="Enable walk-forward validation (default)"
     )
+    parser.add_argument(
+        "--fetch-only", action="store_true",
+        help="Fetch 2y daily OHLCV and save to --data-dir, then exit"
+    )
+    parser.add_argument(
+        "--data-dir", default=None,
+        help="Directory for cached CSV files (used with --fetch-only or as data source)"
+    )
     args = parser.parse_args()
 
+    # --- fetch-only mode: no strategy execution ---
+    if args.fetch_only:
+        if not args.data_dir:
+            print(json.dumps({"error": "--fetch-only requires --data-dir DIR"}))
+            sys.exit(1)
+        info = fetch_and_cache(args.symbol, args.data_dir)
+        print(json.dumps(info, default=str))
+        sys.exit(0)
+
+    # --- strategy mode: require --strategy ---
+    if not args.strategy:
+        parser.error("--strategy is required (or use --fetch-only)")
+
     params = json.loads(args.params)
-
-    # Backward compat: also accept positional-style args for direct CLI use
-    # e.g. python backtest_engine.py sma_crossover AAPL 10 30
-    # If --strategy not explicitly set, try positional fallback
-    # (argparse handles --strategy as required, so this is just for
-    #  the case where someone pipes the old positional format)
-    if not params:
-        # Maybe positional args were appended after --?
-        pass
-
     walkforward = not args.no_walkforward
-    result = run_backtest(args.strategy, args.symbol, params, walkforward=walkforward)
+    result = run_backtest(
+        args.strategy, args.symbol, params,
+        walkforward=walkforward,
+        data_dir=args.data_dir,
+    )
     print(json.dumps(result, indent=2, default=str))
