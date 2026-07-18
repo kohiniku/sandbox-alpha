@@ -4,11 +4,14 @@ Autonomous Alpha Discovery Loop
 エージェントが仮説生成→バックテスト→評価→蓄積を自律的に回す
 """
 import json
+import math
 import os
 import sys
 import time
 import subprocess
 import random
+import uuid
+import copy
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -58,12 +61,57 @@ STRATEGY_TEMPLATES = {
     },
 }
 
-# 採用閾値
-THRESHOLDS = {
-    "min_sharpe": 0.3,
-    "min_return_pct": 5.0,
-    "max_drawdown_pct": -25.0
-}
+# --- Overfitting guards ---
+MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
+MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
+
+
+def compute_effective_min_sharpe(N_family, T_val):
+    """Deflation formula: threshold rises with more trials to penalize data snooping."""
+    N = max(N_family, 2)
+    return max(MIN_SHARPE_BASE, math.sqrt(2 * math.log(N)) * math.sqrt(252.0 / max(T_val, 1)))
+
+
+def _params_within_cluster(p1, p2, templates):
+    """Check if p1 and p2 params are within ±15% (numeric) or one-step (list) of each other."""
+    all_keys = set(p1.keys()) | set(p2.keys())
+    for k in all_keys:
+        v1 = p1.get(k)
+        v2 = p2.get(k)
+        if v1 is None or v2 is None:
+            return False
+
+        # First, check if this param is a list-type in any template
+        is_list_param = False
+        for tmpl_name, tmpl in templates.items():
+            space = tmpl.get("param_space", {}).get(k)
+            if isinstance(space, list):
+                is_list_param = True
+                if v1 in space and v2 in space:
+                    if abs(space.index(v1) - space.index(v2)) > 1:
+                        return False
+                    break  # passed list check
+                else:
+                    # values not in the list space — fall through to exact match
+                    if v1 != v2:
+                        return False
+                    break
+        if is_list_param:
+            continue  # handled above
+
+        # Numeric param: ±15% tolerance
+        if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+            if v1 == 0 and v2 == 0:
+                continue
+            if v1 == 0 or v2 == 0:
+                return False
+            pct = abs(v1 - v2) / max(abs(v1), abs(v2))
+            if pct > 0.15:
+                return False
+        else:
+            if v1 != v2:
+                return False
+    return True
 
 
 def load_knowledge():
@@ -287,65 +335,172 @@ def _run_backtest_subprocess(strategy, symbol, params):
         return {"error": f"JSON parse error: {e}"}
 
 
-def evaluate_result(hypothesis, result):
+def evaluate_result(hypothesis, result, knowledge):
     """
-    評価フェーズ
-    閾値に基づいて戦略の採否を判定。
-    walk-forward有効時は out-of-sample 指標で判定する。
+    Multi-gate evaluation with overfitting countermeasures.
+    Returns (verdict, evaluation_dict).
     """
     if "error" in result:
-        return "rejected", result["error"]
+        return "rejected", {"verdict": "rejected", "error": result["error"], "reasons": [f"❌ Error: {result['error']}"]}
 
-    # walk-forward有効時はOOS指標を使用
-    if result.get("walkforward", {}).get("enabled"):
-        metrics = result.get("out_of_sample", {})
-        is_metrics = result.get("in_sample", {})
-    else:
-        metrics = result
-        is_metrics = None
+    wf = result.get("walkforward", {})
+    if not wf.get("enabled"):
+        return "rejected", {"verdict": "rejected", "error": "walkforward disabled", "reasons": ["❌ Walkforward not enabled"]}
 
-    sharpe = metrics.get("sharpe_ratio", -999)
-    total_return = metrics.get("total_return_pct", -999)
-    max_dd = metrics.get("max_drawdown_pct", -999)
-    num_trades = metrics.get("num_trades", 0)
-    
-    reasons = []
-    
-    if sharpe >= THRESHOLDS["min_sharpe"]:
-        reasons.append(f"✅ Sharpe {sharpe:.2f} >= {THRESHOLDS['min_sharpe']}")
-    else:
-        reasons.append(f"❌ Sharpe {sharpe:.2f} < {THRESHOLDS['min_sharpe']}")
-    
-    if total_return >= THRESHOLDS["min_return_pct"]:
-        reasons.append(f"✅ Return {total_return:.1f}% >= {THRESHOLDS['min_return_pct']}%")
-    else:
-        reasons.append(f"❌ Return {total_return:.1f}% < {THRESHOLDS['min_return_pct']}%")
-    
-    if max_dd >= THRESHOLDS["max_drawdown_pct"]:
-        reasons.append(f"✅ Drawdown {max_dd:.1f}% >= {THRESHOLDS['max_drawdown_pct']}%")
-    else:
-        reasons.append(f"❌ Drawdown {max_dd:.1f}% < {THRESHOLDS['max_drawdown_pct']}%")
-    
-    # 全条件を満たせば採用
-    is_adopted = (
-        sharpe >= THRESHOLDS["min_sharpe"] and
-        total_return >= THRESHOLDS["min_return_pct"] and
-        max_dd >= THRESHOLDS["max_drawdown_pct"]
+    val_metrics = result.get("out_of_sample", {})
+    holdout_metrics = result.get("holdout", {})
+    is_metrics = result.get("in_sample", {})
+
+    val_sharpe = val_metrics.get("sharpe_ratio", -999)
+    val_return = val_metrics.get("total_return_pct", -999)
+    val_max_dd = val_metrics.get("max_drawdown_pct", -999)
+    T_val = val_metrics.get("num_days", 252)
+
+    strategy = hypothesis["strategy"]
+    symbol = hypothesis["symbol"]
+
+    # Count N_family: tested_combinations with same (strategy, symbol)
+    N_family = sum(
+        1 for tc in knowledge.get("tested_combinations", [])
+        if tc.get("strategy") == strategy and tc.get("symbol") == symbol
     )
-    
-    verdict = "adopted" if is_adopted else "rejected"
+    effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
+
+    reasons = []
+    gate_results = {}
+
+    # --- Gate (a): Validation gate ---
+    val_pass = (
+        val_sharpe >= effective_min_sharpe
+        and val_return > 0
+        and val_max_dd >= MAX_DRAWDOWN_LIMIT
+    )
+    gate_results["validation"] = val_pass
+
+    if val_sharpe >= effective_min_sharpe:
+        reasons.append(f"✅ Val Sharpe {val_sharpe:.2f} >= {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+    else:
+        reasons.append(f"❌ Val Sharpe {val_sharpe:.2f} < {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+
+    if val_return > 0:
+        reasons.append(f"✅ Val Return {val_return:.1f}% > 0%")
+    else:
+        reasons.append(f"❌ Val Return {val_return:.1f}% <= 0%")
+
+    if val_max_dd >= MAX_DRAWDOWN_LIMIT:
+        reasons.append(f"✅ Val Drawdown {val_max_dd:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
+    else:
+        reasons.append(f"❌ Val Drawdown {val_max_dd:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+
+    if not val_pass:
+        evaluation = {
+            "verdict": "rejected",
+            "sharpe_ratio": val_sharpe,
+            "total_return_pct": val_return,
+            "max_drawdown_pct": val_max_dd,
+            "reasons": reasons,
+            "gate_results": gate_results,
+            "effective_min_sharpe": round(effective_min_sharpe, 4),
+        }
+        if is_metrics:
+            evaluation["in_sample"] = is_metrics
+        return "rejected", evaluation
+
+    # --- Gate (b): Deflation gate (embedded in (a) via effective_min_sharpe) ---
+    reasons.append(f"📐 Deflated threshold: {effective_min_sharpe:.2f} (base={MIN_SHARPE_BASE}, N_family={N_family}, T_val={T_val})")
+    gate_results["deflation"] = True
+
+    # --- Gate (c): Holdout confirmation ---
+    holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
+    holdout_return = holdout_metrics.get("total_return_pct", -999)
+    holdout_pass = holdout_sharpe > 0 and holdout_return > 0
+    gate_results["holdout"] = holdout_pass
+
+    if holdout_sharpe > 0:
+        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} > 0")
+    else:
+        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} <= 0")
+
+    if holdout_return > 0:
+        reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")
+    else:
+        reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
+
+    if not holdout_pass:
+        evaluation = {
+            "verdict": "rejected",
+            "sharpe_ratio": val_sharpe,
+            "total_return_pct": val_return,
+            "max_drawdown_pct": val_max_dd,
+            "holdout_sharpe": holdout_sharpe,
+            "holdout_return_pct": holdout_return,
+            "reasons": reasons,
+            "gate_results": gate_results,
+            "effective_min_sharpe": round(effective_min_sharpe, 4),
+        }
+        if is_metrics:
+            evaluation["in_sample"] = is_metrics
+        return "rejected", evaluation
+
+    # --- Gate (d): Cluster dedup ---
+    adopted = knowledge.get("adopted", [])
+    cluster_id = str(uuid.uuid4())[:8]
+    incumbent_idx = None
+    for idx, entry in enumerate(adopted):
+        eh = entry.get("hypothesis", {})
+        if eh.get("strategy") != strategy or eh.get("symbol") != symbol:
+            continue
+        if _params_within_cluster(hypothesis["params"], eh.get("params", {}), STRATEGY_TEMPLATES):
+            incumbent_idx = idx
+            cluster_id = entry.get("cluster_id", cluster_id)
+            break
+
+    if incumbent_idx is not None:
+        incumbent = adopted[incumbent_idx]
+        inc_holdout = incumbent.get("evaluation", {}).get("holdout_sharpe", -999)
+        if holdout_sharpe > inc_holdout:
+            reasons.append(f"🔄 Cluster replace: holdout Sharpe {holdout_sharpe:.2f} > incumbent {inc_holdout:.2f}")
+            knowledge.setdefault("superseded", []).append(incumbent)
+            adopted.pop(incumbent_idx)
+            gate_results["cluster"] = "replaced"
+        else:
+            reasons.append(f"❌ Cluster dedup: holdout Sharpe {holdout_sharpe:.2f} <= incumbent {inc_holdout:.2f}")
+            gate_results["cluster"] = "duplicate_cluster"
+            evaluation = {
+                "verdict": "rejected",
+                "sharpe_ratio": val_sharpe,
+                "total_return_pct": val_return,
+                "max_drawdown_pct": val_max_dd,
+                "holdout_sharpe": holdout_sharpe,
+                "holdout_return_pct": holdout_return,
+                "reasons": reasons,
+                "gate_results": gate_results,
+                "effective_min_sharpe": round(effective_min_sharpe, 4),
+            }
+            if is_metrics:
+                evaluation["in_sample"] = is_metrics
+            return "rejected", evaluation
+    else:
+        gate_results["cluster"] = "new"
+
+    # All gates passed
+    reasons.insert(0, "🏆 ALL GATES PASSED")
     evaluation = {
-        "verdict": verdict,
-        "sharpe_ratio": sharpe,
-        "total_return_pct": total_return,
-        "max_drawdown_pct": max_dd,
-        "num_trades": num_trades,
+        "verdict": "adopted",
+        "sharpe_ratio": val_sharpe,
+        "total_return_pct": val_return,
+        "max_drawdown_pct": val_max_dd,
+        "holdout_sharpe": holdout_sharpe,
+        "holdout_return_pct": holdout_return,
         "reasons": reasons,
+        "gate_results": gate_results,
+        "effective_min_sharpe": round(effective_min_sharpe, 4),
+        "cluster_id": cluster_id,
     }
     if is_metrics:
         evaluation["in_sample"] = is_metrics
-    
-    return verdict, evaluation
+
+    return "adopted", evaluation
 
 
 def save_result(hypothesis, result, verdict, evaluation):
@@ -368,12 +523,15 @@ def print_report(knowledge):
     """ナレッジベースのサマリー"""
     adopted = len(knowledge["adopted"])
     rejected = len(knowledge["rejected"])
+    superseded = len(knowledge.get("superseded", []))
     total = adopted + rejected
     
     print(f"\n{'='*60}")
     print(f"📊 Alpha Discovery Report (Iteration {knowledge['iterations']})")
     print(f"{'='*60}")
     print(f"  採用: {adopted}件 / テスト: {total}件 (採用率: {adopted/max(total,1)*100:.1f}%)")
+    if superseded > 0:
+        print(f"  上書き: {superseded}件 (superseded)")
     
     if adopted > 0:
         print(f"\n  🏆 採用された戦略:")
@@ -441,7 +599,7 @@ def run_loop(num_iterations=3):
         result = run_backtest(hypothesis)
         
         # 3. 評価
-        verdict, evaluation = evaluate_result(hypothesis, result)
+        verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
         
         print(f"  📋 判定: {verdict.upper()}")
         if isinstance(evaluation, dict) and "reasons" in evaluation:
@@ -452,6 +610,7 @@ def run_loop(num_iterations=3):
         record = save_result(hypothesis, result, verdict, evaluation)
         
         if verdict == "adopted":
+            record["cluster_id"] = evaluation.get("cluster_id", "unknown")
             knowledge["adopted"].append(record)
         else:
             knowledge["rejected"].append(record)
@@ -474,6 +633,78 @@ def run_loop(num_iterations=3):
     return knowledge
 
 
+def run_revalidation(knowledge):
+    """
+    Re-run every currently adopted strategy through the full new pipeline
+    (backtest + all gates). Demote failures to rejected with reason "revalidation_failed".
+    """
+    adopted = knowledge.get("adopted", [])
+    if not adopted:
+        print("📭 再検証対象の採用戦略がありません。")
+        return knowledge
+
+    print("=" * 60)
+    print("🔁 再検証モード (Revalidation)")
+    print(f"   対象: {len(adopted)}件の採用戦略")
+    print(f"   開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
+    print("=" * 60)
+
+    survivors = []
+    demoted = 0
+
+    for i, entry in enumerate(copy.deepcopy(adopted)):
+        hyp = entry["hypothesis"]
+        print(f"\n🔄 [{i+1}/{len(adopted)}] {hyp['description']}")
+        print(f"   パラメータ: {hyp['params']}")
+
+        # Re-run backtest
+        result = run_backtest(hyp)
+        if "error" in result:
+            print(f"  ❌ バックテスト失敗: {result['error']}")
+            demoted += 1
+            entry["verdict"] = "rejected"
+            entry["evaluation"] = {"verdict": "rejected", "error": result["error"],
+                                   "reasons": [f"revalidation_failed: {result['error']}"]}
+            knowledge["rejected"].append(entry)
+            continue
+
+        # Re-evaluate with current gates
+        verdict, evaluation = evaluate_result(hyp, result, knowledge)
+        print(f"  📋 再判定: {verdict.upper()}")
+        if isinstance(evaluation, dict) and "reasons" in evaluation:
+            for reason in evaluation["reasons"]:
+                print(f"     {reason}")
+
+        if verdict == "adopted":
+            entry["backtest_result"] = result
+            entry["evaluation"] = evaluation
+            entry["verdict"] = verdict
+            entry["tested_at"] = datetime.now().isoformat()
+            entry["cluster_id"] = evaluation.get("cluster_id", entry.get("cluster_id", "unknown"))
+            survivors.append(entry)
+        else:
+            entry["verdict"] = "rejected"
+            entry["evaluation"] = evaluation
+            entry["rejected_reason"] = "revalidation_failed"
+            knowledge["rejected"].append(entry)
+            demoted += 1
+
+    knowledge["adopted"] = survivors
+    save_knowledge(knowledge)
+
+    print(f"\n{'='*60}")
+    print(f"📊 再検証完了")
+    print(f"   Before: {len(adopted)}件採用")
+    print(f"   After:  {len(survivors)}件採用 / {demoted}件降格")
+    print(f"{'='*60}\n")
+
+    return knowledge
+
+
 if __name__ == "__main__":
-    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    run_loop(iterations)
+    if "--revalidate" in sys.argv:
+        knowledge = load_knowledge()
+        run_revalidation(knowledge)
+    else:
+        iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+        run_loop(iterations)
