@@ -14,15 +14,24 @@ import os
 import re
 import time
 import random
+import urllib.request
+import urllib.error
 from datetime import datetime
-
-import requests
 
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 
 _STRATEGY_NAMES = {"sma_crossover", "mean_reversion", "momentum", "rsi"}
+
+
+def _http_post_json(url, headers, payload, timeout):
+    # stdlib のみ: 実行環境 (hermes コンテナ) に requests が無いため
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
 
@@ -285,20 +294,20 @@ def generate(knowledge, templates):
           id, strategy, symbol, params, description, generated_at, rationale
 
     Raises:
-        requests.RequestException – network/HTTP errors
+        urllib.error.URLError – network/HTTP errors
         ValueError – invalid or unvalidatable LLM response
         json.JSONDecodeError – malformed JSON in LLM response
     """
     cfg = _get_config()
     messages = _build_prompt(knowledge, templates)
 
-    resp = requests.post(
+    body = _http_post_json(
         f"{cfg['base_url'].rstrip('/')}/chat/completions",
         headers={
             "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type": "application/json",
         },
-        json={
+        payload={
             "model": cfg["model"],
             "messages": messages,
             "temperature": 0.7,
@@ -309,9 +318,6 @@ def generate(knowledge, templates):
         },
         timeout=30,
     )
-    resp.raise_for_status()
-
-    body = resp.json()
     content = body["choices"][0]["message"]["content"].strip()
 
     # Strip markdown fences if present

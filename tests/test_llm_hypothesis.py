@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
-import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -38,19 +37,6 @@ KNOWLEDGE = {
     "rejected": [],
     "iterations": 0,
 }
-
-
-def _make_mock_response(json_data, status_code=200):
-    """Build a mock requests.Response with the given JSON body."""
-    mock_resp = MagicMock(spec=requests.Response)
-    mock_resp.status_code = status_code
-    mock_resp.json.return_value = json_data
-    mock_resp.raise_for_status = MagicMock()
-    if status_code >= 400:
-        mock_resp.raise_for_status.side_effect = requests.HTTPError(
-            f"{status_code} Error"
-        )
-    return mock_resp
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +156,10 @@ def test_invalid_symbol_rejected():
 # generate() tests (mocked HTTP)
 # ---------------------------------------------------------------------------
 
-@patch("llm_hypothesis.requests.post")
+@patch("llm_hypothesis._http_post_json")
 def test_generate_valid_reply_accepted(mock_post):
     """Full generate() flow: valid LLM reply → proper hypothesis dict."""
-    mock_post.return_value = _make_mock_response(
+    mock_post.return_value = (
         {
             "choices": [
                 {
@@ -199,10 +185,10 @@ def test_generate_valid_reply_accepted(mock_post):
     assert hyp["id"].startswith("hyp_")
 
 
-@patch("llm_hypothesis.requests.post")
+@patch("llm_hypothesis._http_post_json")
 def test_generate_out_of_range_falls_back(mock_post):
     """Out-of-range param in LLM output → ValueError (caller catches)."""
-    mock_post.return_value = _make_mock_response(
+    mock_post.return_value = (
         {
             "choices": [
                 {
@@ -223,10 +209,10 @@ def test_generate_out_of_range_falls_back(mock_post):
         generate(KNOWLEDGE, TEMPLATES)
 
 
-@patch("llm_hypothesis.requests.post")
+@patch("llm_hypothesis._http_post_json")
 def test_generate_unknown_strategy_rejected(mock_post):
     """Unknown strategy → ValueError."""
-    mock_post.return_value = _make_mock_response(
+    mock_post.return_value = (
         {
             "choices": [
                 {
@@ -247,10 +233,10 @@ def test_generate_unknown_strategy_rejected(mock_post):
         generate(KNOWLEDGE, TEMPLATES)
 
 
-@patch("llm_hypothesis.requests.post")
+@patch("llm_hypothesis._http_post_json")
 def test_generate_malformed_json_raises(mock_post):
     """Non-JSON content → json.JSONDecodeError."""
-    mock_post.return_value = _make_mock_response(
+    mock_post.return_value = (
         {
             "choices": [
                 {
@@ -266,10 +252,10 @@ def test_generate_malformed_json_raises(mock_post):
         generate(KNOWLEDGE, TEMPLATES)
 
 
-@patch("llm_hypothesis.requests.post")
+@patch("llm_hypothesis._http_post_json")
 def test_generate_params_key_mismatch_rejected(mock_post):
     """Wrong param keys → ValueError."""
-    mock_post.return_value = _make_mock_response(
+    mock_post.return_value = (
         {
             "choices": [
                 {
