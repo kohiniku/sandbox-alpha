@@ -18,7 +18,7 @@ from datetime import datetime
 COST_BPS = 5.0
 
 
-def fetch_data(symbol, period="2y"):
+def fetch_data(symbol, period="5y"):
     """Fetch historical data from yfinance (lazy import — only when needed)."""
     import yfinance as yf
     ticker = yf.Ticker(symbol)
@@ -39,7 +39,7 @@ def load_cached_data(symbol, data_dir):
 
 
 def fetch_and_cache(symbol, data_dir):
-    """Fetch 2y daily OHLCV and save to CSV. Returns JSON info dict."""
+    """Fetch 5y daily OHLCV and save to CSV. Returns JSON info dict."""
     df = fetch_data(symbol)
     path = os.path.join(data_dir, f"{symbol}.csv")
     os.makedirs(data_dir, exist_ok=True)
@@ -48,10 +48,12 @@ def fetch_and_cache(symbol, data_dir):
     return info
 
 
-def split_walkforward(df, train_ratio=0.7):
-    """Split data into in-sample (train) and out-of-sample (test)"""
-    split_idx = int(len(df) * train_ratio)
-    return df.iloc[:split_idx], df.iloc[split_idx:]
+def split_walkforward(df, train_ratio=0.6, val_ratio=0.2, holdout_ratio=0.2):
+    """Split data into train (in-sample), validation, and holdout segments chronologically."""
+    n = len(df)
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
+    return df.iloc[:train_end], df.iloc[train_end:val_end], df.iloc[val_end:]
 
 
 def apply_trading_cost(strategy_returns, signal):
@@ -248,19 +250,27 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None)
         metrics["walkforward"] = {"enabled": False}
         return metrics
 
-    # Walk-forward: 70% train / 30% test
-    print(f"Running {strategy_name} strategy (walk-forward 70/30)...", file=sys.stderr)
-    train_df, test_df = split_walkforward(df)
+    # Walk-forward: 60% train / 20% validation / 20% holdout
+    print(f"Running {strategy_name} strategy (walk-forward 60/20/20)...", file=sys.stderr)
+    train_df, val_df, holdout_df = split_walkforward(df)
 
-    # In-sample
+    # In-sample (train)
     is_returns, is_signal = run_strategy_on_segment(train_df, strategy_fn, params)
     is_returns_net = apply_trading_cost(is_returns, is_signal)
     is_metrics = calculate_metrics(is_returns_net, is_signal)
+    is_metrics["num_days"] = len(train_df)
 
-    # Out-of-sample (same params, unseen data)
-    oos_returns, oos_signal = run_strategy_on_segment(test_df, strategy_fn, params)
-    oos_returns_net = apply_trading_cost(oos_returns, oos_signal)
-    oos_metrics = calculate_metrics(oos_returns_net, oos_signal)
+    # Validation (out-of-sample)
+    val_returns, val_signal = run_strategy_on_segment(val_df, strategy_fn, params)
+    val_returns_net = apply_trading_cost(val_returns, val_signal)
+    val_metrics = calculate_metrics(val_returns_net, val_signal)
+    val_metrics["num_days"] = len(val_df)
+
+    # Holdout
+    holdout_returns, holdout_signal = run_strategy_on_segment(holdout_df, strategy_fn, params)
+    holdout_returns_net = apply_trading_cost(holdout_returns, holdout_signal)
+    holdout_metrics = calculate_metrics(holdout_returns_net, holdout_signal)
+    holdout_metrics["num_days"] = len(holdout_df)
 
     result = {
         "strategy": strategy_name,
@@ -269,8 +279,9 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None)
         "data_points": len(df),
         "date_range": f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}",
         "in_sample": is_metrics,
-        "out_of_sample": oos_metrics,
-        "walkforward": {"enabled": True, "train_ratio": 0.7},
+        "out_of_sample": val_metrics,
+        "holdout": holdout_metrics,
+        "walkforward": {"enabled": True, "train_ratio": 0.6, "val_ratio": 0.2, "holdout_ratio": 0.2},
     }
     return result
 
@@ -289,7 +300,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--fetch-only", action="store_true",
-        help="Fetch 2y daily OHLCV and save to --data-dir, then exit"
+        help="Fetch 5y daily OHLCV and save to --data-dir, then exit"
     )
     parser.add_argument(
         "--data-dir", default=None,

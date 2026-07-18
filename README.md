@@ -172,7 +172,31 @@ sandbox-alpha/
 
 ### Walk-Forward 検証
 
-データを in-sample 70% / out-of-sample 30% に分割。採用判定は out-of-sample 指標で行う。両期間の指標を結果JSONに含める。
+データを train 60% / validation 20% / holdout 20% に3分割（時系列順）。採用判定は validation 指標で行い、holdout は最終確認のみに使用。全3期間の指標と `num_days` を結果JSONに含める。
+
+### 🛡️ 過学習対策 (Overfitting Guards)
+
+自律的PDCAループにおけるデータスヌーピング（p-hacking）を防ぐ3つの仕組み。
+
+**1. 3-Way Walk-Forward Split（データ分割）**
+
+データを時系列で train 60% / validation 20% / holdout 20% に分割。パラメータ選択・採用判定は validation 期間の指標のみで行う。holdout は最終確認のみに使用され、一度も選択/ランキングに使われない。真のアウトオブサンプル性能を担保する。
+
+**2. Deflated Sharpe Threshold（試行回数補正）**
+
+複数回の試行（N_family: 同一 strategy + symbol の組み合わせ数）に応じて、採用閾値を自動的に引き上げる。
+
+```
+effective_min_sharpe = max(0.5, √(2 × ln(max(N, 2))) × √(252 / T_val))
+```
+
+試行回数が増えるほど閾値が上昇し、偶然の良い結果を排除する。検証期間が短いほど閾値も上昇。計算された閾値は評価レコードに `effective_min_sharpe` として記録される。
+
+**3. Cluster Dedup（クラスタ重複排除）**
+
+同じ (strategy, symbol) で全数値パラメータが ±15% 以内（リストパラメータは1ステップ以内）の候補は同一クラスタとみなす。クラスタ内では holdout Sharpe が最も高い採用戦略のみを保持し、それ以外は棄却。置き換えられた戦略は `superseded` リストに移動。
+
+**再検証モード**: `python3 autonomous_loop.py --revalidate` で全採用戦略を最新パイプラインで再評価し、不合格のものを降格する。
 
 ---
 

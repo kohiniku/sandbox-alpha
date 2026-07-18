@@ -203,38 +203,47 @@ class TestApplyTradingCost:
 
 
 class TestSplitWalkforward:
-    def test_70_30_split(self):
-        """Default 70/30 split: exact boundaries, no data loss."""
+    def test_60_20_20_split(self):
+        """Default 60/20/20 split: exact boundaries, no data loss."""
         df = pd.DataFrame({"Close": range(100)}, index=range(100))
-        train, test = split_walkforward(df)
-        assert len(train) == 70
-        assert len(test) == 30
-        assert len(train) + len(test) == 100
+        train, val, holdout = split_walkforward(df)
+        assert len(train) == 60
+        assert len(val) == 20
+        assert len(holdout) == 20
+        assert len(train) + len(val) + len(holdout) == 100
 
-    def test_boundary_no_overlap(self):
-        """Train and test sets are disjoint and contiguous."""
+    def test_boundary_no_overlap_train_val(self):
+        """Train and validation sets are disjoint and contiguous."""
         df = pd.DataFrame({"Close": range(50)}, index=range(50))
-        train, test = split_walkforward(df)
-        assert train.index.max() < test.index.min()
+        train, val, holdout = split_walkforward(df)
+        assert train.index.max() < val.index.min()
+
+    def test_boundary_no_overlap_val_holdout(self):
+        """Validation and holdout sets are disjoint and contiguous."""
+        df = pd.DataFrame({"Close": range(50)}, index=range(50))
+        train, val, holdout = split_walkforward(df)
+        assert val.index.max() < holdout.index.min()
 
     def test_custom_ratio(self):
         """Custom train_ratio honoured."""
         df = pd.DataFrame({"Close": range(100)}, index=range(100))
-        train, test = split_walkforward(df, train_ratio=0.8)
-        assert len(train) == 80
-        assert len(test) == 20
+        train, val, holdout = split_walkforward(df, train_ratio=0.7, val_ratio=0.1, holdout_ratio=0.2)
+        assert len(train) == 70
+        assert len(val) == 10
+        assert len(holdout) == 20
 
     def test_tiny_dataframe(self):
-        """Single-row DataFrame splits cleanly."""
+        """Single-row DataFrame splits cleanly — holdout gets the leftover."""
         df = pd.DataFrame({"Close": [100]}, index=pd.date_range("2024-01-02", periods=1))
-        train, test = split_walkforward(df)
-        assert len(train) + len(test) == 1
+        train, val, holdout = split_walkforward(df)
+        assert len(train) + len(val) + len(holdout) == 1
 
     def test_empty_frame(self):
         df = pd.DataFrame({"Close": []})
-        train, test = split_walkforward(df)
+        train, val, holdout = split_walkforward(df)
         assert len(train) == 0
-        assert len(test) == 0
+        assert len(val) == 0
+        assert len(holdout) == 0
 
 
 # -- strategy signal validity --
