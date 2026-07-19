@@ -14,8 +14,14 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-# 取引コスト: 片道 bps（デフォルト 5.0 = 0.05%）
-COST_BPS = 5.0
+from .metrics import (
+    COST_BPS,
+    load_cached_data,
+    split_walkforward,
+    apply_trading_cost,
+    calculate_metrics,
+    compute_split_metrics,
+)
 
 
 def fetch_data(symbol, period="5y"):
@@ -23,18 +29,6 @@ def fetch_data(symbol, period="5y"):
     import yfinance as yf
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period)
-    return df
-
-
-def load_cached_data(symbol, data_dir):
-    """Load data from a cached CSV file. No network dependency."""
-    path = os.path.join(data_dir, f"{symbol}.csv")
-    if not os.path.isfile(path):
-        print(json.dumps({"error": f"data not cached: {symbol}"}))
-        sys.exit(1)
-    df = pd.read_csv(path)
-    df["Date"] = pd.to_datetime(df["Date"], utc=True)
-    df = df.set_index("Date")
     return df
 
 
@@ -46,67 +40,6 @@ def fetch_and_cache(symbol, data_dir):
     df.to_csv(path, index=True)
     info = {"fetched": symbol, "rows": len(df), "path": path}
     return info
-
-
-def split_walkforward(df, train_ratio=0.6, val_ratio=0.2, holdout_ratio=0.2):
-    """Split data into train (in-sample), validation, and holdout segments chronologically."""
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = train_end + int(n * val_ratio)
-    return df.iloc[:train_end], df.iloc[train_end:val_end], df.iloc[val_end:]
-
-
-def apply_trading_cost(strategy_returns, signal):
-    """Apply per-trade cost: COST_BPS bps per side on each position change"""
-    if len(strategy_returns) == 0 or len(signal) == 0:
-        return strategy_returns
-    cost_frac = COST_BPS / 10000.0  # bps -> decimal
-    # Align signal with returns index (signal is lagged by 1)
-    sig_aligned = signal.shift(1).reindex(strategy_returns.index)
-    # Position changes (entry + exit = 2 sides per change)
-    pos_changes = sig_aligned.diff().abs().fillna(0)
-    cost_series = pos_changes * cost_frac
-    # Only apply cost on days where we actually have returns
-    cost_aligned = cost_series.reindex(strategy_returns.index, fill_value=0)
-    return strategy_returns - cost_aligned
-
-
-def calculate_metrics(returns, signal=None):
-    """
-    Calculate performance metrics.
-    - num_trades: counts position changes, not trading days
-    - drawdown: equity-curve (1+r).cumprod() based, compound-consistent with total_return
-    """
-    if len(returns) == 0:
-        return {"error": "No trades executed"}
-
-    # Compound total return
-    equity_curve = (1 + returns).cumprod()
-    total_return = equity_curve.iloc[-1] - 1
-
-    # Sharpe ratio (annualized)
-    sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
-
-    # Max drawdown from equity curve (compound-based)
-    running_max = equity_curve.cummax()
-    drawdowns = (equity_curve - running_max) / running_max
-    max_drawdown = drawdowns.min()
-
-    # num_trades: count actual position changes (not trading days)
-    if signal is not None and len(signal) > 0:
-        sig_changes = signal.diff().abs().fillna(0)
-        num_trades = int((sig_changes > 0).sum())
-    else:
-        num_trades = len(returns)
-
-    return {
-        "total_return_pct": round(total_return * 100, 2),
-        "sharpe_ratio": round(sharpe_ratio, 3),
-        "max_drawdown_pct": round(max_drawdown * 100, 2),
-        "num_trades": num_trades,
-        "avg_daily_return_pct": round(returns.mean() * 100, 4),
-        "cost_bps": COST_BPS,
-    }
 
 
 def run_strategy_on_segment(df, strategy_fn, params):
@@ -257,20 +190,17 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None)
     # In-sample (train)
     is_returns, is_signal = run_strategy_on_segment(train_df, strategy_fn, params)
     is_returns_net = apply_trading_cost(is_returns, is_signal)
-    is_metrics = calculate_metrics(is_returns_net, is_signal)
-    is_metrics["num_days"] = len(train_df)
+    is_metrics = compute_split_metrics(is_returns_net, is_signal, len(train_df))
 
     # Validation (out-of-sample)
     val_returns, val_signal = run_strategy_on_segment(val_df, strategy_fn, params)
     val_returns_net = apply_trading_cost(val_returns, val_signal)
-    val_metrics = calculate_metrics(val_returns_net, val_signal)
-    val_metrics["num_days"] = len(val_df)
+    val_metrics = compute_split_metrics(val_returns_net, val_signal, len(val_df))
 
     # Holdout
     holdout_returns, holdout_signal = run_strategy_on_segment(holdout_df, strategy_fn, params)
     holdout_returns_net = apply_trading_cost(holdout_returns, holdout_signal)
-    holdout_metrics = calculate_metrics(holdout_returns_net, holdout_signal)
-    holdout_metrics["num_days"] = len(holdout_df)
+    holdout_metrics = compute_split_metrics(holdout_returns_net, holdout_signal, len(holdout_df))
 
     result = {
         "strategy": strategy_name,
