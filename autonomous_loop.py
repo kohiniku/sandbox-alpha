@@ -3,6 +3,8 @@
 Autonomous Alpha Discovery Loop
 エージェントが仮説生成→バックテスト→評価→蓄積を自律的に回す
 """
+import base64
+import hashlib
 import json
 import math
 import os
@@ -258,8 +260,11 @@ def generate_hypothesis(knowledge):
         # 30%の確率で adopted 戦略の近傍を探索
         if knowledge.get("adopted") and random.random() < 0.3:
             adopted = random.choice(knowledge["adopted"])
-            adopted_params = adopted["hypothesis"]["params"]
             strategy_name = adopted["hypothesis"]["strategy"]
+            # Skip adopted entries whose strategy is not in STRATEGY_TEMPLATES (e.g. codegen)
+            if strategy_name not in STRATEGY_TEMPLATES:
+                continue
+            adopted_params = adopted["hypothesis"]["params"]
             symbol = adopted["hypothesis"]["symbol"]
             template = STRATEGY_TEMPLATES[strategy_name]
 
@@ -681,6 +686,239 @@ def _generate_with_llm_fallback(knowledge):
         return generate_hypothesis(knowledge), "(random)"
 
 
+# ---------------------------------------------------------------------------
+# Backlog consumption helpers
+# ---------------------------------------------------------------------------
+
+_EXTRA_CRITERIA_METRICS = {"sharpe_ratio", "total_return_pct", "max_drawdown_pct"}
+_EXTRA_CRITERIA_OPS = {">=", "<=", ">", "<"}
+
+
+def _parse_extra_criterion(crit_str):
+    """Parse a criterion string of the form '<metric> <op> <number>'.
+
+    Returns (metric, op, value) or (None, None, None) for unparseable.
+    """
+    parts = crit_str.split()
+    if len(parts) < 3:
+        return None, None, None
+    # Metric may be "sharpe_ratio" or "max_drawdown_pct" (multi-word)?
+    # The spec says single-metric — try the first token as metric and last token as value
+    metric = parts[0].strip()
+    if metric not in _EXTRA_CRITERIA_METRICS:
+        return None, None, None
+    # op should be the second token
+    op = parts[1].strip()
+    if op not in _EXTRA_CRITERIA_OPS:
+        return None, None, None
+    try:
+        value = float(parts[2])
+    except (ValueError, IndexError):
+        return None, None, None
+    return metric, op, value
+
+
+def _check_extra_criteria(metrics, extra_criteria):
+    """Evaluate extra_criteria against validation-split metrics.
+
+    Returns (all_pass: bool, failures: list of str).
+    Unparseable criteria are logged with a warning and ignored.
+    Failures are additive: they can only ADD strictness on top of global gates.
+    """
+    failures = []
+    for crit_str in extra_criteria:
+        metric, op, value = _parse_extra_criterion(crit_str)
+        if metric is None:
+            print(f"  ⚠️ 解釈不能なcriteria (無視): {crit_str}")
+            continue
+
+        actual = metrics.get(metric, -999)
+        passed = False
+        if op == ">=":
+            passed = actual >= value
+        elif op == "<=":
+            passed = actual <= value
+        elif op == ">":
+            passed = actual > value
+        elif op == "<":
+            passed = actual < value
+
+        if not passed:
+            failures.append(f"❌ Extra criterion failed: {metric} {op} {value} (actual={actual:.2f})")
+
+    return len(failures) == 0, failures
+
+
+def _consume_backlog_entry(knowledge):
+    """Try to consume one pending backlog entry.
+
+    Returns (entry, hypothesis, result, verdict, evaluation) if consumed,
+    or None if backlog is empty or entry cannot run.
+    """
+    from backlog import Backlog
+
+    backlog_path = os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json"))
+    bl = Backlog(backlog_path)
+    entry = bl.next_pending()
+
+    if entry is None:
+        return None
+
+    etype = entry["type"]
+    spec = entry["spec"]
+    source_info = entry["source"]
+    priority = entry["priority"]
+    eval_plan = entry.get("eval_plan", {})
+    extra_criteria = eval_plan.get("extra_criteria", [])
+
+    # Log
+    if etype == "param":
+        tag = f"[param] {spec['strategy']} on {spec['symbol']}"
+    else:
+        tag = f"[code] {spec.get('name', '?')} on {spec['symbol']}"
+    print(f"📥 バックログ消化: {tag} (priority {priority}, source {source_info.get('kind', '?')}:{source_info.get('ref', '?')})")
+
+    # Mark as testing
+    bl.mark(entry["id"], "testing")
+
+    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
+
+    # ── Route by type ──
+    if etype == "param":
+        # Param entry: use existing sandbox backtest path
+        hypothesis = {
+            "id": f"bl_{entry['id'][:12]}",
+            "strategy": spec["strategy"],
+            "symbol": spec["symbol"],
+            "params": spec["params"],
+            "description": f"Backlog param: {spec['strategy']} on {spec['symbol']}",
+            "generated_at": datetime.now().isoformat(),
+        }
+        result = run_backtest(hypothesis)
+
+    elif etype == "code":
+        # Code entry: POST to SANDBOX_RUNNER_URL/run_code
+        if not runner_url:
+            print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — コードエントリをpendingに戻します")
+            bl.mark(entry["id"], "pending")
+            return None
+
+        code_str = spec["code"]
+        code_b64 = base64.b64encode(code_str.encode("utf-8")).decode("ascii")
+
+        # Compute code_hash locally before sending
+        code_hash = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+
+        # Check duplicate: same code_hash + symbol in tested history
+        for rec in knowledge.get("adopted", []) + knowledge.get("rejected", []):
+            ev = rec.get("evaluation", {})
+            hyp = rec.get("hypothesis", {})
+            if ev.get("code_hash") == code_hash and hyp.get("symbol") == spec["symbol"]:
+                print(f"  ⚠️ 重複コードハッシュ (code_hash={code_hash[:12]}..., symbol={spec['symbol']}) → スキップ")
+                bl.mark(entry["id"], "done_rejected", {
+                    "verdict": "rejected",
+                    "reason": "duplicate_code",
+                    "summary": f"コードハッシュ重複: code_hash={code_hash[:12]}... on {spec['symbol']}",
+                    "finished_at": datetime.now().isoformat(),
+                })
+                return None
+
+        url = f"{runner_url.rstrip('/')}/run_code"
+        body = json.dumps({
+            "code_b64": code_b64,
+            "symbol": spec["symbol"],
+        }).encode("utf-8")
+
+        hypothesis = {
+            "id": f"bl_{entry['id'][:12]}",
+            "strategy": "codegen",
+            "symbol": spec["symbol"],
+            "params": {},
+            "description": f"Backlog code: {spec.get('name', 'codegen')} on {spec['symbol']}",
+            "generated_at": datetime.now().isoformat(),
+        }
+
+        print(f"  🔬 コードバックテスト実行中 (sandbox): {spec.get('name', 'codegen')} on {spec['symbol']}...")
+
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=240) as resp:
+                response_body = resp.read().decode("utf-8")
+                status = resp.status
+            if status != 200:
+                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}"}
+            else:
+                result = json.loads(response_body)
+                # Inject code_hash from harness response (or fallback to local)
+                if "code_hash" not in result:
+                    result["code_hash"] = code_hash
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")[:500]
+            except Exception:
+                pass
+            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}"}
+        except urllib.error.URLError as e:
+            result = {"error": f"Sandbox runner connection error: {e.reason}"}
+        except json.JSONDecodeError as e:
+            result = {"error": f"Sandbox runner JSON parse error: {e}"}
+        except Exception as e:
+            result = {"error": f"Sandbox runner error: {e}"}
+    else:
+        bl.mark(entry["id"], "pending")
+        return None
+
+    # ── Evaluate ──
+    verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
+
+    # ── Extra criteria ──
+    if verdict == "adopted" and extra_criteria:
+        # Use validation-split metrics (out_of_sample in result)
+        metrics = result.get("out_of_sample", result)
+        extra_pass, extra_failures = _check_extra_criteria(metrics, extra_criteria)
+        if not extra_pass:
+            evaluation["reasons"].extend(extra_failures)
+            verdict = "rejected"
+            evaluation["verdict"] = "rejected"
+
+    # ── Summary line ──
+    if verdict == "adopted":
+        val_sharpe = evaluation.get("sharpe_ratio", 0)
+        holdout_sharpe = evaluation.get("holdout_sharpe", 0)
+        summary = f"val Sharpe {val_sharpe:.2f} / holdout Sharpe {holdout_sharpe:.2f}"
+    else:
+        gate_results = evaluation.get("gate_results", {})
+        if evaluation.get("error"):
+            summary = f"failed gate: {evaluation['error'][:100]}"
+        elif not gate_results.get("validation", True):
+            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', -999):.2f})"
+        elif not gate_results.get("holdout", True):
+            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', -999):.2f})"
+        else:
+            # Check for extra_criteria failures in reasons
+            reasons = evaluation.get("reasons", [])
+            extra_fail = [r for r in reasons if "Extra criterion failed" in r]
+            if extra_fail:
+                summary = extra_fail[0].replace("❌ Extra criterion failed: ", "")
+            else:
+                summary = f"failed gate: cluster dedup or other"
+
+    finish_status = "done_adopted" if verdict == "adopted" else "done_rejected"
+    bl.mark(entry["id"], finish_status, {
+        "verdict": verdict,
+        "summary": summary,
+        "finished_at": datetime.now().isoformat(),
+    })
+
+    return entry, hypothesis, result, verdict, evaluation
+
+
+# ======================================================================
+
+
 def run_loop(num_iterations=3):
     """
     メインPDCAループ
@@ -700,8 +938,43 @@ def run_loop(num_iterations=3):
         knowledge["iterations"] += 1
         print(f"\n🔄 Iteration {i+1}/{num_iterations}")
         print("-" * 40)
-        
-        # 1. 仮説生成
+
+        # 0. Backlog consumption: try to consume a pending entry first
+        consumed = _consume_backlog_entry(knowledge)
+        if consumed:
+            entry_bk, hypothesis, result, verdict, evaluation = consumed
+
+            print(f"  📋 判定: {verdict.upper()}")
+            if isinstance(evaluation, dict) and "reasons" in evaluation:
+                for reason in evaluation["reasons"]:
+                    print(f"     {reason}")
+
+            # 5. 蓄積 (with source attribution)
+            record = save_result(hypothesis, result, verdict, evaluation)
+            # Add source attribution from backlog entry
+            record["source"] = entry_bk.get("source", {})
+
+            if verdict == "adopted":
+                record["cluster_id"] = evaluation.get("cluster_id", "unknown")
+                knowledge["adopted"].append(record)
+            else:
+                knowledge["rejected"].append(record)
+
+            update_family_aggregates(knowledge, record)
+
+            knowledge["tested"].append(hypothesis["id"])
+            knowledge["tested_combinations"].append({
+                "strategy": hypothesis["strategy"],
+                "symbol": hypothesis["symbol"],
+                "params": hypothesis["params"]
+            })
+            save_knowledge(knowledge)
+
+            if i < num_iterations - 1:
+                time.sleep(2)
+            continue
+
+        # 1. 仮説生成 (fallback: no backlog entry available)
         if use_llm:
             hypothesis, source_label = _generate_with_llm_fallback(knowledge)
             print(f"  🧠 ソース: {source_label}")
