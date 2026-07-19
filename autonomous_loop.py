@@ -624,6 +624,82 @@ def evaluate_result(hypothesis, result, knowledge):
     return "adopted", evaluation
 
 
+# ---------------------------------------------------------------------------
+# Near-miss classification
+# ---------------------------------------------------------------------------
+
+def _classify_near_miss(hypothesis, evaluation):
+    """Classify a rejected evaluation as near-miss if conditions met.
+
+    Returns a near-miss dict or None.
+    """
+    gate_results = evaluation.get("gate_results", {})
+    val_sharpe = evaluation.get("sharpe_ratio", -999)
+    eff_threshold = evaluation.get("effective_min_sharpe", 0)
+    holdout_sharpe = evaluation.get("holdout_sharpe")  # None if holdout never ran
+
+    failed_gate = None
+
+    # (b) passed validation Sharpe gate but failed later non-dedup gate
+    # Check this FIRST: it implies stronger signal than the 90% threshold rule
+    if not gate_results.get("validation", True) and eff_threshold > 0:
+        # Validation failed but Sharpe itself passed -- drawdown or return
+        if val_sharpe >= eff_threshold:
+            if evaluation.get("max_drawdown_pct", 0) < MAX_DRAWDOWN_LIMIT:
+                failed_gate = "max_drawdown"
+            else:
+                failed_gate = "val_return"
+
+    elif gate_results.get("validation", False):
+        # Validation passed -- check later gates
+        if not gate_results.get("holdout", True):
+            failed_gate = "holdout"
+        elif gate_results.get("cluster") == "duplicate_cluster":
+            return None  # dedup excluded
+        else:
+            # All structural gates passed -- check extra_criteria
+            reasons = evaluation.get("reasons", [])
+            if any("Extra criterion failed" in r for r in reasons):
+                failed_gate = "extra_criteria"
+
+    # (a) val_sharpe >= 90% of deflated threshold but validation failed
+    # Fallback: only applies when (b) didn't match
+    if failed_gate is None:
+        if not gate_results.get("validation", True) and eff_threshold > 0:
+            if val_sharpe >= 0.9 * eff_threshold:
+                failed_gate = "val_sharpe_90pct"
+
+    if failed_gate is None:
+        return None
+
+    return {
+        "id": hypothesis["id"],
+        "strategy": hypothesis["strategy"],
+        "symbol": hypothesis["symbol"],
+        "params": hypothesis["params"],
+        "val_sharpe": val_sharpe,
+        "deflated_threshold": round(eff_threshold, 4),
+        "holdout_sharpe": holdout_sharpe,
+        "failed_gate": failed_gate,
+        "date": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _record_near_miss(hypothesis, evaluation, knowledge):
+    """If the rejected evaluation qualifies as a near-miss, record it.
+
+    Caps the near_misses list at 30 most recent entries.
+    """
+    nm = _classify_near_miss(hypothesis, evaluation)
+    if nm is None:
+        return
+    near_misses = knowledge.setdefault("near_misses", [])
+    near_misses.append(nm)
+    # Cap at 30 most recent
+    if len(near_misses) > 30:
+        knowledge["near_misses"] = near_misses[-30:]
+
+
 def save_result(hypothesis, result, verdict, evaluation):
     """結果を保存"""
     record = {
@@ -958,6 +1034,7 @@ def run_loop(num_iterations=3):
                 record["cluster_id"] = evaluation.get("cluster_id", "unknown")
                 knowledge["adopted"].append(record)
             else:
+                _record_near_miss(hypothesis, evaluation, knowledge)
                 knowledge["rejected"].append(record)
 
             update_family_aggregates(knowledge, record)
@@ -1028,6 +1105,7 @@ def run_loop(num_iterations=3):
             record["cluster_id"] = evaluation.get("cluster_id", "unknown")
             knowledge["adopted"].append(record)
         else:
+            _record_near_miss(hypothesis, evaluation, knowledge)
             knowledge["rejected"].append(record)
         
         update_family_aggregates(knowledge, record)
@@ -1105,6 +1183,7 @@ def run_revalidation(knowledge):
             entry["verdict"] = "rejected"
             entry["evaluation"] = evaluation
             entry["rejected_reason"] = "revalidation_failed"
+            _record_near_miss(entry["hypothesis"], evaluation, knowledge)
             knowledge["rejected"].append(entry)
             demoted += 1
         update_family_aggregates(knowledge, entry)

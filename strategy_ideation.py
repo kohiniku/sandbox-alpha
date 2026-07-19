@@ -185,6 +185,41 @@ def _summarise_rejects(knowledge):
     return "\n".join(lines)
 
 
+def _summarise_near_misses(knowledge):
+    """Build a compact summary of near-miss entries for the LLM context.
+
+    These are directions that showed signal on validation but FAILED --
+    do not re-propose near-identical specs; instead vary symbol, regime
+    filter, or horizon. Holdout failures are a warning.
+    """
+    near_misses = knowledge.get("near_misses", [])
+    if not near_misses:
+        return None
+
+    lines = []
+    for nm in near_misses[-20:]:  # last 20 for token budget
+        strategy = nm.get("strategy", "?")
+        symbol = nm.get("symbol", "?")
+        params = json.dumps(nm.get("params", {}))
+        val_s = nm.get("val_sharpe", -999)
+        thresh = nm.get("deflated_threshold", 0)
+        holdout_s = nm.get("holdout_sharpe")
+        gate = nm.get("failed_gate", "?")
+        holdout_str = f" holdout_sharpe={holdout_s:.2f}" if holdout_s is not None else ""
+        lines.append(
+            f"  {strategy}/{symbol} params={params} val_sharpe={val_s:.2f}"
+            f" (thresh={thresh:.2f}){holdout_str} -- {gate}"
+        )
+
+    header = (
+        "NEAR-MISS ARCHIVE (signal on validation but FAILED):\n"
+        "Do NOT re-propose near-identical specs (validation-set hill-climbing). "
+        "Instead vary direction: different symbol, regime filter, or horizon. "
+        "Holdout failures = overfit warning."
+    )
+    return header + "\n" + "\n".join(lines)
+
+
 def _summarise_backlog(backlog):
     """Build a compact summary of current backlog to avoid duplicates."""
     data = backlog.load()
@@ -255,6 +290,7 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
         strategy_lines.append(f"- {name}: {desc}  param_space: {{{', '.join(parts)}}}")
 
     rejects_summary = _summarise_rejects(knowledge)
+    near_misses_text = _summarise_near_misses(knowledge)
 
     research_text = ""
     if research_docs:
@@ -268,6 +304,9 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
 
 === FAILURE HISTORY (rejected entries + family aggregates) ===
 {rejects_summary}
+
+=== NEAR-MISS ARCHIVE (signal on validation, failed later) ===
+{near_misses_text or "(no near-misses recorded yet)"}
 
 === CURRENT BACKLOG (avoid duplicates) ===
 {backlog_summary}
