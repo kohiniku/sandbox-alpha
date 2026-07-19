@@ -91,6 +91,10 @@ class Backlog:
         """
         data, fd = self._locked_read()
 
+        # Callers may pass entries without an id (documented as "replaced on add")
+        if not entry.get("id"):
+            entry["id"] = str(uuid.uuid4())
+
         # Dedup: identical spec vs any non-archived entry
         spec = entry["spec"]
         for e in data["entries"]:
