@@ -19,15 +19,39 @@ AIエージェントが仮説生成→バックテスト→評価→蓄積のPDC
 
 **自律的PDCAループ**：
 ```
-[仮説生成] → [バックテスト] → [評価]
-    ↑                            ↓
-[戦略破棄/採用] ← [ナレッジ更新]
+[戦略発案] ──→ [バックログ] ──→ [検証ループ] ──→ [評価]
+     ↑              ↑               │                │
+     │    strategy_ideation.py    │                │
+     │    (LLM提案パイプライン)    │                │
+     │                           ↓                ↓
+[研究文書]              ┌─ paramエントリ ──→ backtest_engine.py
+                       │                       OR
+                       └─ codeエントリ  ──→ sandbox-runner /run_code
+                                               │
+                                               ↓
+                                         [ナレッジ更新]
+                                         (採用/棄却・家族集計)
+```
+```
+ideation (LLM) → backlog (priority queue) → validation loop (consume)
+                     ↑                              │
+     strategy_ideation.py                  autonomous_loop.py
+     (研究文書・失敗知識から提案)           (param: 既存エンジン / code: 隔離実行)
+                                                   │
+                                                   ↓
+                                           evaluate + extra_criteria
+                                                   │
+                                        done_adopted / done_rejected
+                                        (source attribution + code_hash dedup)
 ```
 
-- エージェントがナレッジベース参照で仮説を生成（重複回避・adopted近傍探索）
-- 常設venv環境でサブプロセスとしてバックテストを実行
-- 閾値（Sharpe≥0.3, Return≥5%, Drawdown≥-25%）で自動判定
-- 結果をナレッジベースに蓄積し、次の仮説生成に活用
+- strategy_ideation.py が LLM で研究文書・失敗知識から backlog に提案を蓄積
+- autonomous_loop.py が各イテレーション開始時に backlog から最優先エントリを消化
+- param エントリ: 既存バックテストエンジンで実行（LLM/ランダム仮説生成をスキップ）
+- code エントリ: 隔離 sandbox-runner の /run_code エンドポイントに POST（base64コード + 銘柄）
+- extra_criteria でグローバルゲートに追加制約（sharpe_ratio/total_return_pct/max_drawdown_pct）
+- 結果を backlog に書き戻し（done_adopted / done_rejected）、source 帰属付きでナレッジに蓄積
+- code エントリは code_hash 重複チェック（同一コード+銘柄の再実行を防止）
 
 ---
 
@@ -119,14 +143,30 @@ python3 report.py --recent 20 --title "週次レポート"
 sandbox-alpha/
 ├── README.md                    # このファイル
 ├── requirements.txt             # 依存パッケージ
+├── requirements-dev.txt         # 開発用依存
 ├── .gitignore                   # gitignore
 │
-├── autonomous_loop.py           # メインPDCAループ
+├── autonomous_loop.py           # メインPDCAループ + backlog消費
+├── backlog.py                   # JSONファイル永続型優先度キュー
+├── strategy_ideation.py         # LLMによる戦略提案パイプライン
+├── llm_hypothesis.py            # LLM仮説生成モジュール
 ├── report.py                    # 結果レポート生成
 ├── knowledge.json               # ナレッジベース（自動生成）
 │
 ├── backtests/
-│   └── backtest_engine.py       # バックテストエンジン
+│   ├── backtest_engine.py       # バックテストエンジン
+│   ├── strategy_harness.py      # LLM生成コード用隔離ハーネス
+│   └── metrics.py               # 共通メトリクス (cost model, split, metrics)
+│
+├── tests/
+│   ├── test_backtest_engine.py   # バックテストエンジンのテスト
+│   ├── test_overfitting_guards.py # 過学習防止機構のテスト
+│   ├── test_llm_hypothesis.py    # LLM仮説生成のテスト
+│   ├── test_failure_distillation.py # 失敗知識蒸留のテスト
+│   ├── test_strategy_harness.py  # 戦略ハーネスのテスト
+│   ├── test_ideation.py          # 戦略発案のテスト
+│   ├── test_backlog.py           # backlogのテスト
+│   └── test_backlog_consumption.py # backlog消費パスのテスト
 │
 ├── results/                     # 各テスト結果JSON（自動生成）
 │   └── hyp_*.json
