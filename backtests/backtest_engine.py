@@ -14,7 +14,17 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-from .metrics import (
+try:  # package import (pytest) / script import (container)
+    from .metrics import (
+    COST_BPS,
+    load_cached_data,
+    split_walkforward,
+    apply_trading_cost,
+    calculate_metrics,
+    compute_split_metrics,
+)
+except ImportError:
+    from metrics import (
     COST_BPS,
     load_cached_data,
     split_walkforward,
