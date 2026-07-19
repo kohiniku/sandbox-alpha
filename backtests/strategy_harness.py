@@ -24,7 +24,16 @@ import io
 import numpy as np
 import pandas as pd
 
-from .metrics import (
+try:  # package import (pytest) / script import (container)
+    from .metrics import (
+    COST_BPS,
+    load_cached_data,
+    split_walkforward,
+    apply_trading_cost,
+    compute_split_metrics,
+)
+except ImportError:
+    from metrics import (
     COST_BPS,
     load_cached_data,
     split_walkforward,
@@ -143,6 +152,16 @@ SAFE_BUILTINS = {
     "ValueError": ValueError,
     "print": _PrintCatcher(),
 }
+
+
+def _safe_import(name, *args, **kwargs):
+    # AST 検査の許可リストと同一 — import 文を実行時にも同じ集合に制限する
+    if name.split(".")[0] in ("numpy", "pandas", "math"):
+        return __import__(name, *args, **kwargs)
+    raise ImportError(f"import not allowed: {name}")
+
+
+SAFE_BUILTINS["__import__"] = _safe_import
 
 
 def exec_and_extract(code_str, df):
