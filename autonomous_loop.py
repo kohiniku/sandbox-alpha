@@ -711,6 +711,11 @@ def _record_near_miss(hypothesis, evaluation, knowledge):
     nm = _classify_near_miss(hypothesis, evaluation)
     if nm is None:
         return
+    # Machine-greppable line so the cron reporter doesn't have to do arithmetic
+    holdout = nm["holdout_sharpe"]
+    print(f"NEAR_MISS {nm['strategy']}/{nm['symbol']} val={nm['val_sharpe']:.2f} "
+          f"thresh={nm['deflated_threshold']:.2f} holdout={holdout if holdout is not None else 'n/a'} "
+          f"gate={nm['failed_gate']}")
     near_misses = knowledge.setdefault("near_misses", [])
     near_misses.append(nm)
     # Cap at 30 most recent
