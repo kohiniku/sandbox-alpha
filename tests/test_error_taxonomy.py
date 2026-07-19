@@ -263,11 +263,18 @@ class TestKnowledgeBookkeeping:
 class TestBacklogAttempts:
     """Backlog entries retry infra errors (max 3 attempts), mark code errors immediately."""
 
-    def test_infra_error_retried_with_attempts_counter(self, tmp_path, monkeypatch):
-        """Infra error on backlog entry → re-marked 'pending' with attempts counter."""
+    def test_infra_error_retry_counter_persists_across_disk_roundtrip(self, tmp_path, monkeypatch):
+        """Infra error on backlog entry → attempts counter survives disk reload (not just in-memory).
+
+        Bug: the old code read entry.get('attempts') from the top-level in-memory dict,
+        but backlog.mark() only persists 'status' and 'result'. So the counter was
+        forever 1 — an entry hitting infra errors would loop indefinitely.
+        The fix reads from entry['result']['attempts'] which IS persisted.
+        """
         backlog_path = tmp_path / "test_backlog.json"
         monkeypatch.setenv("BACKLOG_PATH", str(backlog_path))
 
+        # Create entry
         bl = Backlog(str(backlog_path))
         entry = make_param_entry(
             strategy="sma_crossover", symbol="AAPL",
@@ -275,48 +282,60 @@ class TestBacklogAttempts:
             priority=0.9, source={"kind": "paper", "ref": "test.md"},
         )
         bl.add_entry(entry)
+        entry_id = entry["id"]
 
-        # Simulate two infra error retries
-        for attempt in range(1, 3):  # attempts 1, 2
-            attempts = entry.get("attempts", 0) + 1
-            if attempts < 3:
-                bl.mark(entry["id"], "pending", {
-                    "verdict": "error",
-                    "summary": f"infra error (attempt {attempts}/3)",
-                    "finished_at": "2026-07-19T00:00:00",
-                    "attempts": attempts,
-                })
-                entry["attempts"] = attempts
+        # --- Attempt 1: fresh Backlog instance reads from disk ---
+        bl1 = Backlog(str(backlog_path))
+        pending = bl1.next_pending()
+        assert pending is not None
+        assert pending["id"] == entry_id
 
-        data = bl.load()
-        e = [x for x in data["entries"] if x["id"] == entry["id"]][0]
-        assert e["status"] == "pending"
-        assert e["result"]["attempts"] == 2
-
-    def test_infra_error_after_3_attempts_marked_done_error(self, tmp_path, monkeypatch):
-        """After 3 infra error attempts → 'done_error'."""
-        backlog_path = tmp_path / "test_backlog.json"
-        monkeypatch.setenv("BACKLOG_PATH", str(backlog_path))
-
-        bl = Backlog(str(backlog_path))
-        entry = make_param_entry(
-            strategy="sma_crossover", symbol="AAPL",
-            params={"fast_window": 10, "slow_window": 30},
-            priority=0.9, source={"kind": "paper", "ref": "test.md"},
-        )
-        bl.add_entry(entry)
-
-        # Simulate 3rd attempt (exceeds max)
-        attempts = 3
-        bl.mark(entry["id"], "done_error", {
+        # Read attempts from result (where mark persists it)
+        attempts = (pending.get("result") or {}).get("attempts", 0) + 1
+        assert attempts == 1
+        bl1.mark(entry_id, "pending", {
             "verdict": "error",
-            "summary": f"infra error after {attempts} attempts",
+            "summary": f"infra error (attempt {attempts}/3)",
             "finished_at": "2026-07-19T00:00:00",
             "attempts": attempts,
         })
 
-        data = bl.load()
-        e = [x for x in data["entries"] if x["id"] == entry["id"]][0]
+        # --- Attempt 2: NEW Backlog instance, verify counter incremented ---
+        bl2 = Backlog(str(backlog_path))
+        pending2 = bl2.next_pending()
+        assert pending2 is not None
+        assert pending2["id"] == entry_id
+        # Verify counter came from result (disk round-trip)
+        assert (pending2.get("result") or {}).get("attempts") == 1
+        attempts2 = (pending2.get("result") or {}).get("attempts", 0) + 1
+        assert attempts2 == 2
+        bl2.mark(entry_id, "pending", {
+            "verdict": "error",
+            "summary": f"infra error (attempt {attempts2}/3)",
+            "finished_at": "2026-07-19T00:00:00",
+            "attempts": attempts2,
+        })
+
+        # --- Attempt 3: should become done_error (max 3) ---
+        bl3 = Backlog(str(backlog_path))
+        pending3 = bl3.next_pending()
+        assert pending3 is not None
+        assert (pending3.get("result") or {}).get("attempts") == 2
+        attempts3 = (pending3.get("result") or {}).get("attempts", 0) + 1
+        assert attempts3 == 3
+        bl3.mark(entry_id, "done_error", {
+            "verdict": "error",
+            "summary": f"infra error after {attempts3} attempts",
+            "finished_at": "2026-07-19T00:00:00",
+            "attempts": attempts3,
+        })
+
+        # --- Final check: entry is done_error, no longer pending ---
+        bl4 = Backlog(str(backlog_path))
+        assert bl4.next_pending() is None  # done_error is not pending
+
+        data = bl4.load()
+        e = [x for x in data["entries"] if x["id"] == entry_id][0]
         assert e["status"] == "done_error"
         assert e["result"]["attempts"] == 3
 

@@ -1013,7 +1013,9 @@ def _consume_backlog_entry(knowledge):
     # Route error verdicts for backlog entries
     if verdict == "error":
         # Infra error: retry with attempts counter
-        attempts = entry.get("attempts", 0) + 1
+        # attempts persists inside result (backlog.mark writes only status + result),
+        # so read from result dict, not from entry top-level.
+        attempts = (entry.get("result") or {}).get("attempts", 0) + 1
         if attempts < 3:
             error_text = evaluation.get("error", "")[:200]
             bl.mark(entry["id"], "pending", {
@@ -1023,8 +1025,6 @@ def _consume_backlog_entry(knowledge):
                 "finished_at": datetime.now().isoformat(),
                 "attempts": attempts,
             })
-            # Also update the in-memory entry's attempts so future reads see it
-            entry["attempts"] = attempts
         else:
             bl.mark(entry["id"], "done_error", {
                 "verdict": verdict,
