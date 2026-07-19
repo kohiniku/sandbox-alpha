@@ -123,6 +123,7 @@ def load_knowledge():
         # 後方互換: 古いナレッジファイルに不足キーを補完
         data.setdefault("tested_combinations", [])
         data.setdefault("superseded", [])
+        data.setdefault("errors", [])
         # Migration: rebuild "families" from history if missing
         if "families" not in data:
             data["families"] = _rebuild_families_from_history(data)
@@ -130,7 +131,7 @@ def load_knowledge():
             KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2, default=str))
         return data
     return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
-            "superseded": [], "families": {}, "iterations": 0}
+            "superseded": [], "families": {}, "iterations": 0, "errors": []}
 
 
 def _rebuild_families_from_history(knowledge):
@@ -397,9 +398,13 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params):
             status = resp.status
 
         if status != 200:
-            return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}"}
+            return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}", "error_type": "infra"}
 
-        return json.loads(response_body)
+        result = json.loads(response_body)
+        # Runner-reported error (strategy code failure) → tag as code
+        if isinstance(result, dict) and "error" in result:
+            result.setdefault("error_type", "code")
+        return result
 
     except urllib.error.HTTPError as e:
         error_body = ""
@@ -407,13 +412,13 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params):
             error_body = e.read().decode("utf-8")[:500]
         except Exception:
             pass
-        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}"}
+        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
     except urllib.error.URLError as e:
-        return {"error": f"Sandbox runner connection error: {e.reason}"}
+        return {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
     except json.JSONDecodeError as e:
-        return {"error": f"Sandbox runner JSON parse error: {e}"}
+        return {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
     except Exception as e:
-        return {"error": f"Sandbox runner error: {e}"}
+        return {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
 
 
 def _run_backtest_subprocess(strategy, symbol, params):
@@ -437,7 +442,7 @@ def _run_backtest_subprocess(strategy, symbol, params):
         )
 
         if result.returncode != 0:
-            return {"error": result.stderr}
+            return {"error": result.stderr, "error_type": "code"}
 
         # stdoutからJSONブロックを抽出（最初の{から最後の}まで）
         stdout = result.stdout
@@ -448,12 +453,12 @@ def _run_backtest_subprocess(strategy, symbol, params):
             json_str = stdout[start_idx:end_idx + 1]
             return json.loads(json_str)
 
-        return {"error": "Could not parse output", "raw": stdout[:500]}
+        return {"error": "Could not parse output", "error_type": "infra", "raw": stdout[:500]}
 
     except subprocess.TimeoutExpired:
-        return {"error": "Timeout (120s)"}
+        return {"error": "Timeout (120s)", "error_type": "infra"}
     except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}"}
+        return {"error": f"JSON parse error: {e}", "error_type": "infra"}
 
 
 def evaluate_result(hypothesis, result, knowledge):
@@ -462,7 +467,20 @@ def evaluate_result(hypothesis, result, knowledge):
     Returns (verdict, evaluation_dict).
     """
     if "error" in result:
-        return "rejected", {"verdict": "rejected", "error": result["error"], "reasons": [f"❌ Error: {result['error']}"]}
+        error_type = result.get("error_type", "error")  # safe default: unknown = error
+        if error_type == "infra":
+            return "error", {"verdict": "error", "error": result["error"],
+                             "error_type": "infra",
+                             "reasons": [f"🔧 Infra error (not counted as rejection): {result['error']}"]}
+        elif error_type == "code":
+            return "code_error", {"verdict": "code_error", "error": result["error"],
+                                  "error_type": "code",
+                                  "reasons": [f"💻 Code error (strategy code crashed): {result['error']}"]}
+        else:
+            # Unknown error_type → safe default: error (never rejection)
+            return "error", {"verdict": "error", "error": result["error"],
+                             "error_type": "unknown",
+                             "reasons": [f"🔧 Unknown error (not counted as rejection): {result['error']}"]}
 
     wf = result.get("walkforward", {})
     if not wf.get("enabled"):
@@ -721,15 +739,22 @@ def print_report(knowledge):
     adopted = len(knowledge["adopted"])
     rejected = len(knowledge["rejected"])
     superseded = len(knowledge.get("superseded", []))
+    errors = knowledge.get("errors", [])
+    n_infra = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "infra")
+    n_code = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "code")
     total = adopted + rejected
-    
+
     print(f"\n{'='*60}")
     print(f"📊 Alpha Discovery Report (Iteration {knowledge['iterations']})")
     print(f"{'='*60}")
     print(f"  採用: {adopted}件 / テスト: {total}件 (採用率: {adopted/max(total,1)*100:.1f}%)")
     if superseded > 0:
         print(f"  上書き: {superseded}件 (superseded)")
-    
+    if n_infra > 0:
+        print(f"  🔧 インフラエラー: {n_infra}件 (not counted as rejection)")
+    if n_code > 0:
+        print(f"  💻 コードエラー: {n_code}件 (strategy code crashed)")
+
     if adopted > 0:
         print(f"\n  🏆 採用された戦略:")
         for s in knowledge["adopted"][-5:]:
@@ -924,9 +949,12 @@ def _consume_backlog_entry(knowledge):
                 response_body = resp.read().decode("utf-8")
                 status = resp.status
             if status != 200:
-                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}"}
+                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}", "error_type": "infra"}
             else:
                 result = json.loads(response_body)
+                # Runner-reported error (strategy code failure) → tag as code
+                if isinstance(result, dict) and "error" in result:
+                    result.setdefault("error_type", "code")
                 # Inject code_hash from harness response (or fallback to local)
                 if "code_hash" not in result:
                     result["code_hash"] = code_hash
@@ -936,13 +964,13 @@ def _consume_backlog_entry(knowledge):
                 error_body = e.read().decode("utf-8")[:500]
             except Exception:
                 pass
-            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}"}
+            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
         except urllib.error.URLError as e:
-            result = {"error": f"Sandbox runner connection error: {e.reason}"}
+            result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
         except json.JSONDecodeError as e:
-            result = {"error": f"Sandbox runner JSON parse error: {e}"}
+            result = {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
         except Exception as e:
-            result = {"error": f"Sandbox runner error: {e}"}
+            result = {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
     else:
         bl.mark(entry["id"], "pending")
         return None
@@ -982,12 +1010,43 @@ def _consume_backlog_entry(knowledge):
             else:
                 summary = f"failed gate: cluster dedup or other"
 
-    finish_status = "done_adopted" if verdict == "adopted" else "done_rejected"
-    bl.mark(entry["id"], finish_status, {
-        "verdict": verdict,
-        "summary": summary,
-        "finished_at": datetime.now().isoformat(),
-    })
+    # Route error verdicts for backlog entries
+    if verdict == "error":
+        # Infra error: retry with attempts counter
+        # attempts persists inside result (backlog.mark writes only status + result),
+        # so read from result dict, not from entry top-level.
+        attempts = (entry.get("result") or {}).get("attempts", 0) + 1
+        if attempts < 3:
+            error_text = evaluation.get("error", "")[:200]
+            bl.mark(entry["id"], "pending", {
+                "verdict": verdict,
+                "error": error_text,
+                "summary": f"infra error (attempt {attempts}/3): {error_text}",
+                "finished_at": datetime.now().isoformat(),
+                "attempts": attempts,
+            })
+        else:
+            bl.mark(entry["id"], "done_error", {
+                "verdict": verdict,
+                "error": evaluation.get("error", "")[:200],
+                "summary": f"infra error after {attempts} attempts: {evaluation.get('error', '')[:200]}",
+                "finished_at": datetime.now().isoformat(),
+                "attempts": attempts,
+            })
+    elif verdict == "code_error":
+        bl.mark(entry["id"], "done_error", {
+            "verdict": verdict,
+            "error": evaluation.get("error", "")[:200],
+            "summary": f"code error: {evaluation.get('error', '')[:200]}",
+            "finished_at": datetime.now().isoformat(),
+        })
+    else:
+        finish_status = "done_adopted" if verdict == "adopted" else "done_rejected"
+        bl.mark(entry["id"], finish_status, {
+            "verdict": verdict,
+            "summary": summary,
+            "finished_at": datetime.now().isoformat(),
+        })
 
     return entry, hypothesis, result, verdict, evaluation
 
@@ -1030,21 +1089,26 @@ def run_loop(num_iterations=3):
             # Add source attribution from backlog entry
             record["source"] = entry_bk.get("source", {})
 
-            if verdict == "adopted":
+            if verdict in ("error", "code_error"):
+                knowledge.setdefault("errors", []).append(record)
+                if len(knowledge["errors"]) > 100:
+                    knowledge["errors"] = knowledge["errors"][-100:]
+            elif verdict == "adopted":
                 record["cluster_id"] = evaluation.get("cluster_id", "unknown")
                 knowledge["adopted"].append(record)
             else:
                 _record_near_miss(hypothesis, evaluation, knowledge)
                 knowledge["rejected"].append(record)
 
-            update_family_aggregates(knowledge, record)
+            if verdict not in ("error", "code_error"):
+                update_family_aggregates(knowledge, record)
+                knowledge["tested"].append(hypothesis["id"])
+                knowledge["tested_combinations"].append({
+                    "strategy": hypothesis["strategy"],
+                    "symbol": hypothesis["symbol"],
+                    "params": hypothesis["params"]
+                })
 
-            knowledge["tested"].append(hypothesis["id"])
-            knowledge["tested_combinations"].append({
-                "strategy": hypothesis["strategy"],
-                "symbol": hypothesis["symbol"],
-                "params": hypothesis["params"]
-            })
             save_knowledge(knowledge)
 
             if i < num_iterations - 1:
@@ -1087,44 +1151,59 @@ def run_loop(num_iterations=3):
             save_knowledge(knowledge)
             continue
 
-        # 3. バックテスト実行
+        # 3. バックテスト実行（インフラエラーの場合は1回だけリトライ）
         result = run_backtest(hypothesis)
-        
+        if "error" in result and result.get("error_type") == "infra":
+            print(f"  🔄 インフラエラー → リトライ: {result['error'][:80]}")
+            time.sleep(2)
+            result = run_backtest(hypothesis)
+
         # 4. 評価
         verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
-        
+
         print(f"  📋 判定: {verdict.upper()}")
         if isinstance(evaluation, dict) and "reasons" in evaluation:
             for reason in evaluation["reasons"]:
                 print(f"     {reason}")
-        
+
         # 5. 蓄積
         record = save_result(hypothesis, result, verdict, evaluation)
-        
-        if verdict == "adopted":
+
+        if verdict in ("error", "code_error"):
+            knowledge.setdefault("errors", []).append(record)
+            if len(knowledge["errors"]) > 100:
+                knowledge["errors"] = knowledge["errors"][-100:]
+        elif verdict == "adopted":
             record["cluster_id"] = evaluation.get("cluster_id", "unknown")
             knowledge["adopted"].append(record)
         else:
             _record_near_miss(hypothesis, evaluation, knowledge)
             knowledge["rejected"].append(record)
-        
-        update_family_aggregates(knowledge, record)
-        
-        knowledge["tested"].append(hypothesis["id"])
-        knowledge["tested_combinations"].append({
-            "strategy": hypothesis["strategy"],
-            "symbol": hypothesis["symbol"],
-            "params": hypothesis["params"]
-        })
+
+        if verdict not in ("error", "code_error"):
+            update_family_aggregates(knowledge, record)
+            knowledge["tested"].append(hypothesis["id"])
+            knowledge["tested_combinations"].append({
+                "strategy": hypothesis["strategy"],
+                "symbol": hypothesis["symbol"],
+                "params": hypothesis["params"]
+            })
+
         save_knowledge(knowledge)
-        
+
         # 少し待機（APIレート制限対策）
         if i < num_iterations - 1:
             time.sleep(2)
     
     # 最終レポート
     print_report(knowledge)
-    
+
+    # Machine-greppable error summary for cron reporters
+    errors = knowledge.get("errors", [])
+    n_infra = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "infra")
+    n_code = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "code")
+    print(f"ERRORS_SUMMARY infra={n_infra} code={n_code}")
+
     return knowledge
 
 
@@ -1157,12 +1236,28 @@ def run_revalidation(knowledge):
         if "error" in result:
             print(f"  ❌ バックテスト失敗: {result['error']}")
             demoted += 1
-            entry["verdict"] = "rejected"
-            entry["evaluation"] = {"verdict": "rejected", "error": result["error"],
-                                   "reasons": [f"revalidation_failed: {result['error']}"],
-                                   "gate_results": {}}
-            knowledge["rejected"].append(entry)
-            update_family_aggregates(knowledge, entry)
+            error_type = result.get("error_type", "unknown")
+            if error_type == "infra":
+                entry["verdict"] = "error"
+                entry["evaluation"] = {"verdict": "error", "error": result["error"],
+                                       "error_type": "infra",
+                                       "reasons": [f"revalidation failed (infra): {result['error']}"],
+                                       "gate_results": {}}
+                knowledge.setdefault("errors", []).append(entry)
+            elif error_type == "code":
+                entry["verdict"] = "code_error"
+                entry["evaluation"] = {"verdict": "code_error", "error": result["error"],
+                                       "error_type": "code",
+                                       "reasons": [f"revalidation failed (code): {result['error']}"],
+                                       "gate_results": {}}
+                knowledge.setdefault("errors", []).append(entry)
+            else:
+                entry["verdict"] = "rejected"
+                entry["evaluation"] = {"verdict": "rejected", "error": result["error"],
+                                       "reasons": [f"revalidation_failed: {result['error']}"],
+                                       "gate_results": {}}
+                knowledge["rejected"].append(entry)
+                update_family_aggregates(knowledge, entry)
             continue
 
         # Re-evaluate with current gates

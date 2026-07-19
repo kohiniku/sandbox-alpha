@@ -185,6 +185,37 @@ def _summarise_rejects(knowledge):
     return "\n".join(lines)
 
 
+def _summarise_code_errors(knowledge):
+    """Build a compact RECENT CODE ERRORS section for the LLM context.
+
+    These are strategy ideas whose generated code crashed at runtime —
+    they were never actually evaluated. The LLM may re-propose the idea
+    with FIXED code, avoiding these exact bugs.
+    """
+    errors = knowledge.get("errors", [])
+    code_errors = [e for e in errors
+                   if e.get("evaluation", {}).get("error_type") == "code"]
+    if not code_errors:
+        return None
+
+    lines = []
+    for ce in code_errors[-10:]:  # last 10
+        hyp = ce.get("hypothesis", {})
+        name = hyp.get("description", hyp.get("strategy", "?"))
+        symbol = hyp.get("symbol", "?")
+        err_text = ce.get("evaluation", {}).get("error", "?")
+        # One-line error: first 120 chars
+        one_line = err_text.split("\n")[0][:120]
+        lines.append(f"  {name}/{symbol} — {one_line}")
+
+    header = (
+        "RECENT CODE ERRORS (these were never evaluated — their generated code crashed):\n"
+        "You may re-propose the idea with FIXED code. IMPORTANT: df columns are "
+        "capitalized (e.g. 'Close' not 'close', 'Open' not 'open')."
+    )
+    return header + "\n" + "\n".join(lines)
+
+
 def _summarise_near_misses(knowledge):
     """Build a compact summary of near-miss entries for the LLM context.
 
@@ -291,6 +322,7 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
 
     rejects_summary = _summarise_rejects(knowledge)
     near_misses_text = _summarise_near_misses(knowledge)
+    code_errors_text = _summarise_code_errors(knowledge)
 
     research_text = ""
     if research_docs:
@@ -313,6 +345,9 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
 
 === RECENT RESEARCH ===
 {research_text or "(no research documents available)"}
+
+=== RECENT CODE ERRORS (never evaluated — code crashed) ===
+{code_errors_text or "(no recent code errors)"}
 
 === YOUR TASK ===
 Propose up to {max_proposals} new strategy candidates. Ground each in either:
