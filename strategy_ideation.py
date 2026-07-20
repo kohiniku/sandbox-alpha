@@ -40,7 +40,7 @@ from llm_hypothesis import _SYMBOL_RE
 from autonomous_loop import STRATEGY_TEMPLATES
 
 # Import manifest module (Phase 0 PR-A)
-from manifest import StrategyManifest, ManifestValidationError
+from manifest import StrategyManifest, ManifestValidationError, VALID_METRICS
 
 # ---------------------------------------------------------------------------
 # Config
@@ -353,6 +353,13 @@ _MANIFEST_JSON_SCHEMA = """{
     }
   ]
 }"""
+
+_ALLOWED_METRICS_NOTE = (
+    "IMPORTANT — evaluator.metrics MUST be a subset of this exact list "
+    "(any other name will fail validation and the whole manifest is dropped): "
+    + ", ".join(sorted(VALID_METRICS)) + "."
+)
+
 
 _EXPERT_MODE_CATALOG = """Expert mode unlocks:
 - RL/deep learning training loops (PyTorch allowed, GPU optional)
@@ -1063,6 +1070,8 @@ For code-type: include a COMPLETE `def generate_signals(df):` function.
 Interface contract: df has DatetimeIndex, columns Open/High/Low/Close/Volume (capitalized),
 NO 'Date' column, return pd.Series({-1,0,1}) aligned to df.index.
 
+{_ALLOWED_METRICS_NOTE}
+
 Return ONLY this JSON:
 {_PROPOSAL_JSON_SCHEMA}"""
 
@@ -1402,6 +1411,8 @@ IMPORTANT: For expert-mode manifests:
 
 Favor NOVEL families (low n_trials) and ideas that survived strong attacks.
 For code_b64: base64-encode complete self-contained Python source.
+
+{_ALLOWED_METRICS_NOTE}
 
 Return ONLY this JSON (no markdown, no commentary):
 {_MANIFEST_JSON_SCHEMA}"""
