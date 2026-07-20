@@ -1,0 +1,21 @@
+"""
+Data adapters for sandbox-alpha v2.
+
+Each adapter reads from the runner's cached data volume and returns
+pandas objects aligned with the existing engine conventions
+(DatetimeIndex, columns Open/High/Low/Close/Volume).
+"""
+
+from data_adapters.ohlcv import (
+    MissingDataError,
+    align_universe,
+    load_ohlcv,
+    to_wide,
+)
+
+__all__ = [
+    "MissingDataError",
+    "align_universe",
+    "load_ohlcv",
+    "to_wide",
+]
