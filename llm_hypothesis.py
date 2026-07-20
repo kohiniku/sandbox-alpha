@@ -25,13 +25,35 @@ from datetime import datetime
 _STRATEGY_NAMES = {"sma_crossover", "mean_reversion", "momentum", "rsi"}
 
 
-def _http_post_json(url, headers, payload, timeout):
-    # stdlib のみ: 実行環境 (hermes コンテナ) に requests が無いため
+def _http_post_json(url, headers, payload, timeout, retries=2):
+    """POST with timeout retries.
+
+    DeepSeek pro often takes 30-90s for reasoning-heavy prompts; a single
+    30s timeout throws away 7/10 iterations to random fallback. Retry the
+    request with the same params on timeout (not on HTTP 4xx/5xx — those
+    are terminal). Each retry has the same timeout ceiling.
+    """
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (TimeoutError, urllib.error.URLError) as e:
+            # URLError wraps socket timeouts too
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+                last_err = f"attempt {attempt + 1}/{retries + 1}: timeout after {timeout}s"
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+            raise
+        except Exception:
+            raise
+    # unreachable, but for clarity
+    raise TimeoutError(last_err or "all retries timed out")
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
 
@@ -316,7 +338,7 @@ def generate(knowledge, templates):
             "max_tokens": int(os.environ.get("HYPO_LLM_MAX_TOKENS", "2048")),
             "response_format": {"type": "json_object"},
         },
-        timeout=30,
+        timeout=int(os.environ.get("HYPO_LLM_TIMEOUT", "120")),
     )
     content = body["choices"][0]["message"]["content"].strip()
 
