@@ -1409,17 +1409,29 @@ Return ONLY this JSON (no markdown, no commentary):
         {"role": "user", "content": select_prompt},
     ]
 
-    # Retry logic: 2 attempts
+    # Retry logic: 3 attempts with progressively larger token budget + lower
+    # temperature. Empirically the failure mode is "unterminated string" from
+    # the manifest schema being verbose enough to hit the token cap, followed
+    # by JSON drift when the model is too creative on retry.
+    attempts_cfg = [
+        {"max_tokens": 8192, "temperature": 0.7},
+        {"max_tokens": 12288, "temperature": 0.3},
+        {"max_tokens": 16384, "temperature": 0.1},
+    ]
     last_err = None
-    for attempt in range(2):
+    for attempt, cfg in enumerate(attempts_cfg):
         try:
-            response = _call_llm(select_messages, max_tokens=8192)  # larger tokens for manifests
+            response = _call_llm(
+                select_messages,
+                max_tokens=cfg["max_tokens"],
+                temperature=cfg["temperature"],
+            )
             manifests_raw = response.get("manifests", [])
 
             if not manifests_raw:
                 last_err = "empty manifests list"
-                if attempt == 0:
-                    print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
+                if attempt < len(attempts_cfg) - 1:
+                    print(f"⚠️  Stage 3 v3 select retry ({attempt+1}/{len(attempts_cfg)}): {last_err}", file=sys.stderr)
                 continue
 
             # Parse and validate each manifest
@@ -1447,17 +1459,17 @@ Return ONLY this JSON (no markdown, no commentary):
 
             if not parsed:
                 last_err = "all manifests failed validation"
-                if attempt == 0:
-                    print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
+                if attempt < len(attempts_cfg) - 1:
+                    print(f"⚠️  Stage 3 v3 select retry ({attempt+1}/{len(attempts_cfg)}): {last_err}", file=sys.stderr)
                 continue
 
             return parsed, fallback_used
 
         except Exception as e:
             last_err = str(e)
-        if attempt == 0:
-            print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
-    raise RuntimeError(f"select v3 failed after 2 attempts: {last_err}")
+        if attempt < len(attempts_cfg) - 1:
+            print(f"⚠️  Stage 3 v3 select retry ({attempt+1}/{len(attempts_cfg)}): {last_err}", file=sys.stderr)
+    raise RuntimeError(f"select v3 failed after {len(attempts_cfg)} attempts: {last_err}")
 
 
 def _preflight_manifest(manifest_dict):
