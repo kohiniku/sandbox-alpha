@@ -32,6 +32,7 @@ VALID_COMPUTE_MODES = frozenset({"inference", "training"})
 VALID_EVALUATOR_TYPES = frozenset({"portfolio", "single_asset", "custom"})
 VALID_EXECUTION_MODES = frozenset({"structured", "expert"})
 VALID_NEWS_SOURCES = frozenset({"arxiv_investment", "general_arxiv"})
+VALID_MACRO_FREQUENCIES = frozenset({"daily", "weekly", "monthly", "quarterly"})
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,48 @@ class NewsSentimentSource(DataSource):
             "start": self.start,
             "source": self.source,
             "min_relevance": self.min_relevance,
+        }
+        if self.end is not None:
+            result["end"] = self.end
+        return result
+
+
+@DataSource.register("macro")
+class MacroSource(DataSource):
+    """Macroeconomic data source from FRED series (Phase 2 PR-K).
+
+    Reads pre-cached CSV files from a macro corpus directory.
+    Each series is stored as ``{series_id}.csv`` with date + value columns.
+    """
+
+    def __init__(
+        self,
+        series: Optional[List[str]] = None,
+        start: str = "",
+        end: Optional[str] = None,
+        frequency: str = "monthly",
+    ) -> None:
+        super().__init__(source_type="macro")
+        self.series: List[str] = series if series is not None else []
+        self.start = start
+        self.end = end
+        self.frequency = frequency
+
+    @classmethod
+    def _from_dict(cls, d: Dict[str, Any]) -> "MacroSource":
+        return cls(
+            series=d.get("series", []),
+            start=d.get("start", ""),
+            end=d.get("end"),
+            frequency=d.get("frequency", "monthly"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "type": self.type,
+            "series": self.series,
+            "start": self.start,
+            "frequency": self.frequency,
         }
         if self.end is not None:
             result["end"] = self.end
@@ -363,6 +406,8 @@ class StrategyManifest:
                 violations.extend(_validate_ohlcv_source(ds, i))
             elif isinstance(ds, NewsSentimentSource):
                 violations.extend(_validate_news_sentiment_source(ds, i))
+            elif isinstance(ds, MacroSource):
+                violations.extend(_validate_macro_source(ds, i))
 
         # 4. model_artifacts
         for i, ma in enumerate(self.model_artifacts):
@@ -538,5 +583,55 @@ def _validate_news_sentiment_source(source: "NewsSentimentSource", index: int) -
                 f"data_sources[{index}].min_relevance must be in [0.0, 1.0], "
                 f"got {mr}"
             )
+
+    return violations
+
+
+def _validate_macro_source(source: "MacroSource", index: int) -> List[str]:
+    """Validate MacroSource fields."""
+    violations: List[str] = []
+
+    # series: required, non-empty list of strings
+    if not isinstance(source.series, list) or len(source.series) == 0:
+        violations.append(
+            f"data_sources[{index}].series must be a non-empty list"
+        )
+    else:
+        for j, sid in enumerate(source.series):
+            if not isinstance(sid, str) or not sid:
+                violations.append(
+                    f"data_sources[{index}].series[{j}] must be a non-empty string"
+                )
+
+    # start: required, YYYY-MM-DD
+    if not source.start or not isinstance(source.start, str):
+        violations.append(
+            f"data_sources[{index}].start must be a non-empty string"
+        )
+    elif not DATE_REGEX.match(source.start):
+        violations.append(
+            f"data_sources[{index}].start '{source.start}' "
+            f"must be YYYY-MM-DD format"
+        )
+
+    # end: optional, YYYY-MM-DD
+    if source.end is not None:
+        if not isinstance(source.end, str):
+            violations.append(
+                f"data_sources[{index}].end must be a string or null"
+            )
+        elif not DATE_REGEX.match(source.end):
+            violations.append(
+                f"data_sources[{index}].end '{source.end}' "
+                f"must be YYYY-MM-DD format"
+            )
+
+    # frequency: must be in valid set
+    if source.frequency not in VALID_MACRO_FREQUENCIES:
+        violations.append(
+            f"data_sources[{index}].frequency must be one of "
+            f"{sorted(VALID_MACRO_FREQUENCIES)}, "
+            f"got '{source.frequency}'"
+        )
 
     return violations

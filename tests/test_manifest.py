@@ -630,3 +630,127 @@ class TestNewsSentimentSource:
         ds = DataSource.from_dict(d)
         assert isinstance(ds, NewsSentimentSource)
         assert ds.source == "arxiv_investment"
+
+
+# ---------------------------------------------------------------------------
+# MacroSource validation (Phase 2 PR-K)
+# ---------------------------------------------------------------------------
+
+class TestMacroSource:
+    def test_valid_macro_source(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10", "UNRATE"],
+             "start": "2020-01-01", "frequency": "monthly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_with_end_and_quarterly(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DFF", "CPIAUCSL"],
+             "start": "2020-01-01", "end": "2024-12-31",
+             "frequency": "quarterly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_all_frequencies(self):
+        for freq in ["daily", "weekly", "monthly", "quarterly"]:
+            d = _minimal_dict()
+            d["data_sources"] = [
+                {"type": "macro", "series": ["DGS10"],
+                 "start": "2020-01-01", "frequency": freq}
+            ]
+            m = StrategyManifest.from_dict(d)
+            assert m.validate() == []
+
+    def test_empty_series(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": [], "start": "2020-01-01",
+             "frequency": "monthly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("series" in v for v in violations)
+
+    def test_invalid_frequency(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10"],
+             "start": "2020-01-01", "frequency": "yearly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("frequency" in v and "yearly" in v for v in violations)
+
+    def test_bad_start_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10"],
+             "start": "2020/01/01", "frequency": "monthly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("start" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_bad_end_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10"],
+             "start": "2020-01-01", "end": "not-a-date",
+             "frequency": "monthly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("end" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_empty_series_id(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["", "UNRATE"],
+             "start": "2020-01-01", "frequency": "monthly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("series[0]" in v for v in violations)
+
+    def test_default_frequency(self):
+        """Default frequency is monthly."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10"],
+             "start": "2020-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        ds = m.data_sources[0]
+        assert ds.frequency == "monthly"
+        assert m.validate() == []
+
+    def test_roundtrip_macro_source(self):
+        """Round-trip preserves all fields including end."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "macro", "series": ["DGS10", "DGS2", "UNRATE"],
+             "start": "2020-01-01", "end": "2024-12-31",
+             "frequency": "weekly"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        out = m.to_dict()
+        ds_out = out["data_sources"][0]
+        assert ds_out["type"] == "macro"
+        assert ds_out["series"] == ["DGS10", "DGS2", "UNRATE"]
+        assert ds_out["frequency"] == "weekly"
+        assert "end" in ds_out
+
+    def test_registry_dispatch(self):
+        """MacroSource is correctly dispatched by DataSource.from_dict."""
+        d = {"type": "macro", "series": ["DGS10", "UNRATE"],
+             "start": "2020-01-01", "frequency": "monthly"}
+        from manifest import MacroSource
+        ds = DataSource.from_dict(d)
+        assert isinstance(ds, MacroSource)
+        assert ds.series == ["DGS10", "UNRATE"]
+        assert ds.frequency == "monthly"

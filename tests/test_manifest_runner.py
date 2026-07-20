@@ -759,3 +759,204 @@ class TestNewsSentimentIntegration:
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Macro data integration tests (Phase 2 PR-K)
+# ---------------------------------------------------------------------------
+
+
+def _write_macro_corpus(data_dir):
+    """Helper: write a minimal macro corpus for integration testing."""
+    import pandas as pd
+    corpus_dir = os.path.join(data_dir, "macro_corpus")
+    os.makedirs(corpus_dir, exist_ok=True)
+
+    dates = pd.bdate_range("2023-01-03", periods=250, freq="B")
+    np.random.seed(99)
+    dgs10_vals = 3.5 + np.cumsum(np.random.randn(250) * 0.02)
+    dgs2_vals = 4.0 + np.cumsum(np.random.randn(250) * 0.02)
+
+    for sid, vals in [("DGS10", dgs10_vals), ("DGS2", dgs2_vals)]:
+        df = pd.DataFrame({"DATE": dates, "VALUE": vals})
+        df.to_csv(os.path.join(corpus_dir, f"{sid}.csv"), index=False)
+
+
+class TestMacroIntegration:
+    def test_expert_mode_receives_macro_data(self, tmp_path):
+        """Expert mode run() receives _macro in data dict."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_macro_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import numpy as np
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_macro" in data, "Missing macro data!"
+                macro = data["_macro"]
+                macro_count = len(macro)
+
+                first_sym = list(data.keys())[0]
+                returns = data[first_sym]["Close"].pct_change().dropna()
+                val_returns = returns[(returns.index > train_end) & (returns.index <= val_end)]
+                holdout_returns = returns[returns.index > val_end]
+
+                mu_val = val_returns.mean() if len(val_returns) > 1 else 0.0
+                sigma_val = val_returns.std(ddof=1) if len(val_returns) > 1 else 0.01
+                val_sharpe = float(mu_val / sigma_val * np.sqrt(252)) if sigma_val > 0 else 0.0
+
+                mu_ho = holdout_returns.mean() if len(holdout_returns) > 1 else 0.0
+                sigma_ho = holdout_returns.std(ddof=1) if len(holdout_returns) > 1 else 0.01
+                holdout_sharpe = float(mu_ho / sigma_ho * np.sqrt(252)) if sigma_ho > 0 else 0.0
+
+                return {
+                    "val_sharpe": val_sharpe,
+                    "val_max_drawdown_pct": 5.0,
+                    "val_total_return_pct": 10.0,
+                    "holdout_sharpe": holdout_sharpe,
+                    "holdout_max_drawdown_pct": 3.0,
+                    "holdout_total_return_pct": 8.0,
+                    "macro_rows": macro_count,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "macro_expert_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "macro", "series": ["DGS10", "DGS2"],
+                 "start": "2023-01-01", "frequency": "monthly"},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe", "max_drawdown_pct"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"
+        assert "expert_extras" in result
+        assert result["expert_extras"]["macro_rows"] > 0
+
+    def test_structured_generate_signals_with_macro_extras(self, tmp_path):
+        """generate_signals(data, extras) receives macro data."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_macro_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data, extras):
+                # extras should contain macro
+                macro = extras.get("macro", pd.DataFrame())
+                macro_cols = list(macro.columns)
+
+                # Produce signals as usual
+                signals = {}
+                for sym, df in data.items():
+                    if sym.startswith("_"):
+                        continue
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals)
+        """)
+
+        manifest_dict = {
+            "name": "macro_structured_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "macro", "series": ["DGS10", "DGS2"],
+                 "start": "2023-01-01", "frequency": "monthly"},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "structured",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "structured"
+
+    def test_macro_corpus_missing_graceful(self, tmp_path):
+        """Missing macro corpus is handled gracefully (no _macro key)."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        # Do NOT write macro corpus
+
+        code = textwrap.dedent("""\
+            import numpy as np
+
+            def run(data, train_end, val_end, benchmark, config):
+                # No _macro expected
+                assert "_macro" not in data
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "macro_missing_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "macro", "series": ["DGS10"],
+                 "start": "2023-01-01", "frequency": "monthly"},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+
+    def test_macro_only_source(self, tmp_path):
+        """Manifest with only macro source (no OHLCV) works via _all_data."""
+        _write_macro_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import numpy as np
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_macro" in data, "Missing macro data!"
+                macro = data["_macro"]
+                return {
+                    "val_sharpe": float(len(macro)) / 10.0,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "macro_only_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "macro", "series": ["DGS10", "DGS2"],
+                 "start": "2023-01-01", "frequency": "monthly"},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"

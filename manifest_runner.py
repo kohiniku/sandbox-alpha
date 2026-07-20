@@ -32,9 +32,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from manifest import OhlcvSource, NewsSentimentSource, StrategyManifest, ManifestValidationError
+from manifest import OhlcvSource, NewsSentimentSource, MacroSource, StrategyManifest, ManifestValidationError
 from data_adapters.ohlcv import MissingDataError, align_universe, load_ohlcv
 from data_adapters.news_sentiment import load_news_sentiment
+from data_adapters.macro import load_macro
 from evaluators.dispatch import evaluate
 
 
@@ -192,6 +193,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
     # --- Step 1: Load data ---
     all_data: Dict[str, pd.DataFrame] = {}
     news_df: Optional[pd.DataFrame] = None
+    macro_df: Optional[pd.DataFrame] = None
 
     for ds in manifest.data_sources:
         if isinstance(ds, OhlcvSource):
@@ -217,13 +219,28 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
                 )
             except Exception as e:
                 return _error_json("infra", f"News sentiment loading failed: {e}")
+        elif isinstance(ds, MacroSource):
+            try:
+                macro_df = load_macro(
+                    series=ds.series,
+                    start=ds.start,
+                    end=ds.end,
+                    frequency=ds.frequency,
+                    data_dir=data_dir,
+                )
+            except Exception as e:
+                return _error_json("infra", f"Macro data loading failed: {e}")
 
     # Store news under special key if loaded
     if news_df is not None and not news_df.empty:
         all_data["_news_sentiment"] = news_df
 
+    # Store macro under special key if loaded
+    if macro_df is not None and not macro_df.empty:
+        all_data["_macro"] = macro_df
+
     if not all_data:
-        return _error_json("infra", "No OHLCV data sources declared in manifest")
+        return _error_json("infra", "No data sources declared in manifest")
 
     # --- Step 2: Execute user code ---
     try:
@@ -296,21 +313,30 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
         return _error_json("code", f"User code raised {type(e).__name__}: {e}", tb)
 
     # --- Step 3: Align and compute returns ---
-    # Filter out special internal keys (_news_sentiment etc.) for OHLCV alignment
+    # Filter out special internal keys (_news_sentiment, _macro etc.) for OHLCV alignment
     ohlcv_data = {k: v for k, v in all_data.items() if not k.startswith("_")}
-    if not ohlcv_data:
-        ohlcv_data = all_data  # fallback if all keys are special (shouldn't happen)
-
-    panel = align_universe(ohlcv_data)
-    if panel.empty:
-        return _error_json("infra", "align_universe returned empty panel (no common dates)")
-
-    # Extract Close prices from MultiIndex panel
-    close_panel = panel.xs("Close", level="field", axis=1)
-    asset_returns = close_panel.pct_change()
-
-    # Compute walk-forward split
-    train_end, val_end = _walk_forward_split(close_panel.index)
+    
+    if manifest.execution_mode == "expert" and not ohlcv_data:
+        # Expert mode with only special data sources (macro, news) — no OHLCV alignment needed.
+        # Use placeholder values; run() gets all_data directly.
+        close_panel = pd.DataFrame()
+        train_end = pd.Timestamp("2020-01-01")
+        val_end = pd.Timestamp("2020-06-30")
+        asset_returns = pd.DataFrame()
+    else:
+        if not ohlcv_data:
+            ohlcv_data = all_data  # fallback (shouldn't reach here)
+        
+        panel = align_universe(ohlcv_data)
+        if panel.empty:
+            return _error_json("infra", "align_universe returned empty panel (no common dates)")
+        
+        # Extract Close prices from MultiIndex panel
+        close_panel = panel.xs("Close", level="field", axis=1)
+        asset_returns = close_panel.pct_change()
+        
+        # Compute walk-forward split
+        train_end, val_end = _walk_forward_split(close_panel.index)
 
     # --- Step 5: Benchmark ---
     benchmark_symbol = manifest.evaluator.benchmark
@@ -351,6 +377,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
             benchmark_series=benchmark_series,
             benchmark_warning=benchmark_warning,
             news_df=news_df,
+            macro_df=macro_df,
         )
 
 
@@ -365,6 +392,7 @@ def _run_structured_mode(
     benchmark_series: Optional[pd.Series],
     benchmark_warning: Optional[str],
     news_df: Optional[pd.DataFrame] = None,
+    macro_df: Optional[pd.DataFrame] = None,
 ) -> str:
     """Execute structured mode: generate_signals/generate_weights entrypoints."""
     
@@ -372,6 +400,8 @@ def _run_structured_mode(
     extras: Dict[str, Any] = {}
     if news_df is not None and not news_df.empty:
         extras["news_sentiment"] = news_df
+    if macro_df is not None and not macro_df.empty:
+        extras["macro"] = macro_df
 
     # Execute user code
     has_signals = callable(sandbox.get("generate_signals"))
