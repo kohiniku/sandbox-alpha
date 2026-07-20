@@ -39,6 +39,9 @@ from llm_hypothesis import _SYMBOL_RE
 # Import STRATEGY_TEMPLATES from autonomous_loop (read-only)
 from autonomous_loop import STRATEGY_TEMPLATES
 
+# Import manifest module (Phase 0 PR-A)
+from manifest import StrategyManifest, ManifestValidationError
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -265,6 +268,12 @@ def _summarise_backlog(backlog):
                 f"  param: {s['strategy']}/{s['symbol']} "
                 f"params={json.dumps(s['params'])} priority={e['priority']:.2f}"
             )
+        elif e["type"] == "manifest":
+            name = s.get("name", "?") if isinstance(s, dict) else "?"
+            mode = s.get("execution_mode", "?") if isinstance(s, dict) else "?"
+            lines.append(
+                f"  manifest: {name} execution_mode={mode} priority={e['priority']:.2f}"
+            )
         else:
             lines.append(
                 f"  code: {s.get('name','?')}/{s.get('symbol','?')} "
@@ -304,6 +313,56 @@ _PROPOSAL_JSON_SCHEMA = """{
     }
   ]
 }"""
+
+_MANIFEST_JSON_SCHEMA = """{
+  "manifests": [
+    {
+      "name": "mean_reversion_bollinger_band",
+      "code_b64": "aW1wb3J0IG51bXB5IGFzIG5w...",
+      "data_sources": [
+        {"type": "ohlcv", "universe": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"], "start": "2020-01-01"}
+      ],
+      "model_artifacts": [],
+      "compute": {"mode": "inference", "budget_seconds": 60, "gpu": false},
+      "evaluator": {
+        "type": "portfolio",
+        "metrics": ["sharpe", "ir", "turnover", "cvar_95"],
+        "benchmark": "SPY"
+      },
+      "execution_mode": "structured",
+      "priority": 0.85,
+      "source": {"kind": "paper", "ref": "bollinger-band-paper.md"}
+    },
+    {
+      "name": "transformer_volatility_regime",
+      "code_b64": "aW1wb3J0IHRvcmNo...",
+      "data_sources": [
+        {"type": "ohlcv", "universe": ["SPY", "TLT", "GLD", "USO", "IWM", "QQQ"], "start": "2018-01-01"}
+      ],
+      "model_artifacts": [{"name": "timesfm-base", "revision": "v1.0"}],
+      "compute": {"mode": "inference", "budget_seconds": 120, "gpu": true},
+      "evaluator": {
+        "type": "custom",
+        "metrics": ["sharpe", "ir", "turnover", "cvar_95", "factor_exposure"],
+        "benchmark": "SPY",
+        "extras": {"custom_evaluator": "regime_aware_sharpe", "n_regimes": 3}
+      },
+      "execution_mode": "expert",
+      "priority": 0.90,
+      "source": {"kind": "paper", "ref": "deep-macro-finance-2024.md"}
+    }
+  ]
+}"""
+
+_EXPERT_MODE_CATALOG = """Expert mode unlocks:
+- RL/deep learning training loops (PyTorch allowed, GPU optional)
+- Foundation-model inference (Transformer, TimesFM, etc.)
+- Cross-sectional/pairs/rotation strategies with custom evaluators
+- Regime detection with dynamic switching
+- Custom evaluators (not limited to portfolio metrics; define your own scoring function)
+- Multi-asset portfolio construction with custom allocators
+- Training mode: write checkpoints, iterate, validate against holdout
+"""
 
 
 def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_proposals):
@@ -690,6 +749,18 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
             "MANDATE: At least ONE idea must RECOMBINE two near-miss directions "
             "(e.g. apply pattern from one to the symbol/regime of another)"
         )
+    mandates.append(
+        "MANDATE: At least TWO of your ideas must target a UNIVERSE of 5+ symbols "
+        "(cross-sectional or portfolio strategies; e.g. rank stocks by signal and take top/bottom quintile). "
+        "This means the idea's type should be 'code' with a universe-oriented approach."
+    )
+    mandates.append(
+        "MANDATE: At least ONE idea must be EXPERT-MODE (execution_mode='expert'). "
+        "Declare a custom evaluation approach — e.g. RL policy, transformer regression, "
+        "cross-sectional rank strategy, regime-switching allocation — and CITE the paper "
+        "it draws from (from RESEARCH_DIRS). Expert-mode ideas may use PyTorch/torch, "
+        "scipy, sklearn in their code; declare model_artifacts if using foundation models."
+    )
 
     mandates_text = "\n".join(mandates) if mandates else ""
 
@@ -706,6 +777,9 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
 
 === RESEARCH ===
 {research_text or "(no research documents)"}
+
+=== EXPERT MODE CATALOG ===
+{_EXPERT_MODE_CATALOG}
 
 === MANDATES ===
 {mandates_text}
@@ -766,6 +840,7 @@ For EACH idea, identify its WEAKNESSES:
 - Deflation cost: more trials in the same family → higher bar (mention family trial count)
 - Alpha decay: if this is a well-known anomaly, post-publication alpha may have already decayed
 - Implementability: can this work on daily OHLCV data with realistic assumptions?
+- Expert-mode ideas: be extra critical about hidden lookahead in the agent's own train/val/holdout split — if the strategy uses any form of supervised learning, the split must be temporal (past→future) and the agent must NOT see future data during training.
 
 === IDEAS ===
 {ideas_text}
@@ -1199,15 +1274,392 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
 
 
 # ---------------------------------------------------------------------------
+# IDEATION V3 — manifest emission (Phase 1 PR-E)
+# ---------------------------------------------------------------------------
+
+def _stage_select_v3(surviving_ideas, debate_results, knowledge, templates, research_docs, max_proposals):
+    """Stage 3 (V3) — Convergent selection producing StrategyManifest objects.
+
+    Returns (manifests, fallback_used) where each item is a dict with:
+      - manifest: StrategyManifest object
+      - priority: float
+      - source: dict
+    """
+    if not surviving_ideas:
+        return [], False
+
+    # Compact family summary for ranking context
+    families = knowledge.get("families", {})
+    family_summary = "\n".join(
+        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', -999):.2f}"
+        for k, f in sorted(families.items())
+    )
+
+    # Research docs compact
+    research_text = ""
+    if research_docs:
+        chunks = [body for _, body in research_docs]
+        research_text = "\n\n---\n\n".join(chunks)
+
+    # Enumerate surviving ideas with debate context
+    items = []
+    for r in debate_results:
+        idx = r["index"]
+        if r["survive"] and idx < len(surviving_ideas):
+            idea = surviving_ideas[idx]
+            items.append({
+                "idx": idx,
+                "idea": idea,
+                "attack": r.get("attack", ""),
+                "rebuttal": r.get("rebuttal", ""),
+                "variation": r.get("variation", ""),
+            })
+
+    fallback_used = False
+    if not items:
+        print("⚠️  WARNING: 0 survivors after debate — selecting from full brainstorm list", file=sys.stderr)
+        fallback_used = True
+        for r in debate_results:
+            idx = r["index"]
+            if idx < len(surviving_ideas):
+                idea = surviving_ideas[idx]
+                items.append({
+                    "idx": idx,
+                    "idea": idea,
+                    "attack": r.get("attack", ""),
+                    "rebuttal": r.get("rebuttal", ""),
+                    "variation": r.get("variation", ""),
+                })
+
+    items_text = "\n".join(
+        f"{i}: [{item['idea'].get('type','?')}] {item['idea'].get('name','?')} "
+        f"| rationale: {item['idea'].get('one_line_rationale','?')} "
+        f"| attack: {item['attack'][:150]} | rebuttal: {item['rebuttal'][:150]}"
+        for i, item in enumerate(items)
+    )
+
+    avail_strats = "\n".join(
+        f"  {name}: {tmpl['description']} | params: {json.dumps({k: str(v) for k, v in tmpl['param_space'].items()})}"
+        for name, tmpl in templates.items()
+    )
+
+    select_prompt = f"""You are a quantitative researcher finalizing strategy MANIFESTS for sandbox-alpha v2.
+
+From the surviving ideas below, select and rank the top {max_proposals} by:
+  novelty × plausibility × implementability
+
+For each selected idea, produce a complete StrategyManifest in the v2 manifest schema.
+The manifest is the single source of truth — the runner will load data, execute code,
+and evaluate according to the manifest's declarations.
+
+=== EXPERT MODE CATALOG ===
+{_EXPERT_MODE_CATALOG}
+
+=== AVAILABLE STRATEGY TEMPLATES (param spaces) ===
+{avail_strats}
+
+=== FAMILY AGGREGATES ===
+{family_summary}
+
+=== RESEARCH ===
+{research_text or "(no research documents)"}
+
+=== SURVIVING IDEAS (after debate) ===
+{items_text}
+
+=== YOUR TASK ===
+Select and rank up to {max_proposals} ideas. For each, output a complete StrategyManifest:
+
+FIELDS:
+- name: a short unique strategy identifier (snake_case, e.g. "cross_sectional_momentum_top20")
+- code_b64: base64-encoded Python source. For structured mode: a generate_signals(df) function
+  returning pd.Series signal per asset or np.array weights. For expert mode: any valid Python
+  entrypoint (generate_signals or generate_weights) — may import torch, sklearn, scipy.
+- data_sources: list of DataSource objects. At minimum one ohlcv with universe and start date.
+  For portfolio strategies: universe should be 5+ symbols.
+- model_artifacts: list of model references (name + optional revision). Empty list if no models.
+- compute: {{mode: "inference"|"training", budget_seconds: int, gpu: bool}}
+- evaluator: {{type: "portfolio"|"single_asset"|"custom", metrics: [...], benchmark: "SPY" or null,
+  extras: {{}}(optional extra config)}}
+- execution_mode: "structured" (simple generate_signals → portfolio evaluation) or
+  "expert" (custom evaluator, RL, regime detection, foundation models, training loops)
+- priority: 0.0–1.0 (higher = more promising)
+- source: {{kind, ref}} — paper citation or idea reference
+
+INTERFACE CONTRACT (structured mode):
+- df has DatetimeIndex, columns Open/High/Low/Close/Volume (ALL capitalized)
+- Return pd.Series aligned to df.index with values in {{-1, 0, 1}}
+- Imports: numpy and pandas ONLY for structured
+
+IMPORTANT: For expert-mode manifests:
+- evaluator.type should be "custom" with extras describing the custom approach
+- code_b64 may import torch, sklearn, scipy
+- model_artifacts must list any foundation models used
+- The code should implement a self-contained training/inference pipeline
+- MUST cite the paper in the source.ref field
+
+Favor NOVEL families (low n_trials) and ideas that survived strong attacks.
+For code_b64: base64-encode complete self-contained Python source.
+
+Return ONLY this JSON (no markdown, no commentary):
+{_MANIFEST_JSON_SCHEMA}"""
+
+    select_messages = [
+        {"role": "system", "content": "You output ONLY valid JSON. No markdown."},
+        {"role": "user", "content": select_prompt},
+    ]
+
+    # Retry logic: 2 attempts
+    last_err = None
+    for attempt in range(2):
+        try:
+            response = _call_llm(select_messages, max_tokens=8192)  # larger tokens for manifests
+            manifests_raw = response.get("manifests", [])
+
+            if not manifests_raw:
+                last_err = "empty manifests list"
+                if attempt == 0:
+                    print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
+                continue
+
+            # Parse and validate each manifest
+            # We also return the raw dicts for logging
+            parsed = []
+            raw_dicts = []
+            for m_raw in manifests_raw:
+                if not isinstance(m_raw, dict):
+                    print(f"  ⚠️  Skipping non-dict manifest entry: {type(m_raw).__name__}")
+                    continue
+                try:
+                    manifest = StrategyManifest.from_dict(m_raw)
+                    violations = manifest.validate()
+                    if violations:
+                        print(f"  🚫 Manifest '{manifest.name or '?'}' dropped — {len(violations)} violation(s):")
+                        for v in violations:
+                            print(f"     - {v}")
+                        continue
+                    # validation passed
+                    parsed.append(manifest)
+                    raw_dicts.append(m_raw)
+                except ManifestValidationError as e:
+                    print(f"  🚫 Manifest parse error: {e}")
+                    continue
+
+            if not parsed:
+                last_err = "all manifests failed validation"
+                if attempt == 0:
+                    print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
+                continue
+
+            return parsed, fallback_used
+
+        except Exception as e:
+            last_err = str(e)
+        if attempt == 0:
+            print(f"⚠️  Stage 3 v3 select retry: {last_err}", file=sys.stderr)
+    raise RuntimeError(f"select v3 failed after 2 attempts: {last_err}")
+
+
+def _preflight_manifest(manifest_dict):
+    """POST manifest to sandbox runner /run_manifest endpoint for dry-check.
+
+    Returns (valid, error_msg). Returns (None, "skipped") if runner unavailable.
+    Skip for expert mode — too expensive to actually run.
+    """
+    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    if not runner_url:
+        return None, "skipped"
+
+    payload = json.dumps(manifest_dict).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"{runner_url}/run_manifest",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"  ⚠️  Manifest preflight skipped: runner unreachable ({e})")
+        return None, "skipped"
+
+    valid = body.get("valid", body.get("status") == "ok")
+    error = body.get("error", "")
+    return valid, error
+
+
+def _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
+                          selection_reasoning, manifest_dicts, fallback_used=False):
+    """Save full audit trail for v3 (manifest-emitting) ideation."""
+    _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = _IDEATION_LOG_DIR / f"{timestamp}_v3.json"
+
+    log = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "version": "v3",
+        "stage1_brainstorm": {
+            "n_ideas": len(brainstorm_ideas),
+            "ideas": brainstorm_ideas,
+        },
+        "stage2_debate": {
+            "risk_report": risk_report,
+            "quant_report": quant_report,
+            "judge_report": judge_report,
+        },
+        "stage3_selection": {
+            "reasoning": selection_reasoning,
+            "n_proposed": len(manifest_dicts),
+            "fallback_used": fallback_used,
+        },
+        "final_proposals": manifest_dicts,
+    }
+
+    _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps(log, indent=2, default=str, ensure_ascii=False))
+
+
+def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals, dry_run):
+    """Execute 3-stage ideation pipeline producing StrategyManifest objects.
+
+    Any stage failure → fall back to v2 pipeline.
+    If ALL manifest validation fails → fall back to v2 pipeline.
+    """
+    from backlog import Backlog
+
+    brainstorm_ideas = []
+    debate_results = []
+    judge_report = []
+
+    # ── Stage 1: Brainstorm ──
+    try:
+        print("🧠 IDEATION_V3 Stage 1: Brainstorm (divergent, high-temp)...")
+        brainstorm_ideas = _stage_brainstorm(knowledge, templates, research_docs)
+        print(f"   📥 {len(brainstorm_ideas)} raw ideas generated")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V3 brainstorm failed: {e} — falling back to v2 ({e})", file=sys.stderr)
+        return None
+
+    # ── Stage 2: Debate ──
+    try:
+        print("⚔️  IDEATION_V3 Stage 2: Debate (Risk Manager + Quant Researcher + Judge)...")
+        debate_results, judge_report = _stage_debate(brainstorm_ideas)
+        n_survived = sum(1 for r in debate_results if r.get("survive"))
+        print(f"   ✅ {n_survived}/{len(brainstorm_ideas)} ideas survived debate")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V3 debate failed: {e} — falling back to v2 ({e})", file=sys.stderr)
+        return None
+
+    # ── Stage 3: Select (v3 manifest) ──
+    try:
+        print("🎯 IDEATION_V3 Stage 3: Select (manifest generation)...")
+        surviving = brainstorm_ideas
+        manifests, select_fallback_used = _stage_select_v3(
+            surviving, debate_results, knowledge, templates, research_docs, max_proposals
+        )
+        print(f"   📝 {len(manifests)} valid manifests generated")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V3 select failed: {e} — falling back to v2 pipeline", file=sys.stderr)
+        return None
+
+    if not manifests:
+        print("⚠️  IDEATION_V3: ALL manifests failed validation — falling back to v2 pipeline", file=sys.stderr)
+        return None
+
+    # ── Map manifests through preflight + backlog ──
+    accepted = []
+    pf_passed = 0
+    pf_skipped = 0
+    manifest_dicts = []
+
+    for i, manifest in enumerate(manifests):
+        manifest_dict = manifest.to_dict()
+        # Inject priority + source from the select-stage response
+        # (These are stored in the backlog entry, not in the manifest itself)
+        manifest_dicts.append(manifest_dict)
+
+        execution_mode = manifest.execution_mode
+        manifest_name = manifest.name
+
+        # ── Preflight for structured mode (skip expert) ──
+        if execution_mode == "structured":
+            valid, error = _preflight_manifest(manifest_dict)
+            if valid is None:
+                pf_skipped += 1
+                print(f"  ⏭️  Manifest {i+1} '{manifest_name}': preflight skipped (runner unavailable)")
+            elif valid:
+                pf_passed += 1
+                print(f"  ✅ Manifest {i+1} '{manifest_name}': preflight passed")
+            else:
+                print(f"  🚫 Manifest {i+1} '{manifest_name}': preflight FAILED — {error}")
+                # Dropped on preflight failure
+                continue
+        else:
+            # Expert mode: validation-only via manifest.validate() (already done in _stage_select_v3)
+            print(f"  🔬 Manifest {i+1} '{manifest_name}' (expert): validation-only, skipping preflight")
+
+        # Build backlog entry
+        # Determine source from the LLM response or fall back
+        # The manifest schema includes priority and source in the LLM response
+        entry = {
+            "id": "",
+            "type": "manifest",
+            "status": "pending",
+            "priority": 0.8,  # default; overridden if available from raw data
+            "created_at": None,
+            "source": {"kind": "idea", "ref": manifest_name},
+            "spec": manifest_dict,
+            "eval_plan": {"extra_criteria": []},
+            "result": None,
+        }
+
+        if dry_run:
+            entry["id"] = f"dry_v3_{i}"
+            accepted.append(entry)
+            print(f"  [DRY-RUN] manifest | {manifest_name} | execution_mode={execution_mode} | priority={entry['priority']:.2f}")
+        else:
+            ok_add, result_id = backlog.add_entry(entry)
+            if ok_add:
+                accepted.append(entry)
+                entry["id"] = result_id
+                print(f"  ✅ manifest | {manifest_name} | execution_mode={execution_mode} | priority={entry['priority']:.2f}")
+            else:
+                print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
+
+    # ── Observability ──
+    n_survived = sum(1 for r in debate_results if r.get("survive"))
+    risk_report = [{"index": r["index"], "attack": r["attack"]} for r in debate_results]
+    quant_report = [{"index": r["index"], "rebuttal": r["rebuttal"], "variation": r["variation"]}
+                    for r in debate_results]
+    try:
+        _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
+                              f"Selected {len(manifests)} from {n_survived} survivors",
+                              manifest_dicts, fallback_used=select_fallback_used)
+    except Exception as e:
+        print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
+
+    # ── Summary ──
+    n_accepted = len(accepted)
+    n_structured = sum(1 for m in manifests if m.execution_mode == "structured")
+    n_expert = sum(1 for m in manifests if m.execution_mode == "expert")
+    print(f"IDEATION_V3 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={len(manifests)} manifest_count={n_accepted}")
+    if n_structured > 0 or n_expert > 0:
+        print(f"PREFLIGHT passed={pf_passed} skipped={pf_skipped}")
+    print(f"  structured={n_structured} expert={n_expert}")
+    return [e["id"] for e in accepted]
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run(max_proposals=5, dry_run=False):
     """Execute the full ideation pipeline. Returns list of added entry IDs.
 
-    When IDEATION_V2 env is not "0", uses the 3-stage multi-agent pipeline
-    (Brainstorm → Debate → Select) with fallback to the single-call v1 path
-    on any stage failure.
+    Cascade: IDEATION_V3 (manifest, default on) → IDEATION_V2 (3-stage) → V1 single-call.
+    Set IDEATION_V3=0 to fall back to v2 (non-manifest) pipeline.
+    Set IDEATION_V2=0 to fall back to v1 single-call pipeline.
     """
     from backlog import Backlog
 
@@ -1221,7 +1673,19 @@ def run(max_proposals=5, dry_run=False):
     for fname, _ in research_docs:
         print(f"   - {fname}")
 
-    # ── (b) Try IDEATION_V2 pipeline ──
+    # ── (b) Try IDEATION_V3 pipeline (manifest emission) ──
+    use_v3 = os.environ.get("IDEATION_V3", "1") != "0"
+    if use_v3:
+        print("🔄 IDEATION_V3 enabled — attempting manifest-emitting 3-stage pipeline...")
+        try:
+            v3_result = _run_ideation_v3(knowledge, STRATEGY_TEMPLATES, research_docs, backlog, max_proposals, dry_run)
+            if v3_result is not None:
+                return v3_result
+            # else: fall through to v2
+        except Exception as e:
+            print(f"⚠️  IDEATION_V3 pipeline error: {e} — falling back to v2 pipeline", file=sys.stderr)
+
+    # ── (c) Try IDEATION_V2 pipeline (3-stage, v1-shape proposals) ──
     use_v2 = os.environ.get("IDEATION_V2", "1") != "0"
     if use_v2:
         print("🔄 IDEATION_V2 enabled — attempting 3-stage multi-agent pipeline...")
@@ -1233,7 +1697,7 @@ def run(max_proposals=5, dry_run=False):
         except Exception as e:
             print(f"⚠️  IDEATION_V2 pipeline error: {e} — falling back to single-call path", file=sys.stderr)
 
-    # ── (c) V1 fallback: single-call LLM ──
+    # ── (d) V1 fallback: single-call LLM ──
     print("📋 Using single-call ideation path (v1 fallback)")
     messages = _build_prompt(knowledge, STRATEGY_TEMPLATES, research_docs, backlog_summary, max_proposals)
     print(f"🧠 Calling LLM ({_get_llm_config()['model']}) for up to {max_proposals} proposals...")

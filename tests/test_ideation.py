@@ -516,15 +516,20 @@ class TestIdeationV2:
         assert "RECOMBINE" in prompt_text or "recombine" in prompt_text.lower()
 
     def test_brainstorm_prompt_no_mandates_when_empty(self):
-        """When families have many trials and no near-misses, no mandates."""
+        """When families have many trials and no near-misses, only structural mandates remain.
+        (Universe and expert-mode mandates are now always-on structural requirements.)"""
         from strategy_ideation import _build_brainstorm_prompt
         from autonomous_loop import STRATEGY_TEMPLATES
 
         knowledge = {"families": {}, "near_misses": [], "errors": [], "rejected": []}
         messages = _build_brainstorm_prompt(knowledge, STRATEGY_TEMPLATES, [])
         prompt_text = messages[1]["content"]
-        # No mandates when no novel families and <2 near-misses
-        assert "MANDATE:" not in prompt_text.replace("MANDATES", "")
+        # Structural mandates (universe + expert) are always present
+        assert "UNIVERSE of 5+" in prompt_text
+        assert "EXPERT-MODE" in prompt_text
+        # No conditional novelty/near-miss mandates when data is empty
+        assert "<3 trials" not in prompt_text
+        assert "RECOMBINE" not in prompt_text.lower()
 
     def test_debate_kill_filtering(self):
         """Verify judge verdicts decide survive/kill per idea."""

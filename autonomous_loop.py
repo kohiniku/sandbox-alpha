@@ -900,7 +900,14 @@ def _consume_backlog_entry(knowledge):
     runner_url = os.environ.get("SANDBOX_RUNNER_URL")
 
     # ── Route by type ──
-    if etype == "param":
+    if etype == "manifest":
+        # v1 consumer does NOT understand 'manifest' type yet.
+        # Phase 1 PR-G will teach autonomous_loop to dispatch manifest entries via /run_manifest.
+        print(f"⚠️  Manifest entry {entry['id']} (v1 consumer): type='manifest' not yet supported. "
+              f"Skipping — will be consumed by Phase 1 PR-G.", file=sys.stderr)
+        bl.mark(entry["id"], "pending")  # return to queue for future consumer
+        return None
+    elif etype == "param":
         # Param entry: use existing sandbox backtest path
         hypothesis = {
             "id": f"bl_{entry['id'][:12]}",
