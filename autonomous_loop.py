@@ -1319,7 +1319,9 @@ def run_loop(num_iterations=3):
     print("=" * 60)
     
     knowledge = load_knowledge()
-    
+    # Snapshot error count so ERRORS_SUMMARY reports THIS RUN, not cumulative
+    _errors_before = len(knowledge.get("errors", []))
+
     for i in range(num_iterations):
         knowledge["iterations"] += 1
         print(f"\n🔄 Iteration {i+1}/{num_iterations}")
@@ -1449,10 +1451,12 @@ def run_loop(num_iterations=3):
     # 最終レポート
     print_report(knowledge)
 
-    # Machine-greppable error summary for cron reporters
-    errors = knowledge.get("errors", [])
-    n_infra = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "infra")
-    n_code = sum(1 for e in errors if e.get("evaluation", {}).get("error_type") == "code")
+    # Machine-greppable THIS-RUN error summary for cron reporters.
+    # Previously reported the cumulative knowledge.errors count which made
+    # every run look like it had 9 errors even when it produced zero.
+    errors_this_run = knowledge.get("errors", [])[_errors_before:]
+    n_infra = sum(1 for e in errors_this_run if e.get("evaluation", {}).get("error_type") == "infra")
+    n_code = sum(1 for e in errors_this_run if e.get("evaluation", {}).get("error_type") == "code")
     print(f"ERRORS_SUMMARY infra={n_infra} code={n_code}")
 
     return knowledge
