@@ -1021,7 +1021,7 @@ def _extract_universe_meta(manifest_spec):
     return universe, universe_hash, len(universe)
 
 
-def _classify_runner_response(status, response_body, runner_label):
+def _classify_runner_response(status, response_body):
     """Parse and classify a sandbox runner HTTP response.
 
     Table-driven mapping of runner status / error_type → infra | code.
@@ -1058,7 +1058,7 @@ def _classify_runner_response(status, response_body, runner_label):
             "error_type": "infra"}, False
 
 
-def _http_post_for_result(url, body, timeout, runner_label):
+def _http_post_for_result(url, body, timeout):
     """HTTP POST to sandbox runner, returning (result: dict, is_ok: bool).
 
     Catches all HTTP/network/parse errors → returns (error_dict, False).
@@ -1071,7 +1071,7 @@ def _http_post_for_result(url, body, timeout, runner_label):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             response_body = resp.read().decode("utf-8")
             status = resp.status
-        return _classify_runner_response(status, response_body, runner_label)
+        return _classify_runner_response(status, response_body)
     except urllib.error.HTTPError as e:
         error_body = ""
         try:
@@ -1105,7 +1105,7 @@ def _consume_param_entry(entry, spec):
     return hypothesis, result
 
 
-def _consume_manifest_entry(entry, spec, knowledge, runner_url, bl):
+def _consume_manifest_entry(entry, spec, runner_url, bl):
     """Handle a manifest-type backlog entry.
 
     Returns (hypothesis, result) or None if entry cannot run.
@@ -1137,7 +1137,7 @@ def _consume_manifest_entry(entry, spec, knowledge, runner_url, bl):
     body = json.dumps(manifest_spec).encode("utf-8")
 
     print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {universe_size} symbols...")
-    result, _ = _http_post_for_result(url, body, 300, "manifest")
+    result, _ = _http_post_for_result(url, body, 300)
     return hypothesis, result
 
 
@@ -1186,12 +1186,9 @@ def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
 
     print(f"  🔬 コードバックテスト実行中 (sandbox): {spec.get('name', 'codegen')} on {spec['symbol']}...")
 
-    url_full = f"{runner_url.rstrip('/')}/run_code"
-    body_raw = json.dumps({"code_b64": code_b64, "symbol": spec["symbol"]}).encode("utf-8")
-
     try:
         req = urllib.request.Request(
-            url_full, data=body_raw,
+            url, data=body,
             headers={"Content-Type": "application/json"}, method="POST"
         )
         with urllib.request.urlopen(req, timeout=240) as resp:
@@ -1264,7 +1261,7 @@ def _consume_backlog_entry(knowledge):
     if etype == "param":
         consumed = _consume_param_entry(entry, spec)
     elif etype == "manifest":
-        consumed = _consume_manifest_entry(entry, spec, knowledge, runner_url, bl)
+        consumed = _consume_manifest_entry(entry, spec, runner_url, bl)
     elif etype == "code":
         consumed = _consume_code_entry(entry, spec, knowledge, runner_url, bl)
     else:
@@ -1314,6 +1311,10 @@ def _consume_backlog_entry(knowledge):
 
     # ── Route error verdicts for backlog entries ──
     if verdict == "error":
+        # Infra error: retry with attempts counter.
+        # attempts persists inside result (backlog.mark writes only status + result),
+        # so we must read from the result dict, not from entry top-level —
+        # this was a hard-won lesson from PR #17 review.
         attempts = (entry.get("result") or {}).get("attempts", 0) + 1
         if attempts < 3:
             error_text = evaluation.get("error", "")[:200]
