@@ -467,26 +467,89 @@ def _run_backtest_subprocess(strategy, symbol, params, metrics_since=None):
         return {"error": f"JSON parse error: {e}", "error_type": "infra"}
 
 
+# ---------------------------------------------------------------------------
+# Shared evaluation gate helpers (used by evaluate_result + _evaluate_manifest_result)
+# ---------------------------------------------------------------------------
+
+
+def _triage_eval_error(result):
+    """If result carries an error, return (verdict, evaluation); else None."""
+    if "error" not in result:
+        return None
+    error_type = result.get("error_type", "error")  # safe default: unknown = error
+    if error_type == "infra":
+        return "error", {"verdict": "error", "error": result["error"],
+                         "error_type": "infra",
+                         "reasons": [f"🔧 Infra error (not counted as rejection): {result['error']}"]}
+    elif error_type == "code":
+        return "code_error", {"verdict": "code_error", "error": result["error"],
+                              "error_type": "code",
+                              "reasons": [f"💻 Code error (strategy code crashed): {result['error']}"]}
+    else:
+        # Unknown error_type → safe default: error (never rejection)
+        return "error", {"verdict": "error", "error": result["error"],
+                         "error_type": "unknown",
+                         "reasons": [f"🔧 Unknown error (not counted as rejection): {result['error']}"]}
+
+
+def _eval_val_gate(val_sharpe, val_return, val_max_dd, effective_min_sharpe,
+                   N_family, T_val):
+    """Validation gate: returns (passed: bool, reasons: list[str])."""
+    passed = (
+        val_sharpe >= effective_min_sharpe
+        and val_return > 0
+        and val_max_dd >= MAX_DRAWDOWN_LIMIT
+    )
+    reasons = []
+    if val_sharpe >= effective_min_sharpe:
+        reasons.append(f"✅ Val Sharpe {val_sharpe:.2f} >= {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+    else:
+        reasons.append(f"❌ Val Sharpe {val_sharpe:.2f} < {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+    if val_return > 0:
+        reasons.append(f"✅ Val Return {val_return:.1f}% > 0%")
+    else:
+        reasons.append(f"❌ Val Return {val_return:.1f}% <= 0%")
+    if val_max_dd >= MAX_DRAWDOWN_LIMIT:
+        reasons.append(f"✅ Val Drawdown {val_max_dd:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
+    else:
+        reasons.append(f"❌ Val Drawdown {val_max_dd:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+    return passed, reasons
+
+
+def _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe):
+    """Holdout confirmation gate: returns (passed: bool, reasons: list[str]).
+
+    Stricter gate: holdout Sharpe must reach min(0.5, 0.5 * val_sharpe).
+    Floor at 0.5 absolute; scaled down for modest val Sharpe so the bar
+    is never harsher than half the validation performance.
+    """
+    holdout_threshold = min(0.5, 0.5 * val_sharpe)
+    passed = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
+    reasons = []
+    if holdout_sharpe >= holdout_threshold:
+        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
+    else:
+        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
+    if holdout_return > 0:
+        reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")
+    else:
+        reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
+    return passed, reasons
+
+
+# ---------------------------------------------------------------------------
+# Public evaluators
+# ---------------------------------------------------------------------------
+
+
 def evaluate_result(hypothesis, result, knowledge):
     """
     Multi-gate evaluation with overfitting countermeasures.
     Returns (verdict, evaluation_dict).
     """
-    if "error" in result:
-        error_type = result.get("error_type", "error")  # safe default: unknown = error
-        if error_type == "infra":
-            return "error", {"verdict": "error", "error": result["error"],
-                             "error_type": "infra",
-                             "reasons": [f"🔧 Infra error (not counted as rejection): {result['error']}"]}
-        elif error_type == "code":
-            return "code_error", {"verdict": "code_error", "error": result["error"],
-                                  "error_type": "code",
-                                  "reasons": [f"💻 Code error (strategy code crashed): {result['error']}"]}
-        else:
-            # Unknown error_type → safe default: error (never rejection)
-            return "error", {"verdict": "error", "error": result["error"],
-                             "error_type": "unknown",
-                             "reasons": [f"🔧 Unknown error (not counted as rejection): {result['error']}"]}
+    triage = _triage_eval_error(result)
+    if triage is not None:
+        return triage
 
     wf = result.get("walkforward", {})
     if not wf.get("enabled"):
@@ -511,31 +574,10 @@ def evaluate_result(hypothesis, result, knowledge):
     )
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
 
-    reasons = []
-    gate_results = {}
-
     # --- Gate (a): Validation gate ---
-    val_pass = (
-        val_sharpe >= effective_min_sharpe
-        and val_return > 0
-        and val_max_dd >= MAX_DRAWDOWN_LIMIT
-    )
-    gate_results["validation"] = val_pass
-
-    if val_sharpe >= effective_min_sharpe:
-        reasons.append(f"✅ Val Sharpe {val_sharpe:.2f} >= {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
-    else:
-        reasons.append(f"❌ Val Sharpe {val_sharpe:.2f} < {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
-
-    if val_return > 0:
-        reasons.append(f"✅ Val Return {val_return:.1f}% > 0%")
-    else:
-        reasons.append(f"❌ Val Return {val_return:.1f}% <= 0%")
-
-    if val_max_dd >= MAX_DRAWDOWN_LIMIT:
-        reasons.append(f"✅ Val Drawdown {val_max_dd:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
-    else:
-        reasons.append(f"❌ Val Drawdown {val_max_dd:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+    val_pass, reasons = _eval_val_gate(val_sharpe, val_return, val_max_dd,
+                                        effective_min_sharpe, N_family, T_val)
+    gate_results = {"validation": val_pass}
 
     if not val_pass:
         evaluation = {
@@ -558,22 +600,9 @@ def evaluate_result(hypothesis, result, knowledge):
     # --- Gate (c): Holdout confirmation ---
     holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
     holdout_return = holdout_metrics.get("total_return_pct", -999)
-    # Stricter gate: holdout Sharpe must reach min(0.5, 0.5 * val_sharpe).
-    # Floor at 0.5 absolute; scaled down for modest val Sharpe so the bar
-    # is never harsher than half the validation performance.
-    holdout_threshold = min(0.5, 0.5 * val_sharpe)
-    holdout_pass = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
+    holdout_pass, holdout_reasons = _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe)
+    reasons.extend(holdout_reasons)
     gate_results["holdout"] = holdout_pass
-
-    if holdout_sharpe >= holdout_threshold:
-        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
-    else:
-        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
-
-    if holdout_return > 0:
-        reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")
-    else:
-        reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
 
     if not holdout_pass:
         evaluation = {
@@ -841,31 +870,10 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     N_family = families.get(fam_key, {}).get("n_trials", 0)
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
 
-    reasons = []
-    gate_results = {}
-
     # --- Gate (a): Validation gate ---
-    val_pass = (
-        val_sharpe >= effective_min_sharpe
-        and val_return > 0
-        and val_max_dd >= MAX_DRAWDOWN_LIMIT
-    )
-    gate_results["validation"] = val_pass
-
-    if val_sharpe >= effective_min_sharpe:
-        reasons.append(f"✅ Val Sharpe {val_sharpe:.2f} >= {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
-    else:
-        reasons.append(f"❌ Val Sharpe {val_sharpe:.2f} < {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
-
-    if val_return > 0:
-        reasons.append(f"✅ Val Return {val_return:.1f}% > 0%")
-    else:
-        reasons.append(f"❌ Val Return {val_return:.1f}% <= 0%")
-
-    if val_max_dd >= MAX_DRAWDOWN_LIMIT:
-        reasons.append(f"✅ Val Drawdown {val_max_dd:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
-    else:
-        reasons.append(f"❌ Val Drawdown {val_max_dd:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+    val_pass, reasons = _eval_val_gate(val_sharpe, val_return, val_max_dd,
+                                        effective_min_sharpe, N_family, T_val)
+    gate_results = {"validation": val_pass}
 
     if not val_pass:
         evaluation = {
@@ -884,19 +892,9 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     gate_results["deflation"] = True
 
     # --- Gate (c): Holdout confirmation ---
-    holdout_threshold = min(0.5, 0.5 * val_sharpe)
-    holdout_pass = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
+    holdout_pass, holdout_reasons = _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe)
+    reasons.extend(holdout_reasons)
     gate_results["holdout"] = holdout_pass
-
-    if holdout_sharpe >= holdout_threshold:
-        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
-    else:
-        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
-
-    if holdout_return > 0:
-        reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")
-    else:
-        reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
 
     if not holdout_pass:
         evaluation = {
