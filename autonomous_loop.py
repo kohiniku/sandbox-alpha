@@ -1101,11 +1101,16 @@ def _consume_backlog_entry(knowledge):
                     result = {"error": "Malformed runner response (not a dict)", "error_type": "infra"}
                 elif parsed.get("status") == "error":
                     err_type = parsed.get("error_type", "")
-                    if err_type == "manifest":
-                        # Manifest validation failure → agent's fault → code_error
-                        result = {"error": parsed.get("error", "manifest validation failed"),
+                    if err_type in ("manifest", "code"):
+                        # Agent's fault → code_error (do not retry as infra).
+                        # 'manifest' = manifest validation failed.
+                        # 'code' = user code raised at import/exec time (e.g.
+                        # ModuleNotFoundError, SyntaxError, or runtime error
+                        # inside generate_signals/run).
+                        result = {"error": parsed.get("error", f"{err_type} error"),
                                   "error_type": "code"}
                     else:
+                        # 'infra' or unknown → treat as infra (retry-eligible).
                         result = {"error": parsed.get("error", "runner reported error"),
                                   "error_type": "infra"}
                 elif parsed.get("status") == "ok":

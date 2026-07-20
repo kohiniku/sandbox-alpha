@@ -51,7 +51,11 @@ from evaluators.dispatch import evaluate
 _STRUCTURED_MODULES = frozenset({"pandas", "numpy", "pd", "np"})
 
 _EXPERT_MODULES = frozenset({
-    "pandas", "numpy", "scipy", "sklearn", "torch",
+    "pandas", "numpy", "scipy", "sklearn", "statsmodels",
+    # torch is INTENTIONALLY EXCLUDED — the current backtest image does not
+    # ship CUDA/torch (~5GB). Re-enable when the sandbox-alpha-backtest:ml
+    # image lands. Without this, LLM code doing `import torch` currently
+    # crashes with ModuleNotFoundError for every proposal.
     "math", "statistics", "dataclasses", "typing", "collections",
     "functools", "itertools", "json",
 })
