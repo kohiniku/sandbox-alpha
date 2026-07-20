@@ -38,7 +38,7 @@ from llm_hypothesis import _http_post_json as _post_json
 from llm_hypothesis import _SYMBOL_RE
 
 # Import STRATEGY_TEMPLATES from autonomous_loop (read-only)
-from autonomous_loop import STRATEGY_TEMPLATES
+from autonomous_loop import STRATEGY_TEMPLATES, MISSING_METRIC
 
 # Import manifest module (Phase 0 PR-A)
 from manifest import StrategyManifest, ManifestValidationError, VALID_METRICS
@@ -182,7 +182,7 @@ def _summarise_rejects(knowledge):
         lines.append("\nFamily aggregates:")
         for key, fam in sorted(families.items()):
             n = fam.get("n_trials", 0)
-            best = fam.get("best_val_sharpe", -999)
+            best = fam.get("best_val_sharpe", MISSING_METRIC)
             exhausted = " [EXHAUSTED]" if (n >= 3 and best < 0) else ""
             lines.append(f"  {key}: {n} trials, best sharpe={best:.2f}{exhausted}")
 
@@ -236,7 +236,7 @@ def _summarise_near_misses(knowledge):
         strategy = nm.get("strategy", "?")
         symbol = nm.get("symbol", "?")
         params = json.dumps(nm.get("params", {}))
-        val_s = nm.get("val_sharpe", -999)
+        val_s = nm.get("val_sharpe", MISSING_METRIC)
         thresh = nm.get("deflated_threshold", 0)
         holdout_s = nm.get("holdout_sharpe")
         gate = nm.get("failed_gate", "?")
@@ -758,7 +758,7 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
     family_lines = []
     for key, fam in sorted(families.items()):
         n = fam.get("n_trials", 0)
-        best = fam.get("best_val_sharpe", -999)
+        best = fam.get("best_val_sharpe", MISSING_METRIC)
         family_lines.append(f"  {key}: {n} trials, best sharpe={best:.2f}")
 
     # Near-misses
@@ -1048,7 +1048,7 @@ def _stage_select(surviving_ideas, debate_results, knowledge, templates, researc
     # Compact family summary for ranking context
     families = knowledge.get("families", {})
     family_summary = "\n".join(
-        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', -999):.2f}"
+        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
         for k, f in sorted(families.items())
     )
 
@@ -1365,7 +1365,7 @@ def _stage_select_v3(surviving_ideas, debate_results, knowledge, templates, rese
     # Compact family summary for ranking context
     families = knowledge.get("families", {})
     family_summary = "\n".join(
-        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', -999):.2f}"
+        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
         for k, f in sorted(families.items())
     )
 

@@ -67,6 +67,9 @@ STRATEGY_TEMPLATES = {
 MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
 MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
 
+# --- Sentinel for missing/absent metrics ---
+MISSING_METRIC = -999  # flows into gates so missing data always fails
+
 
 def compute_effective_min_sharpe(N_family, T_val):
     """Deflation formula: threshold rises with more trials to penalize data snooping."""
@@ -149,7 +152,7 @@ def _rebuild_families_from_history(knowledge):
             continue
         families.setdefault(key, {
             "n_trials": 0,
-            "best_val_sharpe": -999.0,
+            "best_val_sharpe": MISSING_METRIC,
             "best_params": {},
             "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                               "duplicate_cluster": 0, "exhausted_cluster": 0},
@@ -167,7 +170,7 @@ def _apply_entry_to_family(families, key, entry, hyp):
     """Incrementally update a single family aggregate record from one evaluation entry."""
     fam = families.setdefault(key, {
         "n_trials": 0,
-        "best_val_sharpe": -999.0,
+        "best_val_sharpe": MISSING_METRIC,
         "best_params": {},
         "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                           "duplicate_cluster": 0, "exhausted_cluster": 0},
@@ -175,7 +178,7 @@ def _apply_entry_to_family(families, key, entry, hyp):
     })
     fam["n_trials"] += 1
     ev = entry.get("evaluation", {})
-    val_sharpe = ev.get("sharpe_ratio", -999)
+    val_sharpe = ev.get("sharpe_ratio", MISSING_METRIC)
     if val_sharpe > fam["best_val_sharpe"]:
         fam["best_val_sharpe"] = val_sharpe
         fam["best_params"] = hyp.get("params", {})
@@ -234,7 +237,7 @@ def _check_exhausted_cluster(hypothesis, knowledge):
         return False, len(matching), None
 
     best_sharpe = max(
-        (e.get("evaluation", {}).get("sharpe_ratio", -999) for e in matching),
+        (e.get("evaluation", {}).get("sharpe_ratio", MISSING_METRIC) for e in matching),
         default=-999
     )
     if best_sharpe >= 0:
@@ -559,9 +562,9 @@ def evaluate_result(hypothesis, result, knowledge):
     holdout_metrics = result.get("holdout", {})
     is_metrics = result.get("in_sample", {})
 
-    val_sharpe = val_metrics.get("sharpe_ratio", -999)
-    val_return = val_metrics.get("total_return_pct", -999)
-    val_max_dd = val_metrics.get("max_drawdown_pct", -999)
+    val_sharpe = val_metrics.get("sharpe_ratio", MISSING_METRIC)
+    val_return = val_metrics.get("total_return_pct", MISSING_METRIC)
+    val_max_dd = val_metrics.get("max_drawdown_pct", MISSING_METRIC)
     T_val = val_metrics.get("num_days", 252)
 
     strategy = hypothesis["strategy"]
@@ -598,8 +601,8 @@ def evaluate_result(hypothesis, result, knowledge):
     gate_results["deflation"] = True
 
     # --- Gate (c): Holdout confirmation ---
-    holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
-    holdout_return = holdout_metrics.get("total_return_pct", -999)
+    holdout_sharpe = holdout_metrics.get("sharpe_ratio", MISSING_METRIC)
+    holdout_return = holdout_metrics.get("total_return_pct", MISSING_METRIC)
     holdout_pass, holdout_reasons = _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe)
     reasons.extend(holdout_reasons)
     gate_results["holdout"] = holdout_pass
@@ -635,7 +638,7 @@ def evaluate_result(hypothesis, result, knowledge):
 
     if incumbent_idx is not None:
         incumbent = adopted[incumbent_idx]
-        inc_holdout = incumbent.get("evaluation", {}).get("holdout_sharpe", -999)
+        inc_holdout = incumbent.get("evaluation", {}).get("holdout_sharpe", MISSING_METRIC)
         if holdout_sharpe > inc_holdout:
             reasons.append(f"🔄 Cluster replace: holdout Sharpe {holdout_sharpe:.2f} > incumbent {inc_holdout:.2f}")
             knowledge.setdefault("superseded", []).append(incumbent)
@@ -691,7 +694,7 @@ def _classify_near_miss(hypothesis, evaluation):
     Returns a near-miss dict or None.
     """
     gate_results = evaluation.get("gate_results", {})
-    val_sharpe = evaluation.get("sharpe_ratio", -999)
+    val_sharpe = evaluation.get("sharpe_ratio", MISSING_METRIC)
     eff_threshold = evaluation.get("effective_min_sharpe", 0)
     holdout_sharpe = evaluation.get("holdout_sharpe")  # None if holdout never ran
 
@@ -854,11 +857,11 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
         }
 
     metrics = runner_result["metrics"]
-    val_sharpe = metrics.get("val_sharpe", -999)
-    val_max_dd = metrics.get("val_max_drawdown_pct", -999)
-    val_return = metrics.get("val_total_return_pct", -999)
-    holdout_sharpe = metrics.get("holdout_sharpe", -999)
-    holdout_return = metrics.get("holdout_total_return_pct", -999)
+    val_sharpe = metrics.get("val_sharpe", MISSING_METRIC)
+    val_max_dd = metrics.get("val_max_drawdown_pct", MISSING_METRIC)
+    val_return = metrics.get("val_total_return_pct", MISSING_METRIC)
+    holdout_sharpe = metrics.get("holdout_sharpe", MISSING_METRIC)
+    holdout_return = metrics.get("holdout_total_return_pct", MISSING_METRIC)
     T_val = runner_result.get("n_days", 252)
 
     strategy = hypothesis["strategy"]
@@ -981,7 +984,7 @@ def _check_extra_criteria(metrics, extra_criteria):
             print(f"  ⚠️ 解釈不能なcriteria (無視): {crit_str}")
             continue
 
-        actual = metrics.get(metric, -999)
+        actual = metrics.get(metric, MISSING_METRIC)
         passed = False
         if op == ">=":
             passed = actual >= value
@@ -1298,9 +1301,9 @@ def _consume_backlog_entry(knowledge):
         if evaluation.get("error"):
             summary = f"failed gate: {evaluation['error'][:100]}"
         elif not gate_results.get("validation", True):
-            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', -999):.2f})"
+            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', MISSING_METRIC):.2f})"
         elif not gate_results.get("holdout", True):
-            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', -999):.2f})"
+            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', MISSING_METRIC):.2f})"
         else:
             reasons = evaluation.get("reasons", [])
             extra_fail = [r for r in reasons if "Extra criterion failed" in r]

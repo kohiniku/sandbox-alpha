@@ -1,3 +1,4 @@
+from autonomous_loop import MISSING_METRIC
 #!/usr/bin/env python3
 """
 Sandbox Alpha 結果レポート生成モジュール
@@ -56,7 +57,7 @@ def fmt_pct(val):
     """パーセント値を安全にフォーマット。"""
     try:
         v = float(val)
-        if v <= -999:
+        if v <= MISSING_METRIC:
             return "N/A"
         return f"{v:+.1f}%"
     except (TypeError, ValueError):
@@ -67,7 +68,7 @@ def fmt_num(val, precision=2):
     """数値を安全にフォーマット。"""
     try:
         v = float(val)
-        if v <= -999:
+        if v <= MISSING_METRIC:
             return "N/A"
         return f"{v:.{precision}f}"
     except (TypeError, ValueError):
@@ -119,10 +120,10 @@ def build_strategy_table(records):
         if isinstance(ev, dict):
             sr = ev.get("sharpe_ratio")
             tr = ev.get("total_return_pct")
-            if sr is not None and sr != -999:
+            if sr is not None and sr != MISSING_METRIC:
                 by_strategy[strategy]["sharpe_sum"] += float(sr)
                 by_strategy[strategy]["sharpe_count"] += 1
-            if tr is not None and tr != -999:
+            if tr is not None and tr != MISSING_METRIC:
                 by_strategy[strategy]["return_sum"] += float(tr)
                 by_strategy[strategy]["return_count"] += 1
     return by_strategy
@@ -141,10 +142,10 @@ def build_symbol_table(records):
         if isinstance(ev, dict):
             sr = ev.get("sharpe_ratio")
             tr = ev.get("total_return_pct")
-            if sr is not None and sr != -999:
+            if sr is not None and sr != MISSING_METRIC:
                 by_symbol[symbol]["sharpe_sum"] += float(sr)
                 by_symbol[symbol]["sharpe_count"] += 1
-            if tr is not None and tr != -999:
+            if tr is not None and tr != MISSING_METRIC:
                 by_symbol[symbol]["return_sum"] += float(tr)
                 by_symbol[symbol]["return_count"] += 1
     return by_symbol
