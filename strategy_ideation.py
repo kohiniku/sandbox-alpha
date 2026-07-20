@@ -824,10 +824,13 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
     )
     mandates.append(
         "MANDATE: At least ONE idea must be EXPERT-MODE (execution_mode='expert'). "
-        "Declare a custom evaluation approach — e.g. RL policy, transformer regression, "
-        "cross-sectional rank strategy, regime-switching allocation — and CITE the paper "
-        "it draws from (from RESEARCH_DIRS). Expert-mode ideas may use PyTorch/torch, "
-        "scipy, sklearn in their code; declare model_artifacts if using foundation models."
+        "Declare a custom evaluation approach — e.g. regime-switching allocation "
+        "(sklearn.mixture / HMM-style), cross-sectional rank strategy, statistical "
+        "arbitrage via cointegration (statsmodels), ensemble ML signals "
+        "(sklearn.ensemble) — and CITE the paper it draws from (from RESEARCH_DIRS). "
+        "Expert-mode code may ONLY use the installed sandbox modules listed in the "
+        "EXPERT MODE CATALOG (pandas, numpy, scipy, sklearn, statsmodels); "
+        "torch/tensorflow/transformers are NOT installed and will crash at preflight."
     )
 
     mandates_text = "\n".join(mandates) if mandates else ""
