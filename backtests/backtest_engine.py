@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import sys
-import numpy as np
 import pandas as pd
 from datetime import datetime
 
@@ -23,6 +22,13 @@ try:  # package import (pytest) / script import (container)
     calculate_metrics,
     compute_split_metrics,
 )
+    from .strategies import (
+    STRATEGIES,
+    run_mean_reversion_strategy,
+    run_momentum_strategy,
+    run_rsi_strategy,
+    run_sma_crossover_strategy,
+)
 except ImportError:
     from metrics import (
     COST_BPS,
@@ -31,6 +37,13 @@ except ImportError:
     apply_trading_cost,
     calculate_metrics,
     compute_split_metrics,
+)
+    from strategies import (
+    STRATEGIES,
+    run_mean_reversion_strategy,
+    run_momentum_strategy,
+    run_rsi_strategy,
+    run_sma_crossover_strategy,
 )
 
 
@@ -61,104 +74,6 @@ def run_strategy_on_segment(df, strategy_fn, params):
     returns = result_df["Strategy_Returns"].dropna()
     signal = result_df.get("Signal")
     return returns, signal
-
-
-def run_sma_crossover_strategy(df, fast_window=10, slow_window=30):
-    """SMA Crossover Strategy"""
-    df["SMA_Fast"] = df["Close"].rolling(window=fast_window).mean()
-    df["SMA_Slow"] = df["Close"].rolling(window=slow_window).mean()
-
-    df["Signal"] = 0
-    df.loc[df["SMA_Fast"] > df["SMA_Slow"], "Signal"] = 1
-    df.loc[df["SMA_Fast"] < df["SMA_Slow"], "Signal"] = -1
-
-    df["Returns"] = df["Close"].pct_change()
-    df["Strategy_Returns"] = df["Signal"].shift(1) * df["Returns"]
-
-    return df
-
-
-def run_mean_reversion_strategy(df, window=20, threshold=2.0):
-    """Mean Reversion Strategy"""
-    df["SMA"] = df["Close"].rolling(window=window).mean()
-    df["Std"] = df["Close"].rolling(window=window).std()
-    df["Z_Score"] = (df["Close"] - df["SMA"]) / df["Std"]
-
-    df["Signal"] = 0
-    df.loc[df["Z_Score"] < -threshold, "Signal"] = 1
-    df.loc[df["Z_Score"] > threshold, "Signal"] = -1
-
-    df["Returns"] = df["Close"].pct_change()
-    df["Strategy_Returns"] = df["Signal"].shift(1) * df["Returns"]
-
-    return df
-
-
-def run_momentum_strategy(df, lookback=20, hold_period=5):
-    """Momentum Strategy"""
-    df["Momentum"] = df["Close"].pct_change(lookback)
-
-    df["Signal"] = 0
-    df.loc[df["Momentum"] > 0, "Signal"] = 1
-    df.loc[df["Momentum"] < 0, "Signal"] = -1
-
-    df["Position"] = df["Signal"].rolling(window=hold_period).mean()
-    df["Returns"] = df["Close"].pct_change()
-    df["Strategy_Returns"] = df["Position"].shift(1) * df["Returns"]
-
-    return df
-
-
-def run_rsi_strategy(df, rsi_window=14, oversold=30, overbought=70):
-    """
-    RSI Mean-Reversion Strategy
-    Implements Wilder's smoothing method for RSI (the original Welles Wilder formula).
-    Logic: long when RSI < oversold (mean-reversion: buy oversold),
-           short when RSI > overbought (sell overbought).
-    """
-    # Step 1: price changes
-    delta = df["Close"].diff()
-
-    # Step 2: separate gains and losses
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-
-    # Step 3: Wilder smoothing — first value is SMA, subsequent values use exponential smoothing
-    avg_gain = gain.copy()
-    avg_loss = loss.copy()
-
-    # Initial SMA for the first window
-    avg_gain.iloc[rsi_window] = gain.iloc[1:rsi_window+1].mean()
-    avg_loss.iloc[rsi_window] = loss.iloc[1:rsi_window+1].mean()
-
-    # Wilder's smoothing for the rest
-    for i in range(rsi_window + 1, len(df)):
-        avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (rsi_window - 1) + gain.iloc[i]) / rsi_window
-        avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (rsi_window - 1) + loss.iloc[i]) / rsi_window
-
-    # Step 4: RS and RSI
-    # Avoid division by zero: where avg_loss is 0, RSI = 100
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100.0 - (100.0 / (1.0 + rs))
-    df["RSI"] = df["RSI"].fillna(100.0)  # avg_loss=0 → RSI=100
-
-    # Step 5: generate signals
-    df["Signal"] = 0
-    df.loc[df["RSI"] < oversold, "Signal"] = 1    # oversold → buy
-    df.loc[df["RSI"] > overbought, "Signal"] = -1  # overbought → sell
-
-    df["Returns"] = df["Close"].pct_change()
-    df["Strategy_Returns"] = df["Signal"].shift(1) * df["Returns"]
-
-    return df
-
-
-STRATEGIES = {
-    "sma_crossover": run_sma_crossover_strategy,
-    "mean_reversion": run_mean_reversion_strategy,
-    "momentum": run_momentum_strategy,
-    "rsi": run_rsi_strategy,
-}
 
 
 def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
