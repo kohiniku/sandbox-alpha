@@ -998,6 +998,231 @@ def _check_extra_criteria(metrics, extra_criteria):
     return len(failures) == 0, failures
 
 
+# ---------------------------------------------------------------------------
+# Backlog consumption helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_universe_meta(manifest_spec):
+    """Extract universe list + hash + size from a manifest spec.
+
+    Returns (universe: list, universe_hash: str, universe_size: int).
+    Deduplicated helper — the universe-extraction loop appeared twice.
+    """
+    universe = []
+    for ds in manifest_spec.get("data_sources", []):
+        if ds.get("type") == "ohlcv" and ds.get("universe"):
+            universe = ds["universe"]
+            break
+    sorted_universe = sorted(universe)
+    universe_hash = hashlib.sha256(
+        json.dumps(sorted_universe, sort_keys=True).encode()
+    ).hexdigest()[:8]
+    return universe, universe_hash, len(universe)
+
+
+def _classify_runner_response(status, response_body, runner_label):
+    """Parse and classify a sandbox runner HTTP response.
+
+    Table-driven mapping of runner status / error_type → infra | code.
+
+    Returns (result: dict, is_ok: bool).
+    If is_ok is True, result is the parsed runner payload.
+    If is_ok is False, result is an error dict with 'error' and 'error_type'.
+    """
+    if status != 200:
+        return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
+                "error_type": "infra"}, False
+
+    parsed = json.loads(response_body)
+    if not isinstance(parsed, dict):
+        return {"error": "Malformed runner response (not a dict)",
+                "error_type": "infra"}, False
+
+    if parsed.get("status") == "error":
+        # Table: runner error_type -> our classification
+        # 'manifest'/'code' → agent's fault (code_error, do not retry as infra)
+        # 'infra' or unknown → infra (retry-eligible)
+        err_type = parsed.get("error_type", "")
+        if err_type in ("manifest", "code"):
+            return {"error": parsed.get("error", f"{err_type} error"),
+                    "error_type": "code"}, False
+        else:
+            return {"error": parsed.get("error", "runner reported error"),
+                    "error_type": "infra"}, False
+
+    if parsed.get("status") == "ok":
+        return parsed, True
+
+    return {"error": f"Malformed runner response: unknown status '{parsed.get('status', 'missing')}'",
+            "error_type": "infra"}, False
+
+
+def _http_post_for_result(url, body, timeout, runner_label):
+    """HTTP POST to sandbox runner, returning (result: dict, is_ok: bool).
+
+    Catches all HTTP/network/parse errors → returns (error_dict, False).
+    On success returns (parsed_dict, True).
+    """
+    try:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            response_body = resp.read().decode("utf-8")
+            status = resp.status
+        return _classify_runner_response(status, response_body, runner_label)
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")[:500]
+        except Exception:
+            pass
+        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}",
+                "error_type": "infra"}, False
+    except urllib.error.URLError as e:
+        return {"error": f"Sandbox runner connection error: {e.reason}",
+                "error_type": "infra"}, False
+    except json.JSONDecodeError as e:
+        return {"error": f"Sandbox runner JSON parse error: {e}",
+                "error_type": "infra"}, False
+    except Exception as e:
+        return {"error": f"Sandbox runner error: {e}",
+                "error_type": "infra"}, False
+
+
+def _consume_param_entry(entry, spec):
+    """Handle a param-type backlog entry. Returns (hypothesis, result)."""
+    hypothesis = {
+        "id": f"bl_{entry['id'][:12]}",
+        "strategy": spec["strategy"],
+        "symbol": spec["symbol"],
+        "params": spec["params"],
+        "description": f"Backlog param: {spec['strategy']} on {spec['symbol']}",
+        "generated_at": datetime.now().isoformat(),
+    }
+    result = run_backtest(hypothesis)
+    return hypothesis, result
+
+
+def _consume_manifest_entry(entry, spec, knowledge, runner_url, bl):
+    """Handle a manifest-type backlog entry.
+
+    Returns (hypothesis, result) or None if entry cannot run.
+    """
+    if not runner_url:
+        print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — マニフェストエントリをpendingに戻します")
+        bl.mark(entry["id"], "pending")
+        return None
+
+    manifest_spec = spec
+    manifest_name = manifest_spec.get("name", "unknown")
+    universe, universe_hash, universe_size = _extract_universe_meta(manifest_spec)
+    execution_mode = manifest_spec.get("execution_mode", "structured")
+
+    hypothesis = {
+        "id": f"bl_{entry['id'][:12]}",
+        "strategy": f"manifest:{manifest_name}",
+        "symbol": f"universe:{universe_hash}",
+        "params": {
+            "universe_size": universe_size,
+            "execution_mode": execution_mode,
+            "primary_metric": "sharpe",
+        },
+        "description": f"Backlog manifest: {manifest_name} on {universe_size} symbols [{execution_mode}]",
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    url = f"{runner_url.rstrip('/')}/run_manifest"
+    body = json.dumps(manifest_spec).encode("utf-8")
+
+    print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {universe_size} symbols...")
+    result, _ = _http_post_for_result(url, body, 300, "manifest")
+    return hypothesis, result
+
+
+def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
+    """Handle a code-type backlog entry.
+
+    Returns (hypothesis, result) or None if entry cannot run or is duplicate.
+    """
+    if not runner_url:
+        print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — コードエントリをpendingに戻します")
+        bl.mark(entry["id"], "pending")
+        return None
+
+    code_str = spec["code"]
+    code_b64 = base64.b64encode(code_str.encode("utf-8")).decode("ascii")
+    code_hash = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+
+    # Check duplicate: same code_hash + symbol in tested history
+    for rec in knowledge.get("adopted", []) + knowledge.get("rejected", []):
+        ev = rec.get("evaluation", {})
+        hyp = rec.get("hypothesis", {})
+        if ev.get("code_hash") == code_hash and hyp.get("symbol") == spec["symbol"]:
+            print(f"  ⚠️ 重複コードハッシュ (code_hash={code_hash[:12]}..., symbol={spec['symbol']}) → スキップ")
+            bl.mark(entry["id"], "done_rejected", {
+                "verdict": "rejected",
+                "reason": "duplicate_code",
+                "summary": f"コードハッシュ重複: code_hash={code_hash[:12]}... on {spec['symbol']}",
+                "finished_at": datetime.now().isoformat(),
+            })
+            return None
+
+    url = f"{runner_url.rstrip('/')}/run_code"
+    body = json.dumps({
+        "code_b64": code_b64,
+        "symbol": spec["symbol"],
+    }).encode("utf-8")
+
+    hypothesis = {
+        "id": f"bl_{entry['id'][:12]}",
+        "strategy": "codegen",
+        "symbol": spec["symbol"],
+        "params": {},
+        "description": f"Backlog code: {spec.get('name', 'codegen')} on {spec['symbol']}",
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    print(f"  🔬 コードバックテスト実行中 (sandbox): {spec.get('name', 'codegen')} on {spec['symbol']}...")
+
+    url_full = f"{runner_url.rstrip('/')}/run_code"
+    body_raw = json.dumps({"code_b64": code_b64, "symbol": spec["symbol"]}).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url_full, data=body_raw,
+            headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            response_body = resp.read().decode("utf-8")
+            status = resp.status
+        if status != 200:
+            result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
+                      "error_type": "infra"}
+        else:
+            result = json.loads(response_body)
+            if isinstance(result, dict) and "error" in result:
+                result.setdefault("error_type", "code")
+            if "code_hash" not in result:
+                result["code_hash"] = code_hash
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")[:500]
+        except Exception:
+            pass
+        result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
+    except urllib.error.URLError as e:
+        result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
+    except json.JSONDecodeError as e:
+        result = {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
+    except Exception as e:
+        result = {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
+
+    return hypothesis, result
+
+
 def _consume_backlog_entry(knowledge):
     """Try to consume one pending backlog entry.
 
@@ -1024,13 +1249,8 @@ def _consume_backlog_entry(knowledge):
     if etype == "param":
         tag = f"[param] {spec['strategy']} on {spec['symbol']}"
     elif etype == "manifest":
-        manifest_name = spec.get("name", "?")
-        universe_size = 0
-        for ds in spec.get("data_sources", []):
-            if ds.get("type") == "ohlcv" and ds.get("universe"):
-                universe_size = len(ds["universe"])
-                break
-        tag = f"[manifest] {manifest_name} on {universe_size} symbols"
+        _, _, universe_size = _extract_universe_meta(spec)
+        tag = f"[manifest] {spec.get('name', '?')} on {universe_size} symbols"
     else:
         tag = f"[code] {spec.get('name', '?')} on {spec['symbol']}"
     print(f"📥 バックログ消化: {tag} (priority {priority}, source {source_info.get('kind', '?')}:{source_info.get('ref', '?')})")
@@ -1040,196 +1260,30 @@ def _consume_backlog_entry(knowledge):
 
     runner_url = os.environ.get("SANDBOX_RUNNER_URL")
 
-    # ── Route by type ──
-    if etype == "manifest":
-        # Manifest entry: POST to /run_manifest (Phase 1 PR-G)
-        if not runner_url:
-            print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — マニフェストエントリをpendingに戻します")
-            bl.mark(entry["id"], "pending")
-            return None
-
-        manifest_spec = spec  # full manifest dict from ideation (manifest.to_dict())
-        manifest_name = manifest_spec.get("name", "unknown")
-
-        # Extract universe from data_sources
-        universe = []
-        for ds in manifest_spec.get("data_sources", []):
-            if ds.get("type") == "ohlcv" and ds.get("universe"):
-                universe = ds["universe"]
-                break
-        sorted_universe = sorted(universe)
-        universe_hash = hashlib.sha256(
-            json.dumps(sorted_universe, sort_keys=True).encode()
-        ).hexdigest()[:8]
-
-        execution_mode = manifest_spec.get("execution_mode", "structured")
-
-        hypothesis = {
-            "id": f"bl_{entry['id'][:12]}",
-            "strategy": f"manifest:{manifest_name}",
-            "symbol": f"universe:{universe_hash}",
-            "params": {
-                "universe_size": len(universe),
-                "execution_mode": execution_mode,
-                "primary_metric": "sharpe",
-            },
-            "description": f"Backlog manifest: {manifest_name} on {len(universe)} symbols [{execution_mode}]",
-            "generated_at": datetime.now().isoformat(),
-        }
-
-        # POST to /run_manifest
-        url = f"{runner_url.rstrip('/')}/run_manifest"
-        body = json.dumps(manifest_spec).encode("utf-8")
-
-        print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {len(universe)} symbols...")
-
-        try:
-            req = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                response_body = resp.read().decode("utf-8")
-                status = resp.status
-            if status != 200:
-                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
-                          "error_type": "infra"}
-            else:
-                parsed = json.loads(response_body)
-                if not isinstance(parsed, dict):
-                    result = {"error": "Malformed runner response (not a dict)", "error_type": "infra"}
-                elif parsed.get("status") == "error":
-                    err_type = parsed.get("error_type", "")
-                    if err_type in ("manifest", "code"):
-                        # Agent's fault → code_error (do not retry as infra).
-                        # 'manifest' = manifest validation failed.
-                        # 'code' = user code raised at import/exec time (e.g.
-                        # ModuleNotFoundError, SyntaxError, or runtime error
-                        # inside generate_signals/run).
-                        result = {"error": parsed.get("error", f"{err_type} error"),
-                                  "error_type": "code"}
-                    else:
-                        # 'infra' or unknown → treat as infra (retry-eligible).
-                        result = {"error": parsed.get("error", "runner reported error"),
-                                  "error_type": "infra"}
-                elif parsed.get("status") == "ok":
-                    result = parsed
-                else:
-                    result = {"error": f"Malformed runner response: unknown status '{parsed.get('status', 'missing')}'",
-                              "error_type": "infra"}
-        except urllib.error.HTTPError as e:
-            error_body = ""
-            try:
-                error_body = e.read().decode("utf-8")[:500]
-            except Exception:
-                pass
-            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
-        except urllib.error.URLError as e:
-            result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
-        except json.JSONDecodeError as e:
-            result = {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
-        except Exception as e:
-            result = {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
-    elif etype == "param":
-        # Param entry: use existing sandbox backtest path
-        hypothesis = {
-            "id": f"bl_{entry['id'][:12]}",
-            "strategy": spec["strategy"],
-            "symbol": spec["symbol"],
-            "params": spec["params"],
-            "description": f"Backlog param: {spec['strategy']} on {spec['symbol']}",
-            "generated_at": datetime.now().isoformat(),
-        }
-        result = run_backtest(hypothesis)
-
+    # ── Route to per-type handler ──
+    if etype == "param":
+        consumed = _consume_param_entry(entry, spec)
+    elif etype == "manifest":
+        consumed = _consume_manifest_entry(entry, spec, knowledge, runner_url, bl)
     elif etype == "code":
-        # Code entry: POST to SANDBOX_RUNNER_URL/run_code
-        if not runner_url:
-            print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — コードエントリをpendingに戻します")
-            bl.mark(entry["id"], "pending")
-            return None
-
-        code_str = spec["code"]
-        code_b64 = base64.b64encode(code_str.encode("utf-8")).decode("ascii")
-
-        # Compute code_hash locally before sending
-        code_hash = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
-
-        # Check duplicate: same code_hash + symbol in tested history
-        for rec in knowledge.get("adopted", []) + knowledge.get("rejected", []):
-            ev = rec.get("evaluation", {})
-            hyp = rec.get("hypothesis", {})
-            if ev.get("code_hash") == code_hash and hyp.get("symbol") == spec["symbol"]:
-                print(f"  ⚠️ 重複コードハッシュ (code_hash={code_hash[:12]}..., symbol={spec['symbol']}) → スキップ")
-                bl.mark(entry["id"], "done_rejected", {
-                    "verdict": "rejected",
-                    "reason": "duplicate_code",
-                    "summary": f"コードハッシュ重複: code_hash={code_hash[:12]}... on {spec['symbol']}",
-                    "finished_at": datetime.now().isoformat(),
-                })
-                return None
-
-        url = f"{runner_url.rstrip('/')}/run_code"
-        body = json.dumps({
-            "code_b64": code_b64,
-            "symbol": spec["symbol"],
-        }).encode("utf-8")
-
-        hypothesis = {
-            "id": f"bl_{entry['id'][:12]}",
-            "strategy": "codegen",
-            "symbol": spec["symbol"],
-            "params": {},
-            "description": f"Backlog code: {spec.get('name', 'codegen')} on {spec['symbol']}",
-            "generated_at": datetime.now().isoformat(),
-        }
-
-        print(f"  🔬 コードバックテスト実行中 (sandbox): {spec.get('name', 'codegen')} on {spec['symbol']}...")
-
-        try:
-            req = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=240) as resp:
-                response_body = resp.read().decode("utf-8")
-                status = resp.status
-            if status != 200:
-                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}", "error_type": "infra"}
-            else:
-                result = json.loads(response_body)
-                # Runner-reported error (strategy code failure) → tag as code
-                if isinstance(result, dict) and "error" in result:
-                    result.setdefault("error_type", "code")
-                # Inject code_hash from harness response (or fallback to local)
-                if "code_hash" not in result:
-                    result["code_hash"] = code_hash
-        except urllib.error.HTTPError as e:
-            error_body = ""
-            try:
-                error_body = e.read().decode("utf-8")[:500]
-            except Exception:
-                pass
-            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
-        except urllib.error.URLError as e:
-            result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
-        except json.JSONDecodeError as e:
-            result = {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
-        except Exception as e:
-            result = {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
+        consumed = _consume_code_entry(entry, spec, knowledge, runner_url, bl)
     else:
         bl.mark(entry["id"], "pending")
         return None
 
+    if consumed is None:
+        return None
+
+    hypothesis, result = consumed
+
     # ── Evaluate ──
     if etype == "manifest" and isinstance(result, dict) and result.get("status") == "ok":
-        # Manifest runner already did train/val/holdout splits internally.
-        # Use the dedicated manifest evaluator that reads its metrics directly.
         verdict, evaluation = _evaluate_manifest_result(result, hypothesis, knowledge)
     else:
         verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
 
     # ── Extra criteria ──
     if verdict == "adopted" and extra_criteria:
-        # Use validation-split metrics (out_of_sample in result)
         metrics = result.get("out_of_sample", result)
         extra_pass, extra_failures = _check_extra_criteria(metrics, extra_criteria)
         if not extra_pass:
@@ -1251,7 +1305,6 @@ def _consume_backlog_entry(knowledge):
         elif not gate_results.get("holdout", True):
             summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', -999):.2f})"
         else:
-            # Check for extra_criteria failures in reasons
             reasons = evaluation.get("reasons", [])
             extra_fail = [r for r in reasons if "Extra criterion failed" in r]
             if extra_fail:
@@ -1259,11 +1312,8 @@ def _consume_backlog_entry(knowledge):
             else:
                 summary = f"failed gate: cluster dedup or other"
 
-    # Route error verdicts for backlog entries
+    # ── Route error verdicts for backlog entries ──
     if verdict == "error":
-        # Infra error: retry with attempts counter
-        # attempts persists inside result (backlog.mark writes only status + result),
-        # so read from result dict, not from entry top-level.
         attempts = (entry.get("result") or {}).get("attempts", 0) + 1
         if attempts < 3:
             error_text = evaluation.get("error", "")[:200]
