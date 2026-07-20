@@ -32,10 +32,15 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from manifest import OhlcvSource, NewsSentimentSource, Sec13FSource, StrategyManifest, ManifestValidationError
+from manifest import (
+    OhlcvSource, NewsSentimentSource, InsiderSource, MacroSource, Sec13FSource,
+    StrategyManifest, ManifestValidationError,
+)
 from data_adapters.ohlcv import MissingDataError, align_universe, load_ohlcv
 from data_adapters.news_sentiment import load_news_sentiment
 from data_adapters.sec_13f import load_sec_13f
+from data_adapters.insider import load_insider_trades
+from data_adapters.macro import load_macro
 from evaluators.dispatch import evaluate
 
 
@@ -194,6 +199,8 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
     all_data: Dict[str, pd.DataFrame] = {}
     news_df: Optional[pd.DataFrame] = None
     sec13f_df: Optional[pd.DataFrame] = None
+    insider_df: Optional[pd.DataFrame] = None
+    macro_df: Optional[pd.DataFrame] = None
 
     for ds in manifest.data_sources:
         if isinstance(ds, OhlcvSource):
@@ -231,6 +238,29 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
                 )
             except Exception as e:
                 return _error_json("infra", f"SEC 13F loading failed: {e}")
+        elif isinstance(ds, InsiderSource):
+            try:
+                insider_df = load_insider_trades(
+                    universe=ds.universe,
+                    start=ds.start,
+                    end=ds.end,
+                    min_transaction_usd=ds.min_transaction_usd,
+                    roles=ds.roles,
+                    data_dir=data_dir,
+                )
+            except Exception as e:
+                return _error_json("infra", f"Insider loading failed: {e}")
+        elif isinstance(ds, MacroSource):
+            try:
+                macro_df = load_macro(
+                    series=ds.series,
+                    start=ds.start,
+                    end=ds.end,
+                    frequency=ds.frequency,
+                    data_dir=data_dir,
+                )
+            except Exception as e:
+                return _error_json("infra", f"Macro loading failed: {e}")
 
     # Store news under special key if loaded
     if news_df is not None and not news_df.empty:
@@ -239,6 +269,14 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
     # Store sec_13f under special key if loaded
     if sec13f_df is not None and not sec13f_df.empty:
         all_data["_sec_13f"] = sec13f_df
+
+    # Store insider trades under special key if loaded
+    if insider_df is not None and not insider_df.empty:
+        all_data["_insider_trades"] = insider_df
+
+    # Store macro under special key if loaded
+    if macro_df is not None and not macro_df.empty:
+        all_data["_macro"] = macro_df
 
     if not all_data:
         return _error_json("infra", "No OHLCV data sources declared in manifest")

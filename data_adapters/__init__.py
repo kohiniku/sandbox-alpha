@@ -14,10 +14,14 @@ from data_adapters.ohlcv import (
 )
 from data_adapters.news_sentiment import load_news_sentiment
 from data_adapters.sec_13f import load_sec_13f
+from data_adapters.insider import load_insider_trades
+from data_adapters.macro import load_macro
 
 __all__ = [
     "MissingDataError",
     "align_universe",
+    "load_insider_trades",
+    "load_macro",
     "load_news_sentiment",
     "load_ohlcv",
     "load_sec_13f",
