@@ -552,13 +552,17 @@ def evaluate_result(hypothesis, result, knowledge):
     # --- Gate (c): Holdout confirmation ---
     holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
     holdout_return = holdout_metrics.get("total_return_pct", -999)
-    holdout_pass = holdout_sharpe > 0 and holdout_return > 0
+    # Stricter gate: holdout Sharpe must reach min(0.5, 0.5 * val_sharpe).
+    # Floor at 0.5 absolute; scaled down for modest val Sharpe so the bar
+    # is never harsher than half the validation performance.
+    holdout_threshold = min(0.5, 0.5 * val_sharpe)
+    holdout_pass = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
     gate_results["holdout"] = holdout_pass
 
-    if holdout_sharpe > 0:
-        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} > 0")
+    if holdout_sharpe >= holdout_threshold:
+        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
     else:
-        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} <= 0")
+        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
 
     if holdout_return > 0:
         reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")

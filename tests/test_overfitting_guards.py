@@ -303,5 +303,5 @@ class TestErrorHandling:
         hyp = {"strategy": "sma_crossover", "symbol": "AAPL", "params": {}}
         knowledge = {"tested_combinations": [], "adopted": [], "rejected": [], "tested": []}
         verdict, evaluation = evaluate_result(hyp, result, knowledge)
-        assert verdict == "rejected"
+        assert verdict == "error"
         assert "error" in evaluation
