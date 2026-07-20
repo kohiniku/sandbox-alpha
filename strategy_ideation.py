@@ -358,6 +358,31 @@ Propose up to {max_proposals} new strategy candidates. Ground each in either:
 For type=param: use EXACT param spaces above. Symbol must match ^[A-Z0-9][A-Z0-9.\\-]{{0,11}}$.
 For type=code: include a COMPLETE `def generate_signals(df):` function using only numpy/pandas/math stdlib.
 
+=== INTERFACE CONTRACT (code-type ONLY — VIOLATIONS WILL BE REJECTED) ===
+generate_signals(df) receives a pandas DataFrame with:
+  - DatetimeIndex (there is NO 'Date' column — do NOT reference df['Date'])
+  - Columns: Open, High, Low, Close, Volume  (ALL capitalized — 'close' will crash)
+  - Typical length: 200–1000 rows of daily OHLCV data
+It MUST return a pandas Series:
+  - Index aligned to df.index (same length, same dates)
+  - Values in {{-1, 0, 1}} only  (NaN filled to 0)
+  - -1 = short, 0 = flat, 1 = long
+Allowed imports: numpy and pandas ONLY (no sklearn, no talib, no requests).
+
+GOLDEN EXAMPLE (use as reference — simple SMA crossover):
+```
+import numpy as np
+import pandas as pd
+
+def generate_signals(df):
+    fast = df["Close"].rolling(10).mean()
+    slow = df["Close"].rolling(30).mean()
+    signals = pd.Series(0, index=df.index)
+    signals[fast > slow] = 1
+    signals[fast < slow] = -1
+    return signals
+```
+
 CRITICAL CONSTRAINTS:
 - extra_criteria may ONLY ADD constraints, never relax the global gates (min_sharpe, max_drawdown, holdout).
 - Assign priority (0.0-1.0) with a brief rationale comment.
@@ -512,6 +537,92 @@ def _validate_proposal(proposal, templates):
 
 
 # ---------------------------------------------------------------------------
+# Preflight validation via sandbox runner
+# ---------------------------------------------------------------------------
+
+_MAX_PREFLIGHT_FIX_ATTEMPTS = 2
+
+
+def _preflight_validate(code_str):
+    """POST code to sandbox runner /validate endpoint. Returns (valid, error_msg, traceback).
+
+    If SANDBOX_RUNNER_URL is unset or HTTP error → returns (None, "skipped", "") to signal skip.
+    """
+    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    if not runner_url:
+        return None, "skipped", ""
+
+    import base64 as _b64
+    code_b64 = _b64.b64encode(code_str.encode("utf-8")).decode("ascii")
+    payload = json.dumps({"code_b64": code_b64}).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            f"{runner_url}/validate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        # HTTP error or network failure → skip preflight, don't block
+        print(f"  ⚠️  Preflight skipped: runner unreachable ({e})")
+        return None, "skipped", ""
+
+    valid = body.get("valid", False)
+    error = body.get("error", "")
+    traceback = body.get("traceback", "")
+    return valid, error, traceback
+
+
+def _preflight_fix_attempt(code_str, error_msg, traceback_str, spec_context):
+    """Send error back to LLM asking for corrected code. Returns fixed code or None."""
+    fix_prompt = f"""Your previous code for strategy "{spec_context}" failed preflight validation.
+
+ERROR: {error_msg}
+
+TRACEBACK (last lines):
+{traceback_str}
+
+ORIGINAL CODE:
+```
+{code_str}
+```
+
+Please provide ONLY the corrected `def generate_signals(df):` function (with imports).
+Remember the INTERFACE CONTRACT:
+- df has DatetimeIndex, columns Open/High/Low/Close/Volume (capitalized), NO 'Date' column
+- Return pd.Series aligned to df.index with values in {{-1, 0, 1}}
+- Only numpy and pandas imports allowed
+"""
+    messages = [
+        {"role": "system", "content": "You output ONLY corrected Python code. No markdown fences, no commentary."},
+        {"role": "user", "content": fix_prompt},
+    ]
+
+    try:
+        response = _call_llm(messages, max_tokens=2048)
+        # LLM may return JSON or raw text; try to extract code
+        if isinstance(response, dict):
+            code = response.get("code", response.get("corrected_code", ""))
+        else:
+            code = str(response)
+        # Strip markdown fences if present
+        code = code.strip()
+        if code.startswith("```"):
+            code = code.split("\n", 1)[-1]
+            if code.endswith("```"):
+                code = code[:-3].strip()
+        if "def generate_signals" not in code:
+            return None
+        return code
+    except Exception as e:
+        print(f"  ⚠️  Preflight fix LLM call failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -546,17 +657,74 @@ def run(max_proposals=5, dry_run=False):
 
     print(f"📥 LLM returned {len(proposals)} raw proposals")
 
-    # ── (c) Validate ──
+    # ── (c) Validate + Preflight ──
     accepted = []
+    # Preflight counters (code-type proposals only)
+    pf_passed = 0
+    pf_fixed = 0
+    pf_dropped = 0
+    pf_skipped = 0
+
     for i, p in enumerate(proposals):
         ok, reason = _validate_proposal(p, STRATEGY_TEMPLATES)
         if not ok:
             print(f"  ⚠️  Proposal {i+1} dropped: {reason}")
             continue
 
+        ptype = p["type"]
+
+        # ── Preflight for code-type proposals ──
+        if ptype == "code":
+            code = p["spec"].get("code", "")
+            spec_context = f"{p['spec'].get('name', '?')}/{p['spec'].get('symbol', '?')}"
+            valid, error_msg, tb_str = _preflight_validate(code)
+
+            if valid is None:
+                # Runner unreachable — skip preflight, don't block
+                pf_skipped += 1
+                print(f"  ⏭️  Proposal {i+1} ({spec_context}): preflight skipped (runner unavailable)")
+            elif valid:
+                pf_passed += 1
+                print(f"  ✅ Preflight passed for Proposal {i+1} ({spec_context})")
+            else:
+                # Failed — attempt fix retries
+                fixed = False
+                for attempt in range(_MAX_PREFLIGHT_FIX_ATTEMPTS):
+                    print(f"  🔄 Proposal {i+1} ({spec_context}): preflight failed, fix attempt {attempt+1}/{_MAX_PREFLIGHT_FIX_ATTEMPTS}")
+                    fixed_code = _preflight_fix_attempt(code, error_msg, tb_str, spec_context)
+                    if fixed_code is None:
+                        print(f"  ⚠️  Fix attempt {attempt+1}: LLM did not return valid code")
+                        continue
+                    # Re-validate fixed code
+                    valid2, error_msg2, tb_str2 = _preflight_validate(fixed_code)
+                    if valid2 is None:
+                        pf_skipped += 1
+                        # Runner went down mid-fix; accept with warning
+                        p["spec"]["code"] = fixed_code
+                        fixed = True
+                        pf_fixed += 1
+                        print(f"  ⏭️  Proposal {i+1}: runner unavailable on re-validate, accepting with warning")
+                        break
+                    elif valid2:
+                        p["spec"]["code"] = fixed_code
+                        fixed = True
+                        pf_fixed += 1
+                        print(f"  ✅ Proposal {i+1} ({spec_context}): fixed on attempt {attempt+1}")
+                        break
+                    else:
+                        error_msg = error_msg2
+                        tb_str = tb_str2
+                        print(f"  ❌ Fix attempt {attempt+1} still failing: {error_msg}")
+
+                if not fixed:
+                    pf_dropped += 1
+                    print(f"  🚫 Proposal {i+1} ({spec_context}): DROPPED — preflight failed after {_MAX_PREFLIGHT_FIX_ATTEMPTS} fix attempts")
+                    print(f"     Last error: {error_msg}")
+                    continue
+
         entry = {
             "id": p.get("id", ""),  # will be replaced on add
-            "type": p["type"],
+            "type": ptype,
             "status": "pending",
             "priority": float(p["priority"]),
             "created_at": None,  # set by backlog.add_entry
@@ -569,7 +737,6 @@ def run(max_proposals=5, dry_run=False):
         if dry_run:
             entry["id"] = f"dry_{i}"
             accepted.append(entry)
-            ptype = entry["type"]
             spec = entry["spec"]
             if ptype == "param":
                 desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
@@ -581,7 +748,6 @@ def run(max_proposals=5, dry_run=False):
             if ok_add:
                 accepted.append(entry)
                 entry["id"] = result_id
-                ptype = entry["type"]
                 spec = entry["spec"]
                 if ptype == "param":
                     desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
@@ -592,6 +758,12 @@ def run(max_proposals=5, dry_run=False):
                 print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
 
     print(f"\n📊 Accepted: {len(accepted)}/{len(proposals)} proposals")
+
+    # Preflight summary line (machine-greppable)
+    n_code_proposals = sum(1 for p in proposals if p.get("type") == "code")
+    if n_code_proposals > 0:
+        print(f"PREFLIGHT passed={pf_passed} fixed={pf_fixed} dropped={pf_dropped} skipped={pf_skipped}")
+
     if dry_run:
         print("🔍 DRY-RUN mode — no writes performed")
     return [e["id"] for e in accepted]
