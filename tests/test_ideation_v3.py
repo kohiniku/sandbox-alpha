@@ -273,12 +273,17 @@ class TestBrainstormV3Mandates:
         assert "EXPERT-MODE" in prompt_text
 
     def test_prompt_has_expert_catalog(self, v2_knowledge):
-        """Brainstorm prompt includes the expert mode catalog."""
+        """Brainstorm prompt includes the expert mode catalog.
+
+        Catalog was tightened in c0ef34e (installed-modules whitelist replaced
+        the RL/deep-learning pitch); assert the current stable anchors.
+        """
         messages = _build_brainstorm_prompt(v2_knowledge, STRATEGY_TEMPLATES, [])
         prompt_text = messages[1]["content"]
-        assert "RL/deep learning" in prompt_text
         assert "Cross-sectional" in prompt_text
         assert "Regime detection" in prompt_text
+        assert "INSTALLED IN SANDBOX" in prompt_text
+        assert "Machine learning" in prompt_text
 
     def test_prompt_has_lookahead_warning(self):
         """Debate risk prompt includes expert lookahead warning."""
