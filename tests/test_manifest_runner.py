@@ -538,3 +538,224 @@ class TestExpertMode:
         assert result["status"] == "error"
         assert result["error_type"] == "code"
         assert "expert bug" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# News sentiment integration tests (Phase 2 PR-H)
+# ---------------------------------------------------------------------------
+
+
+def _write_news_corpus(data_dir):
+    """Helper: write a minimal news corpus for testing."""
+    import json
+    corpus_dir = os.path.join(data_dir, "news_corpus", "arxiv_investment")
+    os.makedirs(corpus_dir, exist_ok=True)
+    papers = [
+        {
+            "title": "Momentum is strong in US equities",
+            "abstract": "We find momentum outperforms.",
+            "published": "2023-06-01",
+            "url": "https://arxiv.org/abs/2306.00001",
+            "relevance": 0.85,
+            "tickers": ["AAPL", "MSFT"],
+        },
+        {
+            "title": "Market crash risk increasing",
+            "abstract": "Indicators suggest downside risk.",
+            "published": "2023-07-15",
+            "url": "https://arxiv.org/abs/2307.00002",
+            "relevance": 0.45,
+            "tickers": ["GOOG"],
+        },
+    ]
+    out_path = os.path.join(corpus_dir, "2023-06.jsonl")
+    with open(out_path, "w") as fh:
+        for paper in papers:
+            fh.write(json.dumps(paper) + "\n")
+
+
+class TestNewsSentimentIntegration:
+    def test_expert_mode_receives_news_sentiment(self, tmp_path):
+        """Expert mode run() receives _news_sentiment in data dict."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_news_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                # Check that news data is available
+                assert "_news_sentiment" in data, "Missing news data!"
+                news = data["_news_sentiment"]
+                news_count = len(news)
+
+                first_sym = list(data.keys())[0]
+                returns = data[first_sym]["Close"].pct_change().dropna()
+                val_returns = returns[(returns.index > train_end) & (returns.index <= val_end)]
+                holdout_returns = returns[returns.index > val_end]
+
+                mu_val = val_returns.mean()
+                sigma_val = val_returns.std(ddof=1) if len(val_returns) > 1 else 0.01
+                val_sharpe = float(mu_val / sigma_val * np.sqrt(252)) if sigma_val > 0 else 0.0
+
+                mu_ho = holdout_returns.mean()
+                sigma_ho = holdout_returns.std(ddof=1) if len(holdout_returns) > 1 else 0.01
+                holdout_sharpe = float(mu_ho / sigma_ho * np.sqrt(252)) if sigma_ho > 0 else 0.0
+
+                return {
+                    "val_sharpe": val_sharpe,
+                    "val_max_drawdown_pct": 5.0,
+                    "val_total_return_pct": 10.0,
+                    "holdout_sharpe": holdout_sharpe,
+                    "holdout_max_drawdown_pct": 3.0,
+                    "holdout_total_return_pct": 8.0,
+                    "news_count": news_count,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "news_expert_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "news_sentiment", "universe": [], "start": "2023-01-01",
+                 "source": "arxiv_investment", "min_relevance": 0.0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe", "max_drawdown_pct"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"
+        assert "expert_extras" in result
+        assert result["expert_extras"]["news_count"] > 0
+
+    def test_structured_generate_signals_with_extras(self, tmp_path):
+        """generate_signals(data, extras) receives news_sentiment."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_news_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data, extras):
+                # extras should contain news_sentiment
+                news = extras.get("news_sentiment", pd.DataFrame())
+                news_count = len(news)
+
+                # Still produce signals
+                signals = {}
+                for sym, df in data.items():
+                    if sym.startswith("_"):
+                        continue
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals)
+        """)
+
+        manifest_dict = {
+            "name": "news_structured_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "news_sentiment", "universe": [], "start": "2023-01-01",
+                 "source": "arxiv_investment", "min_relevance": 0.0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "structured",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "structured"
+
+    def test_structured_single_arg_still_works(self, tmp_path):
+        """generate_signals(data) with only 1 arg still works with news source."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_news_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data):
+                # Single-arg function — news_sentiment is NOT passed
+                # Just skip special keys
+                signals = {}
+                for sym, df in data.items():
+                    if sym.startswith("_"):
+                        continue
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals)
+        """)
+
+        manifest_dict = {
+            "name": "news_single_arg_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "news_sentiment", "universe": [], "start": "2023-01-01",
+                 "source": "arxiv_investment", "min_relevance": 0.0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "structured",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "structured"
+
+    def test_news_corpus_missing_graceful(self, tmp_path):
+        """Missing news corpus is handled gracefully (no _news_sentiment key)."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        # Do NOT write news corpus
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                # No _news_sentiment expected
+                assert "_news_sentiment" not in data
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "news_missing_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "news_sentiment", "universe": [], "start": "2023-01-01",
+                 "source": "arxiv_investment", "min_relevance": 0.3},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"

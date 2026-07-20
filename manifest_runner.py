@@ -22,6 +22,7 @@ Error taxonomy
 """
 import argparse
 import base64
+import inspect
 import io
 import json
 import sys
@@ -31,8 +32,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from manifest import OhlcvSource, StrategyManifest, ManifestValidationError
+from manifest import OhlcvSource, NewsSentimentSource, StrategyManifest, ManifestValidationError
 from data_adapters.ohlcv import MissingDataError, align_universe, load_ohlcv
+from data_adapters.news_sentiment import load_news_sentiment
 from evaluators.dispatch import evaluate
 
 
@@ -64,6 +66,25 @@ def _safe_import(name: str, allowlist: frozenset, *args: Any, **kwargs: Any) -> 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _call_with_extras(
+    fn: Any, data: Dict[str, pd.DataFrame], extras: Dict[str, Any]
+) -> Any:
+    """Call fn(data) or fn(data, extras) depending on its signature.
+
+    If fn accepts 2+ parameters, extras is passed as the second argument.
+    Otherwise, only data is passed (backward compatible with single-arg
+    generate_signals / generate_weights).
+    """
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.keys())
+        if len(params) >= 2 and extras:
+            return fn(data, extras)
+    except (ValueError, TypeError):
+        pass
+    return fn(data)
+
 
 def _error_json(error_type: str, error: str, tb: Optional[str] = None) -> str:
     out: Dict[str, Any] = {
@@ -170,19 +191,36 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
 
     # --- Step 1: Load data ---
     all_data: Dict[str, pd.DataFrame] = {}
+    news_df: Optional[pd.DataFrame] = None
+
     for ds in manifest.data_sources:
-        if not isinstance(ds, OhlcvSource):
-            continue
-        try:
-            loaded = load_ohlcv(
-                universe=ds.universe,
-                start=ds.start,
-                end=ds.end,
-                data_dir=data_dir,
-            )
-            all_data.update(loaded)
-        except MissingDataError as e:
-            return _error_json("infra", str(e))
+        if isinstance(ds, OhlcvSource):
+            try:
+                loaded = load_ohlcv(
+                    universe=ds.universe,
+                    start=ds.start,
+                    end=ds.end,
+                    data_dir=data_dir,
+                )
+                all_data.update(loaded)
+            except MissingDataError as e:
+                return _error_json("infra", str(e))
+        elif isinstance(ds, NewsSentimentSource):
+            try:
+                news_df = load_news_sentiment(
+                    universe=ds.universe,
+                    start=ds.start,
+                    end=ds.end,
+                    source=ds.source,
+                    min_relevance=ds.min_relevance,
+                    data_dir=data_dir,
+                )
+            except Exception as e:
+                return _error_json("infra", f"News sentiment loading failed: {e}")
+
+    # Store news under special key if loaded
+    if news_df is not None and not news_df.empty:
+        all_data["_news_sentiment"] = news_df
 
     if not all_data:
         return _error_json("infra", "No OHLCV data sources declared in manifest")
@@ -258,7 +296,12 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
         return _error_json("code", f"User code raised {type(e).__name__}: {e}", tb)
 
     # --- Step 3: Align and compute returns ---
-    panel = align_universe(all_data)
+    # Filter out special internal keys (_news_sentiment etc.) for OHLCV alignment
+    ohlcv_data = {k: v for k, v in all_data.items() if not k.startswith("_")}
+    if not ohlcv_data:
+        ohlcv_data = all_data  # fallback if all keys are special (shouldn't happen)
+
+    panel = align_universe(ohlcv_data)
     if panel.empty:
         return _error_json("infra", "align_universe returned empty panel (no common dates)")
 
@@ -307,6 +350,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
             val_end=val_end,
             benchmark_series=benchmark_series,
             benchmark_warning=benchmark_warning,
+            news_df=news_df,
         )
 
 
@@ -320,9 +364,15 @@ def _run_structured_mode(
     val_end: pd.Timestamp,
     benchmark_series: Optional[pd.Series],
     benchmark_warning: Optional[str],
+    news_df: Optional[pd.DataFrame] = None,
 ) -> str:
     """Execute structured mode: generate_signals/generate_weights entrypoints."""
     
+    # Build extras dict for functions that accept additional arguments
+    extras: Dict[str, Any] = {}
+    if news_df is not None and not news_df.empty:
+        extras["news_sentiment"] = news_df
+
     # Execute user code
     has_signals = callable(sandbox.get("generate_signals"))
     has_weights = callable(sandbox.get("generate_weights"))
@@ -339,7 +389,9 @@ def _run_structured_mode(
 
     try:
         if use_weights_fn:
-            raw_weights = sandbox["generate_weights"](all_data)
+            raw_weights = _call_with_extras(
+                sandbox["generate_weights"], all_data, extras
+            )
             if isinstance(raw_weights, dict):
                 weights_df = pd.DataFrame(raw_weights)
             elif isinstance(raw_weights, pd.DataFrame):
@@ -350,7 +402,9 @@ def _run_structured_mode(
                     f"generate_weights must return DataFrame or dict, got {type(raw_weights).__name__}",
                 )
         else:
-            raw_signals = sandbox["generate_signals"](all_data)
+            raw_signals = _call_with_extras(
+                sandbox["generate_signals"], all_data, extras
+            )
             if isinstance(raw_signals, dict):
                 signals_df = _dict_signals_to_wide(raw_signals)
             elif isinstance(raw_signals, pd.DataFrame):

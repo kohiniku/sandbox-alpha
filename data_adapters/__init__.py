@@ -12,10 +12,12 @@ from data_adapters.ohlcv import (
     load_ohlcv,
     to_wide,
 )
+from data_adapters.news_sentiment import load_news_sentiment
 
 __all__ = [
     "MissingDataError",
     "align_universe",
+    "load_news_sentiment",
     "load_ohlcv",
     "to_wide",
 ]
