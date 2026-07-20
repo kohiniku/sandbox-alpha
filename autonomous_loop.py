@@ -389,7 +389,7 @@ def run_backtest(hypothesis, metrics_since=None):
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
     params = hypothesis["params"]
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
+    runner_url = _get_loop_config()["runner_url"]
 
     if runner_url:
         return _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since)
@@ -1249,7 +1249,7 @@ def _consume_backlog_entry(knowledge):
     """
     from backlog import Backlog
 
-    backlog_path = os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json"))
+    backlog_path = _get_loop_config()["backlog_path"]
     bl = Backlog(backlog_path)
     entry = bl.next_pending()
 
@@ -1276,7 +1276,7 @@ def _consume_backlog_entry(knowledge):
     # Mark as testing
     bl.mark(entry["id"], BacklogStatus.TESTING)
 
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
+    runner_url = _get_loop_config()["runner_url"]
 
     # ── Route to per-type handler ──
     if etype == "param":
@@ -1375,17 +1375,31 @@ def _consume_backlog_entry(knowledge):
 # ======================================================================
 
 
+def _get_loop_config():
+    """Return a dict of all environment-driven config values.
+
+    Read at call time (not import time) so tests can monkeypatch env vars.
+    """
+    return {
+        "runner_url": os.environ.get("SANDBOX_RUNNER_URL"),
+        "backlog_path": os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json")),
+        "use_llm": os.environ.get("USE_LLM_HYPOTHESIS") == "1",
+    }
+
+
 def run_loop(num_iterations=3):
     """
     メインPDCAループ
     """
-    use_llm = os.environ.get("USE_LLM_HYPOTHESIS") == "1"
+    config = _get_loop_config()
+    use_llm = config["use_llm"]
 
     print("=" * 60)
     print("🚀 Autonomous Alpha Discovery Loop 開始")
     print(f"   開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
     print(f"   イテレーション数: {num_iterations}")
     print(f"   LLM仮説生成: {'有効' if use_llm else '無効'}")
+    print(f"CONFIG runner_url={'set' if config['runner_url'] else 'unset'} backlog_path={config['backlog_path']} use_llm={use_llm}")
     print("=" * 60)
     
     knowledge = load_knowledge()

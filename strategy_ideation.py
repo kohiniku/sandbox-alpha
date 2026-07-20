@@ -75,6 +75,20 @@ def _get_knowledge_path():
     return Path(os.environ.get("KNOWLEDGE_PATH", str(BASE_DIR / "knowledge.json")))
 
 
+def _get_ideation_config():
+    """Return the remaining ideation env-config values (not covered by _get_llm_config).
+
+    Read at call time (not import time) so tests can monkeypatch env vars.
+    """
+    return {
+        "runner_url": os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/"),
+        "brainstorm_model": os.environ.get("HYPO_LLM_MODEL_BRAINSTORM", "deepseek-v4-flash"),
+        "select_model": os.environ.get("HYPO_LLM_MODEL_SELECT", "deepseek-v4-flash"),
+        "ideation_v3": os.environ.get("IDEATION_V3", "1") != "0",
+        "ideation_v2": os.environ.get("IDEATION_V2", "1") != "0",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Context gathering
 # ---------------------------------------------------------------------------
@@ -670,7 +684,7 @@ def _preflight_validate(code_str):
 
     If SANDBOX_RUNNER_URL is unset or HTTP error → returns (None, "skipped", "") to signal skip.
     """
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    runner_url = _get_ideation_config()["runner_url"]
     if not runner_url:
         return None, "skipped", ""
 
@@ -862,7 +876,7 @@ def _stage_brainstorm(knowledge, templates, research_docs):
     JSON (unterminated strings, stray commas); the second/third retries
     trade some diversity for reliability rather than collapsing to v2.
     """
-    model = os.environ.get("HYPO_LLM_MODEL_BRAINSTORM", "deepseek-v4-flash")
+    model = _get_ideation_config()["brainstorm_model"]
     messages = _build_brainstorm_prompt(knowledge, templates, research_docs)
     attempts_cfg = [
         {"max_tokens": 4096, "temperature": 1.0},
@@ -1146,7 +1160,7 @@ Return ONLY this JSON:
     # (measured 2026-07-20: DeepSeek pro consumes 190/200 tokens on reasoning
     # even for trivial prompts, leaving content truncated). Select is
     # mechanical structuring — flash is faster AND more reliable.
-    select_model = os.environ.get("HYPO_LLM_MODEL_SELECT", "deepseek-v4-flash")
+    select_model = _get_ideation_config()["select_model"]
     last_err = None
     for attempt in range(2):
         try:
@@ -1509,7 +1523,7 @@ Return ONLY this JSON (no markdown, no commentary):
     # and returned empty JSON twice. Select is mechanical — take surviving
     # ideas and structure them — so flash is faster AND more reliable.
     # HYPO_LLM_MODEL_SELECT overrides if you want to force pro.
-    select_model = os.environ.get("HYPO_LLM_MODEL_SELECT", "deepseek-v4-flash")
+    select_model = _get_ideation_config()["select_model"]
     attempts_cfg = [
         {"max_tokens": 8192, "temperature": 0.7},
         {"max_tokens": 12288, "temperature": 0.3},
@@ -1576,7 +1590,7 @@ def _preflight_manifest(manifest_dict):
     Returns (valid, error_msg). Returns (None, "skipped") if runner unavailable.
     Skip for expert mode — too expensive to actually run.
     """
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    runner_url = _get_ideation_config()["runner_url"]
     if not runner_url:
         return None, "skipped"
 
@@ -1680,7 +1694,7 @@ def _runtime_preflight_manifest(manifest_dict):
     Returns (valid: bool, error_msg: str, traceback_str: str). None-valid if
     runner is unreachable (skip preflight in that case, do not drop).
     """
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    runner_url = _get_ideation_config()["runner_url"]
     if not runner_url:
         return None, "skipped (runner unreachable)", ""
     payload = json.dumps(manifest_dict).encode("utf-8")
@@ -2010,12 +2024,17 @@ def run(max_proposals=5, dry_run=False):
     backlog = Backlog()
     backlog_summary = _summarise_backlog(backlog)
 
+    ideation_cfg = _get_ideation_config()
+
     print(f"📚 Research docs loaded: {len(research_docs)}")
     for fname, _ in research_docs:
         print(f"   - {fname}")
+    print(f"CONFIG runner_url={'set' if ideation_cfg['runner_url'] else 'unset'} "
+          f"v3={ideation_cfg['ideation_v3']} v2={ideation_cfg['ideation_v2']} "
+          f"brainstorm_model={ideation_cfg['brainstorm_model']} select_model={ideation_cfg['select_model']}")
 
     # ── (b) Try IDEATION_V3 pipeline (manifest emission) ──
-    use_v3 = os.environ.get("IDEATION_V3", "1") != "0"
+    use_v3 = ideation_cfg["ideation_v3"]
     if use_v3:
         print("🔄 IDEATION_V3 enabled — attempting manifest-emitting 3-stage pipeline...")
         try:
@@ -2027,7 +2046,7 @@ def run(max_proposals=5, dry_run=False):
             print(f"⚠️  IDEATION_V3 pipeline error: {e} — falling back to v2 pipeline", file=sys.stderr)
 
     # ── (c) Try IDEATION_V2 pipeline (3-stage, v1-shape proposals) ──
-    use_v2 = os.environ.get("IDEATION_V2", "1") != "0"
+    use_v2 = _get_ideation_config()["ideation_v2"]
     if use_v2:
         print("🔄 IDEATION_V2 enabled — attempting 3-stage multi-agent pipeline...")
         try:
