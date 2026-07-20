@@ -1522,6 +1522,31 @@ def _preflight_manifest(manifest_dict):
     return valid, error
 
 
+def _syntax_preflight_manifest(manifest_dict):
+    """Cheap in-process syntax check on manifest's code_b64.
+
+    Applied to ALL manifests (including expert mode, where full preflight is
+    skipped for cost). Catches SyntaxError before backlog investment so the
+    validation loop doesn't waste an iteration compiling broken code.
+
+    Returns (valid: bool, error_msg: str).
+    """
+    code_b64 = manifest_dict.get("code_b64", "")
+    if not code_b64:
+        return False, "empty code_b64"
+    try:
+        source = base64.b64decode(code_b64).decode("utf-8", errors="replace")
+    except Exception as e:
+        return False, f"code_b64 decode failed: {e}"
+    try:
+        compile(source, f"<manifest:{manifest_dict.get('name', '?')}>", "exec")
+    except SyntaxError as e:
+        return False, f"SyntaxError line {e.lineno}: {e.msg}"
+    except Exception as e:
+        return False, f"compile failed: {type(e).__name__}: {e}"
+    return True, ""
+
+
 def _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
                           selection_reasoning, manifest_dicts, fallback_used=False):
     """Save full audit trail for v3 (manifest-emitting) ideation."""
@@ -1615,7 +1640,13 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         execution_mode = manifest.execution_mode
         manifest_name = manifest.name
 
-        # ── Preflight for structured mode (skip expert) ──
+        # ── Syntax preflight (both modes, cheap) ──
+        syn_valid, syn_err = _syntax_preflight_manifest(manifest_dict)
+        if not syn_valid:
+            print(f"  🚫 Manifest {i+1} '{manifest_name}': syntax preflight FAILED — {syn_err}")
+            continue
+
+        # ── Full preflight for structured mode (skip expert) ──
         if execution_mode == "structured":
             valid, error = _preflight_manifest(manifest_dict)
             if valid is None:
@@ -1629,8 +1660,8 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
                 # Dropped on preflight failure
                 continue
         else:
-            # Expert mode: validation-only via manifest.validate() (already done in _stage_select_v3)
-            print(f"  🔬 Manifest {i+1} '{manifest_name}' (expert): validation-only, skipping preflight")
+            # Expert mode: syntax check above + validation-only via manifest.validate()
+            print(f"  🔬 Manifest {i+1} '{manifest_name}' (expert): syntax-checked, skipping full preflight")
 
         # Build backlog entry
         # Determine source from the LLM response or fall back
