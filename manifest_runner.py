@@ -66,7 +66,7 @@ def main():
 
     universe = []
     for ds in manifest.data_sources:
-        if getattr(ds, "source_type", None) == "ohlcv":
+        if getattr(ds, "type", None) == "ohlcv":
             universe.extend(getattr(ds, "universe", []))
 
     print(json.dumps({
