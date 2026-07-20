@@ -467,3 +467,324 @@ def test_symbol_validation_comprehensive():
         assert _SYMBOL_RE_COMPILED.match(s), f"'{s}' should be valid"
     for s in invalid:
         assert not _SYMBOL_RE_COMPILED.match(s), f"'{s}' should be invalid"
+
+
+# ---------------------------------------------------------------------------
+# IDEATION V2 — 3-stage pipeline tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def v2_knowledge():
+    """Knowledge with families, near_misses, and errors for v2 tests."""
+    return {
+        "rejected": [],
+        "adopted": [],
+        "families": {
+            "momentum|AAPL": {"n_trials": 5, "best_val_sharpe": 0.8},
+            "mean_reversion|MSFT": {"n_trials": 1, "best_val_sharpe": -0.2},
+            "rsi|SPY": {"n_trials": 0, "best_val_sharpe": -999.0},
+        },
+        "near_misses": [
+            {"strategy": "momentum", "symbol": "NVDA", "params": {"lookback": 20, "hold_period": 5},
+             "val_sharpe": 1.2, "deflated_threshold": 1.0, "failed_gate": "holdout"},
+            {"strategy": "mean_reversion", "symbol": "GOOGL", "params": {"window": 30, "threshold": 2.0},
+             "val_sharpe": 0.9, "deflated_threshold": 0.8, "failed_gate": "holdout"},
+        ],
+        "errors": [
+            {"hypothesis": {"description": "bad strategy"}, "evaluation": {"error_type": "code", "error": "KeyError: 'close'"}},
+        ],
+        "iterations": 10,
+    }
+
+
+class TestIdeationV2:
+    """Tests for the 3-stage ideation pipeline."""
+
+    def test_brainstorm_mandate_in_prompt(self, v2_knowledge):
+        """Verify brainstorm prompt includes novelty mandate and near-miss mandate."""
+        from strategy_ideation import _build_brainstorm_prompt
+        from autonomous_loop import STRATEGY_TEMPLATES
+
+        messages = _build_brainstorm_prompt(v2_knowledge, STRATEGY_TEMPLATES, [])
+        prompt_text = messages[1]["content"]
+
+        # Novelty mandate: <3 trials families exist → mandate injected
+        assert "MANDATE:" in prompt_text
+        assert "<3 trials" in prompt_text
+        # Near-miss recombination mandate: >=2 near_misses → mandate injected
+        assert "RECOMBINE" in prompt_text or "recombine" in prompt_text.lower()
+
+    def test_brainstorm_prompt_no_mandates_when_empty(self):
+        """When families have many trials and no near-misses, no mandates."""
+        from strategy_ideation import _build_brainstorm_prompt
+        from autonomous_loop import STRATEGY_TEMPLATES
+
+        knowledge = {"families": {}, "near_misses": [], "errors": [], "rejected": []}
+        messages = _build_brainstorm_prompt(knowledge, STRATEGY_TEMPLATES, [])
+        prompt_text = messages[1]["content"]
+        # No mandates when no novel families and <2 near-misses
+        assert "MANDATE:" not in prompt_text.replace("MANDATES", "")
+
+    def test_debate_kill_filtering(self):
+        """Verify debate kill logic: overfit/unimplementable → killed."""
+        from strategy_ideation import _stage_debate
+
+        ideas = [
+            {"name": "good_idea", "type": "param", "family": "rsi|SPY", "one_line_rationale": "test"},
+            {"name": "overfit_idea", "type": "param", "family": "momentum|AAPL", "one_line_rationale": "too narrow"},
+        ]
+
+        # We need to mock _call_llm; _stage_debate calls it internally
+        # Test the merge/kill logic by directly examining the debate merge
+        import strategy_ideation as si
+
+        def mock_risk(messages, max_tokens=4096, **kwargs):
+            return {
+                "risk_report": [
+                    {"index": 0, "attack": "reasonable approach"},
+                    {"index": 1, "attack": "clear overfitting smell, too narrow"},
+                ]
+            }
+
+        def mock_quant(messages, max_tokens=4096, **kwargs):
+            return {
+                "quant_report": [
+                    {"index": 0, "rebuttal": "solid rationale", "variation": ""},
+                    {"index": 1, "rebuttal": "could broaden", "variation": "add regime filter"},
+                ]
+            }
+
+        call_count = [0]
+
+        def mock_call(messages, max_tokens=4096, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return mock_risk(messages, max_tokens)
+            else:
+                return mock_quant(messages, max_tokens)
+
+        with patch.object(si, "_call_llm", side_effect=mock_call):
+            results = _stage_debate(ideas)
+
+        assert len(results) == 2
+        assert results[0]["survive"] is True  # "reasonable" → survives
+        assert results[1]["survive"] is False  # "overfitting" → killed
+
+    def test_happy_3stage_path(self, mock_env, v2_knowledge):
+        """Full 3-stage pipeline runs end-to-end with mocked LLM."""
+        import strategy_ideation as si
+
+        brainstorm_ideas = [
+            {"name": "vol_adaptive_mr", "type": "param", "family": "mean_reversion|SPY",
+             "one_line_rationale": "volatility scaling improves mean reversion timing"},
+            {"name": "gap_reversal", "type": "code", "family": "strategy|QQQ",
+             "one_line_rationale": "overnight gaps revert within the session"},
+            {"name": "overfit_narrow", "type": "param", "family": "momentum|AAPL",
+             "one_line_rationale": "very specific window combo"},
+        ]
+
+        debate_results = [
+            {"index": 0, "survive": True, "attack": "reasonable", "rebuttal": "good", "variation": "", "reason": "ok"},
+            {"index": 1, "survive": True, "attack": "may overfit", "rebuttal": "testable", "variation": "add vol filter", "reason": "ok"},
+            {"index": 2, "survive": False, "attack": "overfitting smell", "rebuttal": "weak", "variation": "", "reason": "killed"},
+        ]
+
+        full_proposals = [
+            {
+                "type": "param",
+                "priority": 0.85,
+                "source": {"kind": "idea", "ref": "vol_adaptive_mr"},
+                "spec": {"strategy": "mean_reversion", "symbol": "SPY", "params": {"window": 20, "threshold": 2.0}},
+                "eval_plan": {"extra_criteria": []},
+            }
+        ]
+
+        def mock_stage_brainstorm(knowledge, templates, research_docs):
+            return brainstorm_ideas
+
+        def mock_stage_debate(ideas):
+            return debate_results
+
+        def mock_stage_select(surviving, debate, knowledge, templates, research_docs, max_p):
+            return full_proposals
+
+        def mock_save_log(*args, **kwargs):
+            pass
+
+        with patch.object(si, "_stage_brainstorm", side_effect=mock_stage_brainstorm):
+            with patch.object(si, "_stage_debate", side_effect=mock_stage_debate):
+                with patch.object(si, "_stage_select", side_effect=mock_stage_select):
+                    with patch.object(si, "_save_ideation_log", side_effect=mock_save_log):
+                        result = si._run_ideation_v2(
+                            v2_knowledge, STRATEGY_TEMPLATES, [], MagicMock(), 5, dry_run=True
+                        )
+
+        assert result is not None
+        assert len(result) == 1
+
+    def test_stage1_failure_falls_back(self, mock_env, v2_knowledge):
+        """Brainstorm failure → _run_ideation_v2 returns None (fallback signal)."""
+        import strategy_ideation as si
+
+        def failing_brainstorm(*args, **kwargs):
+            raise ValueError("API down")
+
+        with patch.object(si, "_stage_brainstorm", side_effect=failing_brainstorm):
+            result = si._run_ideation_v2(
+                v2_knowledge, STRATEGY_TEMPLATES, [], MagicMock(), 5, dry_run=True
+            )
+
+        assert result is None  # fallback signal
+
+    def test_stage2_failure_falls_back(self, mock_env, v2_knowledge):
+        """Debate failure → _run_ideation_v2 returns None."""
+        import strategy_ideation as si
+
+        brainstorm_ideas = [{"name": "test", "type": "param", "family": "rsi|SPY",
+                              "one_line_rationale": "test"}]
+
+        def mock_brainstorm(*args, **kwargs):
+            return brainstorm_ideas
+
+        def failing_debate(*args, **kwargs):
+            raise json.JSONDecodeError("bad JSON", "", 0)
+
+        with patch.object(si, "_stage_brainstorm", side_effect=mock_brainstorm):
+            with patch.object(si, "_stage_debate", side_effect=failing_debate):
+                result = si._run_ideation_v2(
+                    v2_knowledge, STRATEGY_TEMPLATES, [], MagicMock(), 5, dry_run=True
+                )
+
+        assert result is None
+
+    def test_stage3_failure_falls_back(self, mock_env, v2_knowledge):
+        """Selection failure → _run_ideation_v2 returns None."""
+        import strategy_ideation as si
+
+        brainstorm_ideas = [{"name": "test", "type": "param", "family": "rsi|SPY",
+                              "one_line_rationale": "test"}]
+        debate_results = [{"index": 0, "survive": True, "attack": "", "rebuttal": "",
+                           "variation": "", "reason": "ok"}]
+
+        def mock_brainstorm(*args, **kwargs):
+            return brainstorm_ideas
+
+        def mock_debate(*args, **kwargs):
+            return debate_results
+
+        def failing_select(*args, **kwargs):
+            raise Exception("select error")
+
+        with patch.object(si, "_stage_brainstorm", side_effect=mock_brainstorm):
+            with patch.object(si, "_stage_debate", side_effect=mock_debate):
+                with patch.object(si, "_stage_select", side_effect=failing_select):
+                    result = si._run_ideation_v2(
+                        v2_knowledge, STRATEGY_TEMPLATES, [], MagicMock(), 5, dry_run=True
+                    )
+
+        assert result is None
+
+    def test_ideation_v2_disabled_bypass(self, mock_env, v2_knowledge, monkeypatch):
+        """IDEATION_V2=0 → bypasses v2 pipeline entirely, uses v1 fallback."""
+        monkeypatch.setenv("IDEATION_V2", "0")
+        import strategy_ideation as si
+
+        proposals = [
+            {
+                "type": "param",
+                "priority": 0.8,
+                "source": {"kind": "paper", "ref": "test.md"},
+                "spec": {"strategy": "momentum", "symbol": "AAPL", "params": {"lookback": 20, "hold_period": 5}},
+                "eval_plan": {"extra_criteria": []},
+            }
+        ]
+
+        with patch.object(si, "_call_llm", return_value={"proposals": proposals}):
+            ids = si.run(max_proposals=3, dry_run=True)
+            assert len(ids) == 1
+
+    def test_ideation_v2_enabled_runs_v2(self, mock_env, v2_knowledge, monkeypatch):
+        """IDEATION_V2=1 (default) → runs v2 pipeline successfully."""
+        monkeypatch.setenv("IDEATION_V2", "1")
+        import strategy_ideation as si
+
+        brainstorm_ideas = [
+            {"name": "test_idea", "type": "param", "family": "mean_reversion|SPY",
+             "one_line_rationale": "test"},
+        ]
+
+        debate_results = [
+            {"index": 0, "survive": True, "attack": "ok", "rebuttal": "ok",
+             "variation": "", "reason": "ok"},
+        ]
+
+        full_proposals = [
+            {
+                "type": "param",
+                "priority": 0.85,
+                "source": {"kind": "idea", "ref": "test_idea"},
+                "spec": {"strategy": "mean_reversion", "symbol": "SPY", "params": {"window": 20, "threshold": 2.0}},
+                "eval_plan": {"extra_criteria": []},
+            }
+        ]
+
+        def mock_brainstorm(*args, **kwargs):
+            return brainstorm_ideas
+
+        def mock_debate(*args, **kwargs):
+            return debate_results
+
+        def mock_select(*args, **kwargs):
+            return full_proposals
+
+        def mock_save_log(*args, **kwargs):
+            pass
+
+        with patch.object(si, "_stage_brainstorm", side_effect=mock_brainstorm):
+            with patch.object(si, "_stage_debate", side_effect=mock_debate):
+                with patch.object(si, "_stage_select", side_effect=mock_select):
+                    with patch.object(si, "_save_ideation_log", side_effect=mock_save_log):
+                        ids = si.run(max_proposals=3, dry_run=True)
+
+        assert len(ids) == 1
+
+    def test_brainstorm_prompt_includes_families(self, v2_knowledge):
+        """Verify brainstorm prompt includes family aggregates with trial counts."""
+        from strategy_ideation import _build_brainstorm_prompt
+        from autonomous_loop import STRATEGY_TEMPLATES
+
+        messages = _build_brainstorm_prompt(v2_knowledge, STRATEGY_TEMPLATES, [])
+        prompt_text = messages[1]["content"]
+
+        assert "momentum|AAPL" in prompt_text
+        assert "5 trials" in prompt_text
+        assert "mean_reversion|MSFT" in prompt_text
+        assert "1 trials" in prompt_text
+
+    def test_save_ideation_log_creates_file(self, mock_env):
+        """Verify _save_ideation_log writes a JSON file to ideation_logs/."""
+        from strategy_ideation import _save_ideation_log, _IDEATION_LOG_DIR
+        import tempfile
+        import shutil
+
+        # Use a temp dir for ideation_logs
+        with tempfile.TemporaryDirectory() as td:
+            import strategy_ideation as si
+            orig_dir = si._IDEATION_LOG_DIR
+            try:
+                si._IDEATION_LOG_DIR = Path(td)
+                _save_ideation_log(
+                    [{"name": "idea1"}],
+                    [{"index": 0, "attack": "test"}],
+                    [{"index": 0, "rebuttal": "ok", "variation": ""}],
+                    "test reasoning",
+                    [{"type": "param"}],
+                )
+                log_files = list(Path(td).glob("*.json"))
+                assert len(log_files) == 1
+                data = json.loads(log_files[0].read_text())
+                assert data["stage1_brainstorm"]["n_ideas"] == 1
+                assert data["stage2_debate"]["risk_report"] == [{"index": 0, "attack": "test"}]
+            finally:
+                si._IDEATION_LOG_DIR = orig_dir

@@ -23,6 +23,7 @@ Thumbs.db
 results/
 strategies/
 knowledge.json
+ideation_logs/
 *.log
 .env
 .env.local
