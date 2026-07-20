@@ -15,6 +15,7 @@ Config (env):
     BACKLOG_PATH — path to backlog.json (default: ./backlog.json)
 """
 import argparse
+import base64
 import json
 import os
 import re
