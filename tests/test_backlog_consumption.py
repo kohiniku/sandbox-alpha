@@ -229,10 +229,10 @@ class TestCodeEntryRunCode:
         )
         bl.add_entry(entry)
 
-        # Result that barely passes
+        # Result that barely passes (holdout_sharpe must now meet min(0.5, 0.5*val_sharpe) = 0.5)
         mock_response = _make_synthetic_backtest_result(
             val_sharpe=1.2, val_return=8.0, val_max_dd=-15.0, val_days=252,
-            holdout_sharpe=0.3, holdout_return=5.0, holdout_days=80,
+            holdout_sharpe=0.5, holdout_return=5.0, holdout_days=80,
             symbol="GOOGL", params={},
         )
 

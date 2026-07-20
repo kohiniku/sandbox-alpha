@@ -358,11 +358,12 @@ def generate_hypothesis(knowledge):
     return hypothesis
 
 
-def run_backtest(hypothesis):
+def run_backtest(hypothesis, metrics_since=None):
     """
     バックテスト実行フェーズ
     SANDBOX_RUNNER_URL が設定されている場合は信頼済みサンドボックスランナーにHTTPリクエストを送信。
     未設定の場合はサブプロセスで戦略を検証（従来の venv 実行パス）。
+    metrics_since: YYYY-MM-DD形式の日付。指定された場合、その日以降のデータを対象にメトリクスを計算。
     """
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
@@ -370,19 +371,22 @@ def run_backtest(hypothesis):
     runner_url = os.environ.get("SANDBOX_RUNNER_URL")
 
     if runner_url:
-        return _run_backtest_sandbox(runner_url, strategy, symbol, params)
+        return _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since)
     else:
-        return _run_backtest_subprocess(strategy, symbol, params)
+        return _run_backtest_subprocess(strategy, symbol, params, metrics_since)
 
 
-def _run_backtest_sandbox(runner_url, strategy, symbol, params):
+def _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since=None):
     """信頼済みサンドボックスランナー（Trusted Runner）経由でバックテストを実行"""
     url = f"{runner_url.rstrip('/')}/run"
-    body = json.dumps({
+    payload = {
         "strategy": strategy,
         "symbol": symbol,
         "params": params
-    }).encode("utf-8")
+    }
+    if metrics_since:
+        payload["metrics_since"] = metrics_since
+    body = json.dumps(payload).encode("utf-8")
 
     print(f"  🔬 バックテスト実行中 (sandbox): {strategy} on {symbol}...")
 
@@ -421,7 +425,7 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params):
         return {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
 
 
-def _run_backtest_subprocess(strategy, symbol, params):
+def _run_backtest_subprocess(strategy, symbol, params, metrics_since=None):
     """サブプロセスでバックテストを実行（従来の venv 実行パス）"""
     cmd = [
         sys.executable,
@@ -430,6 +434,8 @@ def _run_backtest_subprocess(strategy, symbol, params):
         "--symbol", symbol,
         "--params", json.dumps(params),
     ]
+    if metrics_since:
+        cmd.extend(["--metrics-since", metrics_since])
 
     print(f"  🔬 バックテスト実行中: {strategy} on {symbol}...")
 
@@ -552,13 +558,17 @@ def evaluate_result(hypothesis, result, knowledge):
     # --- Gate (c): Holdout confirmation ---
     holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
     holdout_return = holdout_metrics.get("total_return_pct", -999)
-    holdout_pass = holdout_sharpe > 0 and holdout_return > 0
+    # Stricter gate: holdout Sharpe must reach min(0.5, 0.5 * val_sharpe).
+    # Floor at 0.5 absolute; scaled down for modest val Sharpe so the bar
+    # is never harsher than half the validation performance.
+    holdout_threshold = min(0.5, 0.5 * val_sharpe)
+    holdout_pass = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
     gate_results["holdout"] = holdout_pass
 
-    if holdout_sharpe > 0:
-        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} > 0")
+    if holdout_sharpe >= holdout_threshold:
+        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
     else:
-        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} <= 0")
+        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
 
     if holdout_return > 0:
         reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")

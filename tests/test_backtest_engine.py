@@ -316,3 +316,112 @@ class TestStrategySignalValidity:
             result = fn(df.copy(), **kw)
             assert "Strategy_Returns" in result.columns
             assert result["Strategy_Returns"].notna().any()
+
+
+# -- since_metrics (OOS monitor) --
+
+
+class TestSinceMetrics:
+    """Tests for the metrics_since parameter (post-adoption OOS window)."""
+
+    def test_since_metrics_normal_window(self, tmp_path):
+        """since_metrics computes over rows >= metrics_since date."""
+        # 500 days of data, compute metrics for last 100 days
+        df = make_ohlc(500)
+        data_file = tmp_path / "AAPL.csv"
+        df.index.name = "Date"  # Ensure index is named for CSV export
+        df.to_csv(data_file)
+        
+        from backtests.backtest_engine import run_backtest
+        result = run_backtest(
+            strategy_name="sma_crossover",
+            symbol="AAPL",
+            params={"fast_window": 10, "slow_window": 30},
+            walkforward=True,
+            data_dir=str(tmp_path),
+            metrics_since=df.index[-100].strftime("%Y-%m-%d"),
+        )
+        
+        assert "since_metrics" in result
+        sm = result["since_metrics"]
+        assert sm["n_days"] == 100
+        assert "sharpe_ratio" in sm
+        assert "total_return_pct" in sm
+        assert "max_drawdown_pct" in sm
+        # Sharpe should be a finite number
+        assert isinstance(sm["sharpe_ratio"], (int, float))
+        assert not np.isnan(sm["sharpe_ratio"])
+
+    def test_since_metrics_empty_window(self, tmp_path):
+        """since_metrics with future date returns n_days=0."""
+        df = make_ohlc(100)
+        data_file = tmp_path / "AAPL.csv"
+        df.index.name = "Date"
+        df.to_csv(data_file)
+        
+        from backtests.backtest_engine import run_backtest
+        future_date = (df.index[-1] + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+        result = run_backtest(
+            strategy_name="sma_crossover",
+            symbol="AAPL",
+            params={"fast_window": 10, "slow_window": 30},
+            walkforward=True,
+            data_dir=str(tmp_path),
+            metrics_since=future_date,
+        )
+        
+        assert "since_metrics" in result
+        sm = result["since_metrics"]
+        assert sm["n_days"] == 0
+        # Should not have sharpe_ratio when n_days=0
+        assert "sharpe_ratio" not in sm
+
+    def test_since_metrics_full_range(self, tmp_path):
+        """since_metrics with earliest date covers full dataset."""
+        df = make_ohlc(252)
+        data_file = tmp_path / "AAPL.csv"
+        df.index.name = "Date"
+        df.to_csv(data_file)
+        
+        from backtests.backtest_engine import run_backtest
+        result = run_backtest(
+            strategy_name="sma_crossover",
+            symbol="AAPL",
+            params={"fast_window": 10, "slow_window": 30},
+            walkforward=True,
+            data_dir=str(tmp_path),
+            metrics_since=df.index[0].strftime("%Y-%m-%d"),
+        )
+        
+        assert "since_metrics" in result
+        sm = result["since_metrics"]
+        # Should cover all 252 days
+        assert sm["n_days"] == 252
+        assert "sharpe_ratio" in sm
+
+    def test_since_metrics_warmup_preserved(self, tmp_path):
+        """Indicators get full history warmup even when metrics_since truncates."""
+        # 300 days, compute since_metrics for last 50 days
+        # SMA(30) needs 30 days warmup, so last 50 days should work fine
+        df = make_ohlc(300)
+        data_file = tmp_path / "AAPL.csv"
+        df.index.name = "Date"
+        df.to_csv(data_file)
+        
+        from backtests.backtest_engine import run_backtest
+        result = run_backtest(
+            strategy_name="sma_crossover",
+            symbol="AAPL",
+            params={"fast_window": 10, "slow_window": 30},
+            walkforward=True,
+            data_dir=str(tmp_path),
+            metrics_since=df.index[-50].strftime("%Y-%m-%d"),
+        )
+        
+        assert "since_metrics" in result
+        sm = result["since_metrics"]
+        assert sm["n_days"] == 50
+        # Should have valid metrics (indicators had warmup from full history)
+        assert "sharpe_ratio" in sm
+        assert "total_return_pct" in sm
+        assert not np.isnan(sm["sharpe_ratio"])
