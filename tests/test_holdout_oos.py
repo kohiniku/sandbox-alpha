@@ -190,11 +190,26 @@ class TestOOSWindowSlicing:
         }
         with patch("oos_monitor.run_backtest") as mock_bt:
             mock_bt.return_value = {
-                "holdout": {"sharpe_ratio": 0.5, "total_return_pct": 10.0, "max_drawdown_pct": -5.0}
+                "since_metrics": {"sharpe_ratio": 0.5, "total_return_pct": 10.0, "max_drawdown_pct": -5.0, "n_days": 29}
             }
             oos_record, error = run_oos_check(entry, today=today)
             assert error is None
             assert oos_record["window_days"] == 29  # 6/20 10:00 → 7/20 00:00 = 29 days
+
+    def test_insufficient_data_skipped(self):
+        """since_metrics with n_days < 7 → insufficient_data error."""
+        today = datetime(2026, 7, 20)
+        entry = {
+            "hypothesis": {"strategy": "rsi", "symbol": "TSLA", "params": {"rsi_window": 14}},
+            "tested_at": "2026-06-20T10:00:00",
+        }
+        with patch("oos_monitor.run_backtest") as mock_bt:
+            mock_bt.return_value = {
+                "since_metrics": {"sharpe_ratio": 0.5, "total_return_pct": 10.0, "max_drawdown_pct": -5.0, "n_days": 5}
+            }
+            oos_record, error = run_oos_check(entry, today=today)
+            assert error == "insufficient_data"
+            assert oos_record is None
 
     def test_adoption_in_future_skipped(self):
         today = datetime(2026, 7, 1)
@@ -230,7 +245,7 @@ class TestGreppableOutput:
         with patch("oos_monitor.run_backtest") as mock_bt, \
              patch("oos_monitor.save_knowledge") as mock_save:
             mock_bt.return_value = {
-                "holdout": {"sharpe_ratio": 0.5, "total_return_pct": 10.0, "max_drawdown_pct": -5.0}
+                "since_metrics": {"sharpe_ratio": 0.5, "total_return_pct": 10.0, "max_drawdown_pct": -5.0, "n_days": 29}
             }
             # Capture stdout
             buf = io.StringIO()
@@ -271,7 +286,7 @@ class TestGreppableOutput:
         with patch("oos_monitor.run_backtest") as mock_bt, \
              patch("oos_monitor.save_knowledge"):
             mock_bt.return_value = {
-                "holdout": {"sharpe_ratio": -0.3, "total_return_pct": -5.0, "max_drawdown_pct": -15.0}
+                "since_metrics": {"sharpe_ratio": -0.3, "total_return_pct": -5.0, "max_drawdown_pct": -15.0, "n_days": 80}
             }
             checked, negative, skipped = run_oos_monitor(knowledge, today=today)
             assert checked == 1

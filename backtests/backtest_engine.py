@@ -161,10 +161,13 @@ STRATEGIES = {
 }
 
 
-def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None):
+def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
+                 metrics_since=None):
     """
     Run full backtest with optional walk-forward validation.
     data_dir: if set, load cached CSV from this dir instead of calling yfinance.
+    metrics_since: if set (YYYY-MM-DD string or datetime), compute since_metrics
+                   over rows with index >= that date (full data, no splitting).
     """
     if data_dir:
         df = load_cached_data(symbol, data_dir)
@@ -191,6 +194,19 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None)
         metrics["data_points"] = len(df)
         metrics["date_range"] = f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}"
         metrics["walkforward"] = {"enabled": False}
+        # Optional: compute metrics over rows with index >= metrics_since
+        if metrics_since is not None:
+            since_dt = pd.Timestamp(metrics_since, tz=df.index.tz if hasattr(df.index, 'tz') else None)
+            since_df = df[df.index >= since_dt]
+            if len(since_df) == 0:
+                metrics["since_metrics"] = {"n_days": 0}
+            else:
+                since_returns, since_signal = run_strategy_on_segment(since_df, strategy_fn, params)
+                since_returns_net = apply_trading_cost(since_returns, since_signal)
+                since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df))
+                # Rename num_days to n_days for spec compliance
+                since_m["n_days"] = since_m.pop("num_days")
+                metrics["since_metrics"] = since_m
         return metrics
 
     # Walk-forward: 60% train / 20% validation / 20% holdout
@@ -223,6 +239,19 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None)
         "holdout": holdout_metrics,
         "walkforward": {"enabled": True, "train_ratio": 0.6, "val_ratio": 0.2, "holdout_ratio": 0.2},
     }
+    # Optional: compute metrics over rows with index >= metrics_since
+    if metrics_since is not None:
+        since_dt = pd.Timestamp(metrics_since, tz=df.index.tz if hasattr(df.index, 'tz') else None)
+        since_df = df[df.index >= since_dt]
+        if len(since_df) == 0:
+            result["since_metrics"] = {"n_days": 0}
+        else:
+            since_returns, since_signal = run_strategy_on_segment(since_df, strategy_fn, params)
+            since_returns_net = apply_trading_cost(since_returns, since_signal)
+            since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df))
+            # Rename num_days to n_days for spec compliance
+            since_m["n_days"] = since_m.pop("num_days")
+            result["since_metrics"] = since_m
     return result
 
 
@@ -246,6 +275,10 @@ if __name__ == "__main__":
         "--data-dir", default=None,
         help="Directory for cached CSV files (used with --fetch-only or as data source)"
     )
+    parser.add_argument(
+        "--metrics-since", default=None,
+        help="YYYY-MM-DD date: compute since_metrics over rows with index >= this date"
+    )
     args = parser.parse_args()
 
     # --- fetch-only mode: no strategy execution ---
@@ -267,5 +300,6 @@ if __name__ == "__main__":
         args.strategy, args.symbol, params,
         walkforward=walkforward,
         data_dir=args.data_dir,
+        metrics_since=args.metrics_since,
     )
     print(json.dumps(result, indent=2, default=str))

@@ -4,9 +4,9 @@ Rolling Out-of-Sample Monitor for Adopted Strategies.
 
 Re-checks adopted strategies on data that did not exist when they were adopted.
 For each adopted param-type strategy:
-  1. Run backtest via the sandbox runner (same protocol as autonomous_loop).
-  2. Use the holdout segment (most recent 20% of 5y data) as OOS proxy.
-  3. Record OOS metrics in oos_history.
+  1. Run backtest via the sandbox runner with metrics_since=adoption_date.
+  2. Read since_metrics (sharpe, total_return_pct, max_drawdown_pct, n_days).
+  3. Record OOS metrics in oos_history if n_days >= 7.
   4. Report greppable status lines.
 
 Does NOT demote — v1 is record-and-report only.
@@ -97,25 +97,29 @@ def run_oos_check(entry, today=None):
 
     warmup = _estimate_warmup_days(params)
 
-    # Run backtest via the same runner as autonomous_loop
-    result = run_backtest(hyp)
+    # Run backtest with metrics_since=adoption_date
+    metrics_since_str = adoption_date.strftime("%Y-%m-%d")
+    result = run_backtest(hyp, metrics_since=metrics_since_str)
     if "error" in result:
         error_type = result.get("error_type", "unknown")
         return None, f"runner_{error_type}"
 
-    # Extract holdout metrics as OOS proxy
-    # The holdout segment is the most recent 20% of 5y data (~1 year)
-    holdout_raw = result.get("holdout", {})
-    if not isinstance(holdout_raw, dict):
-        return None, "no_holdout_metrics"
-    holdout = holdout_raw
-    oos_sharpe = holdout.get("sharpe_ratio")
-    oos_return = holdout.get("total_return_pct", 0.0)
-    oos_max_dd = holdout.get("max_drawdown_pct", 0.0)
+    # Extract since_metrics (post-adoption data only)
+    since_metrics = result.get("since_metrics")
+    if since_metrics is None:
+        return None, "no_since_metrics"
+
+    n_days = since_metrics.get("n_days", 0)
+    if n_days < 7:
+        return None, "insufficient_data"
+
+    oos_sharpe = since_metrics.get("sharpe_ratio")
+    oos_return = since_metrics.get("total_return_pct", 0.0)
+    oos_max_dd = since_metrics.get("max_drawdown_pct", 0.0)
 
     if oos_sharpe is None:
-        return None, "no_holdout_metrics"
-    
+        return None, "no_sharpe_in_since_metrics"
+
     oos_return = float(oos_return)
     oos_max_dd = float(oos_max_dd)
 
