@@ -995,8 +995,22 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. No markdown."},
         {"role": "user", "content": select_prompt},
     ]
-    response = _call_llm(select_messages, max_tokens=4096)
-    return response.get("proposals", []), fallback_used
+    # Retry once on empty/unparseable JSON — DeepSeek pro occasionally returns
+    # nothing due to internal reasoning token consumption, and the whole v2
+    # pipeline shouldn't collapse into v1 for a single flaky response.
+    last_err = None
+    for attempt in range(2):
+        try:
+            response = _call_llm(select_messages, max_tokens=4096)
+            proposals = response.get("proposals", [])
+            if proposals:
+                return proposals, fallback_used
+            last_err = "empty proposals list"
+        except Exception as e:
+            last_err = str(e)
+        if attempt == 0:
+            print(f"⚠️  Stage 3 select retry: {last_err}", file=sys.stderr)
+    raise RuntimeError(f"select failed after 2 attempts: {last_err}")
 
 
 def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report, selection_reasoning, final_proposals, fallback_used=False):
