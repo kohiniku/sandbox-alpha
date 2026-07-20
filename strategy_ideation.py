@@ -1591,22 +1591,103 @@ def _syntax_preflight_manifest(manifest_dict):
     skipped for cost). Catches SyntaxError before backlog investment so the
     validation loop doesn't waste an iteration compiling broken code.
 
-    Returns (valid: bool, error_msg: str).
+    Returns (valid: bool, error_msg: str, source: str). Source is the
+    decoded Python string (empty if decoding failed) — callers use it to
+    request an LLM fix.
     """
     code_b64 = manifest_dict.get("code_b64", "")
     if not code_b64:
-        return False, "empty code_b64"
+        return False, "empty code_b64", ""
     try:
         source = base64.b64decode(code_b64).decode("utf-8", errors="replace")
     except Exception as e:
-        return False, f"code_b64 decode failed: {e}"
+        return False, f"code_b64 decode failed: {e}", ""
     try:
         compile(source, f"<manifest:{manifest_dict.get('name', '?')}>", "exec")
     except SyntaxError as e:
-        return False, f"SyntaxError line {e.lineno}: {e.msg}"
+        return False, f"SyntaxError line {e.lineno}: {e.msg}", source
     except Exception as e:
-        return False, f"compile failed: {type(e).__name__}: {e}"
-    return True, ""
+        return False, f"compile failed: {type(e).__name__}: {e}", source
+    return True, "", source
+
+
+def _syntax_fix_attempt(code_str, error_msg, spec_context):
+    """Ask the LLM to fix a SyntaxError in generated manifest code.
+
+    Returns the fixed source string, or None if the fix call failed / the
+    response was empty or missing generate_signals/run.
+    """
+    fix_prompt = f"""Your previous code for strategy "{spec_context}" failed a Python syntax check.
+
+ERROR: {error_msg}
+
+ORIGINAL CODE:
+```
+{code_str}
+```
+
+Return ONLY the corrected Python source (no markdown fences, no commentary).
+Keep the same overall structure and function signature. Fix the syntax
+error(s) only.
+
+Reminders:
+- Each import on its own line: `import numpy as np` NOT combined with `from x import y`
+- Installed modules: pandas, numpy, scipy, sklearn, statsmodels, math, statistics,
+  dataclasses, typing, collections, functools, itertools, json
+- Do NOT import: torch, tensorflow, hmmlearn, jax, transformers
+- The strategy entrypoint is either `def generate_signals(data)` (structured)
+  or `def run(data, train_end, val_end, benchmark, config)` (expert).
+"""
+    messages = [
+        {"role": "system", "content": "You output ONLY corrected Python code. No markdown fences, no commentary."},
+        {"role": "user", "content": fix_prompt},
+    ]
+    try:
+        response = _call_llm(messages, max_tokens=4096, response_json=False)
+        code = str(response).strip()
+        if code.startswith("```"):
+            code = code.split("\n", 1)[-1]
+            if code.endswith("```"):
+                code = code[:-3].strip()
+        if not code:
+            return None
+        if "def generate_signals" not in code and "def run" not in code:
+            return None
+        return code
+    except Exception as e:
+        print(f"  ⚠️  Syntax fix LLM call failed: {e}")
+        return None
+
+
+def _syntax_preflight_with_fix(manifest_dict, max_attempts=2):
+    """Run syntax preflight; on failure, ask the LLM to repair up to
+    ``max_attempts`` times. On success, mutate manifest_dict['code_b64'] to
+    the fixed source and return (True, "", fix_count). On final failure,
+    return (False, last_error, fix_count).
+    """
+    name = manifest_dict.get("name", "?")
+    valid, err, source = _syntax_preflight_manifest(manifest_dict)
+    if valid:
+        return True, "", 0
+    if not source:
+        # decoding failed; nothing to repair
+        return False, err, 0
+    for attempt in range(max_attempts):
+        print(f"  🔄 Manifest '{name}': syntax fix attempt {attempt + 1}/{max_attempts} — {err}")
+        fixed = _syntax_fix_attempt(source, err, name)
+        if not fixed:
+            continue
+        # Re-check the fixed code
+        try:
+            compile(fixed, f"<manifest:{name}>", "exec")
+        except SyntaxError as e:
+            err = f"SyntaxError line {e.lineno}: {e.msg}"
+            source = fixed
+            continue
+        # Success — encode back into manifest
+        manifest_dict["code_b64"] = base64.b64encode(fixed.encode("utf-8")).decode("ascii")
+        return True, "", attempt + 1
+    return False, err, max_attempts
 
 
 def _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
@@ -1702,8 +1783,10 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         execution_mode = manifest.execution_mode
         manifest_name = manifest.name
 
-        # ── Syntax preflight (both modes, cheap) ──
-        syn_valid, syn_err = _syntax_preflight_manifest(manifest_dict)
+        # ── Syntax preflight (both modes, cheap) with fix-retry ──
+        syn_valid, syn_err, _fix_n = _syntax_preflight_with_fix(manifest_dict)
+        if _fix_n and syn_valid:
+            print(f"  🔧 Manifest {i+1} '{manifest_name}': syntax fixed after {_fix_n} attempt(s)")
         if not syn_valid:
             print(f"  🚫 Manifest {i+1} '{manifest_name}': syntax preflight FAILED — {syn_err}")
             continue
