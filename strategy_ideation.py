@@ -335,22 +335,23 @@ _MANIFEST_JSON_SCHEMA = """{
       "source": {"kind": "paper", "ref": "bollinger-band-paper.md"}
     },
     {
-      "name": "transformer_volatility_regime",
-      "code_b64": "aW1wb3J0IHRvcmNo...",
+      "name": "regime_switching_gmm",
+      "// code_b64 decodes to": "def run(data, train_end, val_end, benchmark, config):\\n    import pandas as pd\\n    import numpy as np\\n    from sklearn.mixture import GaussianMixture\\n    ... returns dict with val_sharpe/val_max_drawdown_pct/val_total_return_pct/holdout_*",
+      "code_b64": "ZGVmIHJ1bihkYXRhLCB0cmFpbl9lbmQsIHZhbF9lbmQsIGJlbmNobWFyaywgY29uZmlnKTogLi4u",
       "data_sources": [
         {"type": "ohlcv", "universe": ["SPY", "TLT", "GLD", "USO", "IWM", "QQQ"], "start": "2018-01-01"}
       ],
-      "model_artifacts": [{"name": "timesfm-base", "revision": "v1.0"}],
-      "compute": {"mode": "inference", "budget_seconds": 120, "gpu": true},
+      "model_artifacts": [],
+      "compute": {"mode": "inference", "budget_seconds": 120, "gpu": false},
       "evaluator": {
         "type": "custom",
-        "metrics": ["sharpe", "ir", "turnover", "cvar_95", "factor_exposure"],
+        "metrics": ["sharpe", "max_drawdown_pct"],
         "benchmark": "SPY",
-        "extras": {"custom_evaluator": "regime_aware_sharpe", "n_regimes": 3}
+        "extras": {"n_regimes": 3}
       },
       "execution_mode": "expert",
       "priority": 0.90,
-      "source": {"kind": "paper", "ref": "deep-macro-finance-2024.md"}
+      "source": {"kind": "paper", "ref": "hamilton-regime-switching-1989.md"}
     }
   ]
 }"""
@@ -1444,32 +1445,46 @@ and evaluate according to the manifest's declarations.
 Select and rank up to {max_proposals} ideas. For each, output a complete StrategyManifest:
 
 FIELDS:
-- name: a short unique strategy identifier (snake_case, e.g. "cross_sectional_momentum_top20")
-- code_b64: base64-encoded Python source. For structured mode: a generate_signals(df) function
-  returning pd.Series signal per asset or np.array weights. For expert mode: any valid Python
-  entrypoint (generate_signals or generate_weights) — may import torch, sklearn, scipy.
+- name: a short unique strategy identifier (snake_case)
+- code_b64: base64-encoded Python source. Entrypoint depends on execution_mode (see below).
 - data_sources: list of DataSource objects. At minimum one ohlcv with universe and start date.
   For portfolio strategies: universe should be 5+ symbols.
-- model_artifacts: list of model references (name + optional revision). Empty list if no models.
-- compute: {{mode: "inference"|"training", budget_seconds: int, gpu: bool}}
+- model_artifacts: [] (Phase 3 — leave empty for now)
+- compute: {{mode: "inference", budget_seconds: int, gpu: false}}  (training/gpu not supported)
 - evaluator: {{type: "portfolio"|"single_asset"|"custom", metrics: [...], benchmark: "SPY" or null,
   extras: {{}}(optional extra config)}}
-- execution_mode: "structured" (simple generate_signals → portfolio evaluation) or
-  "expert" (custom evaluator, RL, regime detection, foundation models, training loops)
+- execution_mode: "structured" or "expert"
 - priority: 0.0–1.0 (higher = more promising)
 - source: {{kind, ref}} — paper citation or idea reference
 
-INTERFACE CONTRACT (structured mode):
-- df has DatetimeIndex, columns Open/High/Low/Close/Volume (ALL capitalized)
-- Return pd.Series aligned to df.index with values in {{-1, 0, 1}}
-- Imports: numpy and pandas ONLY for structured
+═══════════════════════════════════════════════════════════════════════
+ENTRYPOINT CONTRACT — READ CAREFULLY. Wrong entrypoint = manifest DIES.
+═══════════════════════════════════════════════════════════════════════
 
-IMPORTANT: For expert-mode manifests:
-- evaluator.type should be "custom" with extras describing the custom approach
-- code_b64 may import torch, sklearn, scipy
-- model_artifacts must list any foundation models used
-- The code should implement a self-contained training/inference pipeline
-- MUST cite the paper in the source.ref field
+If execution_mode == "structured":
+  YOU MUST define ONE of:
+    def generate_signals(data):
+        # data: dict[symbol: str, DataFrame] with cols Open/High/Low/Close/Volume
+        # return: dict[symbol, pd.Series in {-1,0,1}] OR wide DataFrame
+    def generate_weights(data):
+        # same input, return wide DataFrame of portfolio weights
+
+If execution_mode == "expert":
+  YOU MUST define EXACTLY:
+    def run(data, train_end, val_end, benchmark, config):
+        # data: dict[symbol: str, DataFrame]  (may also contain '_news_sentiment' etc.)
+        # train_end, val_end: pd.Timestamp — walk-forward split boundaries
+        # benchmark: pd.Series of benchmark returns (or None)
+        # config: dict from evaluator.extras
+        # RETURN a dict with these EXACT keys (all floats):
+        #   {{"val_sharpe": ..., "val_max_drawdown_pct": ..., "val_total_return_pct": ...,
+        #    "holdout_sharpe": ..., "holdout_max_drawdown_pct": ..., "holdout_total_return_pct": ...}}
+        # Optional: additional keys go into "expert_extras" in the output.
+  DO NOT define generate_signals in expert mode — the runner won't call it.
+
+Installed modules for BOTH modes: pandas, numpy, scipy, sklearn, statsmodels,
+math, statistics, dataclasses, typing, collections, functools, itertools, json.
+NOT installed: torch, tensorflow, hmmlearn, jax, transformers.
 
 Favor NOVEL families (low n_trials) and ideas that survived strong attacks.
 For code_b64: base64-encode complete self-contained Python source.
