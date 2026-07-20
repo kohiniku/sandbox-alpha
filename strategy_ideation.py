@@ -1413,6 +1413,13 @@ Return ONLY this JSON (no markdown, no commentary):
     # temperature. Empirically the failure mode is "unterminated string" from
     # the manifest schema being verbose enough to hit the token cap, followed
     # by JSON drift when the model is too creative on retry.
+    #
+    # Model choice: default to flash for select because the previous cron run
+    # (2026-07-20 09:06) timed out at 600s while pro consumed reasoning tokens
+    # and returned empty JSON twice. Select is mechanical — take surviving
+    # ideas and structure them — so flash is faster AND more reliable.
+    # HYPO_LLM_MODEL_SELECT overrides if you want to force pro.
+    select_model = os.environ.get("HYPO_LLM_MODEL_SELECT", "deepseek-v4-flash")
     attempts_cfg = [
         {"max_tokens": 8192, "temperature": 0.7},
         {"max_tokens": 12288, "temperature": 0.3},
@@ -1425,6 +1432,7 @@ Return ONLY this JSON (no markdown, no commentary):
                 select_messages,
                 max_tokens=cfg["max_tokens"],
                 temperature=cfg["temperature"],
+                model=select_model,
             )
             manifests_raw = response.get("manifests", [])
 
