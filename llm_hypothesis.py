@@ -335,9 +335,11 @@ def generate(knowledge, templates):
             "model": cfg["model"],
             "messages": messages,
             "temperature": 0.7,
-            # DeepSeek v4系はflashでも隠れreasoningがトークンを消費するため、
-            # 512では finish_reason=length で content が空になるケースが多発した
-            "max_tokens": int(os.environ.get("HYPO_LLM_MAX_TOKENS", "2048")),
+            # DeepSeek v4系は隠れreasoningがトークンを消費する。512では flash でも
+            # content が空になり、2048 でも v4-pro は reasoning で食い尽くして
+            # 空 content を返した (2026-07-20 のループで 10 件中 4 件 JSON 失敗)。
+            # ideation 側の教訓 (fe1db96) と同じく pro の呼び出しは 8192 に揃える。
+            "max_tokens": int(os.environ.get("HYPO_LLM_MAX_TOKENS", "8192")),
             "response_format": {"type": "json_object"},
         },
         timeout=int(os.environ.get("HYPO_LLM_TIMEOUT", "120")),
