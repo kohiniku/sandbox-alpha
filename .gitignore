@@ -21,7 +21,10 @@ Thumbs.db
 
 # Project specific
 results/
+# Runtime dump of LLM-generated strategy code (repo root). The built-in
+# strategy package backtests/strategies/ is tracked — hence the negation.
 strategies/
+!backtests/strategies/
 knowledge.json
 ideation_logs/
 *.log
