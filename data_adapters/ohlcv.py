@@ -120,9 +120,13 @@ def load_ohlcv(
         if not os.path.isfile(path):
             raise MissingDataError(symbol, data_dir)
 
-        # Read CSV — first column is assumed to be the date index
-        df = pd.read_csv(path, parse_dates=[0], index_col=0)
-        df.index = pd.DatetimeIndex(df.index)
+        # Read CSV — first column is assumed to be the date index.
+        # utc=True normalises mixed-tz CSVs (e.g. crypto has UTC offset,
+        # equities are naive) so downstream concat/reindex across symbols
+        # doesn't raise "Mixed timezones detected". tz_convert(None) keeps
+        # the wall-clock date because the rest of the pipeline is date-only.
+        df = pd.read_csv(path, index_col=0)
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
         df.index.name = "Date"
 
         # Canonicalize columns
