@@ -264,6 +264,86 @@ def compute_position_returns(df, signals):
     return strategy_returns.dropna(), signals
 
 
+def build_synthetic_df(n_days=250, seed=42):
+    """Build a deterministic synthetic OHLCV DataFrame for preflight validation.
+
+    Returns a DataFrame with DatetimeIndex, columns Open/High/Low/Close/Volume,
+    using seeded random-walk prices (numpy default_rng).
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2022-01-03", periods=n_days, freq="B")
+    daily_ret = rng.normal(0.0003, 0.012, size=n_days)
+    close = 100.0 * np.cumprod(1.0 + daily_ret)
+    # Derive O/H/L/V from close with small noise
+    open_ = close * (1.0 + rng.uniform(-0.002, 0.002, size=n_days))
+    high = np.maximum(open_, close) * (1.0 + rng.uniform(0.001, 0.005, size=n_days))
+    low = np.minimum(open_, close) * (1.0 - rng.uniform(0.001, 0.005, size=n_days))
+    volume = rng.integers(500_000, 5_000_000, size=n_days).astype(float)
+    df = pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
+        index=dates,
+    )
+    return df
+
+
+def run_preflight(code_b64_str):
+    """Preflight validation: decode → safety → exec → signal contract → backtest on synthetic data.
+
+    Returns a JSON-serialisable dict:
+      success: {"valid": true, "n_signals": <int>}
+      failure: {"valid": false, "error": "<msg>", "traceback": "<last ~15 lines>"}
+    """
+    import traceback as tb_module
+
+    # (a) decode
+    try:
+        decoded = base64.b64decode(code_b64_str)
+    except Exception as e:
+        return {"valid": False, "error": f"base64 decode failed: {e}", "traceback": ""}
+
+    if len(decoded) > MAX_CODE_BYTES:
+        return {"valid": False, "error": f"code too large: {len(decoded)} bytes (max {MAX_CODE_BYTES})", "traceback": ""}
+
+    try:
+        code_str_decoded = decoded.decode("utf-8")
+    except Exception as e:
+        return {"valid": False, "error": f"utf-8 decode failed: {e}", "traceback": ""}
+
+    # (b) AST safety check
+    safety_err = check_safety(code_str_decoded)
+    if safety_err:
+        return {"valid": False, "error": safety_err, "traceback": ""}
+
+    # Build synthetic data
+    df = build_synthetic_df()
+
+    # (c) Exec and extract
+    try:
+        generate_signals = exec_and_extract(code_str_decoded, df)
+    except Exception as e:
+        tb_lines = tb_module.format_exc().splitlines()[-15:]
+        return {"valid": False, "error": f"exec failed: {e}", "traceback": "\n".join(tb_lines)}
+
+    # Validate signals on full data
+    try:
+        signals = _call_signals(generate_signals, df)
+    except Exception as e:
+        tb_lines = tb_module.format_exc().splitlines()[-15:]
+        return {"valid": False, "error": f"signal validation failed: {e}", "traceback": "\n".join(tb_lines)}
+
+    # Fast backtest pass on synthetic data to catch downstream errors
+    try:
+        strat_returns, _ = compute_position_returns(df, signals)
+        strat_returns_net = apply_trading_cost(strat_returns, signals.reindex(strat_returns.index))
+        _ = compute_split_metrics(strat_returns_net, signals, len(df))
+    except Exception as e:
+        tb_lines = tb_module.format_exc().splitlines()[-15:]
+        return {"valid": False, "error": f"backtest pass failed: {e}", "traceback": "\n".join(tb_lines)}
+
+    n_signals = int((signals != 0).sum())
+    return {"valid": True, "n_signals": n_signals}
+
+
 def run_harness(code_str, symbol, data_dir):
     """Full harness pipeline: decode → safety → exec → lookahead → metrics → JSON."""
 
@@ -345,14 +425,26 @@ def run_harness(code_str, symbol, data_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trusted Strategy Harness")
     parser.add_argument("--code-b64", required=True, help="Base64-encoded strategy code")
-    parser.add_argument("--symbol", required=True, help="Ticker symbol")
-    parser.add_argument("--data-dir", required=True, help="Directory for cached CSV files")
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--symbol", help="Ticker symbol (normal backtest mode)")
+    group.add_argument("--synthetic", action="store_true",
+                       help="Preflight mode: validate against synthetic OHLCV data")
+
+    parser.add_argument("--data-dir", help="Directory for cached CSV files (normal mode)")
     args = parser.parse_args()
 
-    result = run_harness(args.code_b64, args.symbol, args.data_dir)
+    if args.synthetic:
+        result = run_preflight(args.code_b64)
+        print(json.dumps(result, default=str))
+        sys.exit(0)  # validity is in the payload, always exit 0
+    else:
+        if not args.data_dir:
+            parser.error("--data-dir is required in normal mode (without --synthetic)")
+        result = run_harness(args.code_b64, args.symbol, args.data_dir)
 
-    if "error" in result:
-        print(json.dumps({"error": result["error"]}))
-        sys.exit(1)
+        if "error" in result:
+            print(json.dumps({"error": result["error"]}))
+            sys.exit(1)
 
-    print(json.dumps(result, indent=2, default=str))
+        print(json.dumps(result, indent=2, default=str))
