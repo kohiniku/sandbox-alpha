@@ -52,6 +52,7 @@ def _minimal_dict(**overrides):
             "type": "portfolio",
             "metrics": ["sharpe"],
         },
+        "execution_mode": "structured",
     }
     d.update(overrides)
     return d
@@ -85,6 +86,7 @@ class TestRoundTrip:
                 "benchmark": "SPY",
                 "extras": {"custom_flag": True},
             },
+            "execution_mode": "structured",
         }
         m = StrategyManifest.from_dict(d)
         out = m.to_dict()
@@ -398,6 +400,36 @@ class TestEvaluatorValidation:
         d["evaluator"] = {"type": "portfolio", "metrics": ["sharpe"], "benchmark": "SPY"}
         m = StrategyManifest.from_dict(d)
         assert m.validate() == []
+
+
+# ---------------------------------------------------------------------------
+# execution_mode validation
+# ---------------------------------------------------------------------------
+
+class TestExecutionModeValidation:
+    def test_default_is_structured(self):
+        d = _minimal_dict()
+        m = StrategyManifest.from_dict(d)
+        assert m.execution_mode == "structured"
+        assert m.validate() == []
+
+    def test_valid_expert(self):
+        d = _minimal_dict(execution_mode="expert")
+        m = StrategyManifest.from_dict(d)
+        assert m.execution_mode == "expert"
+        assert m.validate() == []
+
+    def test_invalid_mode(self):
+        d = _minimal_dict(execution_mode="experimental")
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("execution_mode" in v for v in violations)
+
+    def test_roundtrip_preserves_mode(self):
+        d = _minimal_dict(execution_mode="expert")
+        m = StrategyManifest.from_dict(d)
+        out = m.to_dict()
+        assert out["execution_mode"] == "expert"
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ VALID_METRICS = frozenset({
 
 VALID_COMPUTE_MODES = frozenset({"inference", "training"})
 VALID_EVALUATOR_TYPES = frozenset({"portfolio", "single_asset", "custom"})
+VALID_EXECUTION_MODES = frozenset({"structured", "expert"})
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +251,7 @@ class StrategyManifest:
     model_artifacts: List[ModelArtifact] = field(default_factory=list)
     compute: ComputeSpec = field(default_factory=ComputeSpec)
     evaluator: EvaluatorSpec = field(default_factory=EvaluatorSpec)
+    execution_mode: str = "structured"
 
     @classmethod
     def from_dict(cls, d: Any) -> "StrategyManifest":
@@ -269,6 +271,7 @@ class StrategyManifest:
             model_artifacts=model_artifacts,
             compute=compute,
             evaluator=evaluator,
+            execution_mode=d.get("execution_mode", "structured"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -280,6 +283,7 @@ class StrategyManifest:
             "model_artifacts": [ma.to_dict() for ma in self.model_artifacts],
             "compute": self.compute.to_dict(),
             "evaluator": self.evaluator.to_dict(),
+            "execution_mode": self.execution_mode,
         }
 
     def validate(self) -> List[str]:
@@ -363,6 +367,13 @@ class StrategyManifest:
                 )
         if not isinstance(self.evaluator.extras, dict):
             violations.append("evaluator.extras must be a dict")
+
+        # 7. execution_mode
+        if self.execution_mode not in VALID_EXECUTION_MODES:
+            violations.append(
+                f"execution_mode must be one of {sorted(VALID_EXECUTION_MODES)}, "
+                f"got '{self.execution_mode}'"
+            )
 
         return violations
 

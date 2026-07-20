@@ -44,6 +44,7 @@ def _make_manifest(
     end="2023-12-31",
     metrics=None,
     benchmark=None,
+    execution_mode="structured",
 ):
     """Build a StrategyManifest with code_b64 encoded."""
     if universe is None:
@@ -63,6 +64,7 @@ def _make_manifest(
             "metrics": metrics,
             "benchmark": benchmark,
         },
+        "execution_mode": execution_mode,
     }
     return StrategyManifest.from_dict(payload)
 
@@ -84,7 +86,7 @@ def _setup_data(tmp_path, symbols, n_days=60):
 class TestHappyPathSignals:
     def test_generate_signals_wide_df(self, tmp_path):
         symbols = ["AAPL", "MSFT", "GOOG"]
-        _setup_data(tmp_path, symbols, n_days=60)
+        _setup_data(tmp_path, symbols, n_days=200)
 
         code = textwrap.dedent("""\
             import pandas as pd
@@ -107,10 +109,19 @@ class TestHappyPathSignals:
         assert result["manifest_name"] == "test_strat"
         assert result["universe_size"] == 3
         assert result["n_days"] > 0
-        assert "sharpe" in result["metrics"]
-        assert "max_drawdown" in result["metrics"]
+        assert result["execution_mode"] == "structured"
+        assert "val_sharpe" in result["metrics"]
+        assert "val_max_drawdown" in result["metrics"]
+        assert "holdout_sharpe" in result["metrics"]
+        assert "holdout_max_drawdown" in result["metrics"]
+        assert "val_max_drawdown_pct" in result["metrics"]
+        assert "holdout_max_drawdown_pct" in result["metrics"]
+        assert "val_total_return_pct" in result["metrics"]
+        assert "holdout_total_return_pct" in result["metrics"]
         assert result["config"]["weighting"] == "equal_active_signals"
         assert result["config"]["benchmark"] is None
+        assert "train_end" in result["config"]
+        assert "val_end" in result["config"]
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +131,7 @@ class TestHappyPathSignals:
 class TestGenerateWeights:
     def test_generate_weights_direct(self, tmp_path):
         symbols = ["AAPL", "MSFT", "GOOG"]
-        _setup_data(tmp_path, symbols, n_days=60)
+        _setup_data(tmp_path, symbols, n_days=200)
 
         code = textwrap.dedent("""\
             import pandas as pd
@@ -219,7 +230,7 @@ class TestMissingData:
 class TestMissingBenchmark:
     def test_benchmark_not_in_universe(self, tmp_path):
         symbols = ["AAPL", "MSFT", "GOOG"]
-        _setup_data(tmp_path, symbols, n_days=60)
+        _setup_data(tmp_path, symbols, n_days=200)
 
         code = textwrap.dedent("""\
             import pandas as pd
@@ -245,10 +256,10 @@ class TestMissingBenchmark:
         assert result["status"] == "ok"
         assert "warning" in result
         assert "SPY" in result["warning"]
-        assert "sharpe" in result["metrics"]
-        assert "max_drawdown" in result["metrics"]
+        assert "val_sharpe" in result["metrics"]
+        assert "val_max_drawdown" in result["metrics"]
         # IR should be NaN since benchmark is None
-        assert np.isnan(result["metrics"].get("ir", float("nan")))
+        assert np.isnan(result["metrics"].get("val_ir", result["metrics"].get("holdout_ir", float("nan"))))
 
 
 # ---------------------------------------------------------------------------
@@ -327,3 +338,203 @@ class TestImportRestriction:
         assert result["status"] == "error"
         assert result["error_type"] == "code"
         assert "not allowed" in result["error"].lower() or "import" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Expert mode tests
+# ---------------------------------------------------------------------------
+
+class TestExpertMode:
+    def test_expert_happy_path(self, tmp_path):
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                first_sym = list(data.keys())[0]
+                val_returns = data[first_sym]["Close"].pct_change().dropna()
+                val_returns = val_returns[(val_returns.index > train_end) & (val_returns.index <= val_end)]
+                holdout_returns = data[first_sym]["Close"].pct_change().dropna()
+                holdout_returns = holdout_returns[holdout_returns.index > val_end]
+                mu_val = val_returns.mean()
+                sigma_val = val_returns.std(ddof=1)
+                val_sharpe = float(mu_val / sigma_val * np.sqrt(252)) if sigma_val > 0 else 0.0
+                mu_ho = holdout_returns.mean()
+                sigma_ho = holdout_returns.std(ddof=1)
+                holdout_sharpe = float(mu_ho / sigma_ho * np.sqrt(252)) if sigma_ho > 0 else 0.0
+                return {
+                    "val_sharpe": val_sharpe,
+                    "val_max_drawdown_pct": 5.0,
+                    "val_total_return_pct": 10.0,
+                    "holdout_sharpe": holdout_sharpe,
+                    "holdout_max_drawdown_pct": 3.0,
+                    "holdout_total_return_pct": 8.0,
+                    "my_extra_metric": 42.5,
+                }
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"
+        assert "val_sharpe" in result["metrics"]
+        assert "val_max_drawdown_pct" in result["metrics"]
+        assert "val_total_return_pct" in result["metrics"]
+        assert "holdout_sharpe" in result["metrics"]
+        assert "holdout_max_drawdown_pct" in result["metrics"]
+        assert "holdout_total_return_pct" in result["metrics"]
+        assert "expert_extras" in result
+        assert result["expert_extras"]["my_extra_metric"] == 42.5
+        assert result["config"]["entrypoint"] == "run"
+
+    def test_missing_run_entrypoint(self, tmp_path):
+        symbols = ["AAPL"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = "x = 1  # no run() defined"
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "code"
+        assert "run(" in result["error"] or "run()" in result["error"]
+
+    def test_missing_required_metric(self, tmp_path):
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            def run(data, train_end, val_end, benchmark, config):
+                # Missing holdout_* metrics
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                }
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "code"
+        assert "missing" in result["error"].lower()
+        assert "holdout" in result["error"]
+
+    def test_non_finite_metric(self, tmp_path):
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import math
+
+            def run(data, train_end, val_end, benchmark, config):
+                return {
+                    "val_sharpe": float("nan"),
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "code"
+        assert "not finite" in result["error"].lower()
+
+    def test_pathological_sharpe_warning(self, tmp_path):
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import math
+
+            def run(data, train_end, val_end, benchmark, config):
+                return {
+                    "val_sharpe": 15.0,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert "pathological_warnings" in result
+        assert any("sharpe" in w.lower() for w in result["pathological_warnings"])
+
+    def test_import_scipy(self, tmp_path):
+        """scipy is allowed but may not be installed — best-effort."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            from scipy import stats
+
+            def run(data, train_end, val_end, benchmark, config):
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        # scipy is a best-effort import; if not installed, it's a normal code_error
+        if result["status"] == "ok":
+            assert result["execution_mode"] == "expert"
+        else:
+            assert result["error_type"] == "code"
+
+    def test_import_os_blocked(self, tmp_path):
+        symbols = ["AAPL"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import os
+
+            def run(data, train_end, val_end, benchmark, config):
+                return {"val_sharpe": 1.5}
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "code"
+        assert "not allowed" in result["error"].lower() or "import" in result["error"].lower()
+
+    def test_run_raises_exception(self, tmp_path):
+        symbols = ["AAPL"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            def run(data, train_end, val_end, benchmark, config):
+                raise ValueError("expert bug")
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "code"
+        assert "expert bug" in result["error"]
