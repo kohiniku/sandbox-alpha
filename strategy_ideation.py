@@ -741,11 +741,15 @@ def _stage_brainstorm(knowledge, templates, research_docs):
 
 
 def _stage_debate(ideas):
-    """Stage 2 — Adversarial debate: Risk Manager attacks, Quant Researcher defends.
+    """Stage 2 — Adversarial debate: Risk Manager attacks, Quant Researcher defends,
+    Judge decides survive/kill per idea.
 
-    Returns list of per-idea results: [{index, survive: bool, attack, rebuttal, reason}]
+    Returns (results, judge_report) where:
+      results: [{index, survive: bool, attack, rebuttal, reason}]
+      judge_report: raw judge LLM response list
 
-    Two persona calls over the full brainstorm list.
+    Judge is the single source of truth for survive/kill. If the judge call
+    fails or returns unparseable output, ALL ideas survive (fail-open).
     """
     ideas_text = "\n".join(
         f"{i}: [{idea.get('type','?')}] {idea.get('name','?')} | family={idea.get('family','?')} "
@@ -804,25 +808,75 @@ Return ONLY this JSON:
     quant_response = _call_llm(quant_messages, max_tokens=4096)
     quant_report = quant_response.get("quant_report", [])
 
-    # --- Merge ---
+    # --- Build per-idea context for judge ---
     risk_by_idx = {r.get("index"): r.get("attack", "") for r in risk_report if isinstance(r, dict)}
     quant_by_idx = {q.get("index"): (q.get("rebuttal", ""), q.get("variation", ""))
                     for q in quant_report if isinstance(q, dict)}
+
+    # --- Judge: explicit survive/kill verdicts ---
+    judge_items = []
+    for i, idea in enumerate(ideas):
+        attack = risk_by_idx.get(i, "no attack recorded")
+        rebuttal, variation = quant_by_idx.get(i, ("no rebuttal", ""))
+        judge_items.append({
+            "index": i,
+            "idea": f"{idea.get('name','?')} [{idea.get('type','?')}] family={idea.get('family','?')}",
+            "attack": attack,
+            "rebuttal": rebuttal,
+        })
+
+    judge_prompt = f"""You are an impartial JUDGE evaluating trading-strategy ideas. For each idea,
+review the attack vs rebuttal and decide: SURVIVE (keep) or KILL (discard).
+
+Decision factors:
+- SURVIVE if: rebuttal addresses the attack convincingly OR the idea explores novel ground
+- KILL if: attack is fatal (clear overfitting, un-implementable, or well-known decayed anomaly)
+
+For EACH idea, provide a one-sentence reason for your decision.
+
+=== IDEAS WITH ATTACKS AND REBUTTALS ===
+{json.dumps(judge_items, indent=2)}
+
+Return ONLY this JSON:
+{{"judge_report": [
+  {{"index": <int matching idea index>, "survive": true|false, "reason": "one sentence verdict"}}
+]}}"""
+
+    judge_messages = [
+        {"role": "system", "content": "You output ONLY valid JSON. You are an impartial judge."},
+        {"role": "user", "content": judge_prompt},
+    ]
+
+    judge_report = []
+    judge_failed = False
+    try:
+        judge_response = _call_llm(judge_messages, max_tokens=4096)
+        judge_report = judge_response.get("judge_report", [])
+        if not isinstance(judge_report, list) or not judge_report:
+            judge_failed = True
+    except Exception as e:
+        print(f"⚠️  Judge LLM call failed: {e} — ALL ideas survive (fail-open)", file=sys.stderr)
+        judge_failed = True
+
+    # --- Build results from judge verdicts ---
+    if judge_failed:
+        # Fail-open: all ideas survive
+        print("⚠️  Judge verdicts unavailable — treating ALL ideas as surviving", file=sys.stderr)
+        judge_verdicts = {i: (True, "judge unavailable — fail-open") for i in range(len(ideas))}
+    else:
+        judge_verdicts = {}
+        for jv in judge_report:
+            if isinstance(jv, dict) and "index" in jv:
+                idx = jv["index"]
+                survive = jv.get("survive", True)  # default True if key missing
+                reason = jv.get("reason", "")
+                judge_verdicts[idx] = (survive, reason)
 
     results = []
     for i in range(len(ideas)):
         attack = risk_by_idx.get(i, "")
         rebuttal, variation = quant_by_idx.get(i, ("", ""))
-
-        # Kill signals in attack: overfit, exhausted, unimplementable
-        attack_lower = attack.lower()
-        kill_signals = [
-            "overfit" in attack_lower,
-            "post-publication" in attack_lower and "decayed" in attack_lower,
-            "unimplementable on daily" in attack_lower,
-        ]
-        survive = not any(kill_signals)
-        reason = f"attack: {attack[:200]} | rebuttal: {rebuttal[:200]}" if attack or rebuttal else "no debate"
+        survive, judge_reason = judge_verdicts.get(i, (True, "no judge verdict — default survive"))
 
         results.append({
             "index": i,
@@ -830,20 +884,21 @@ Return ONLY this JSON:
             "attack": attack,
             "rebuttal": rebuttal,
             "variation": variation,
-            "reason": reason,
+            "reason": f"judge: {judge_reason} | attack: {attack[:100]} | rebuttal: {rebuttal[:100]}",
         })
 
-    return results
+    return results, judge_report
 
 
 def _stage_select(surviving_ideas, debate_results, knowledge, templates, research_docs, max_proposals):
     """Stage 3 — Convergent selection: rank by novelty × plausibility × implementability,
     output full proposals in the existing format.
 
-    Returns list of full proposal dicts (in existing schema).
+    Returns (proposals, fallback_used) where fallback_used=True if 0 survivors
+    triggered fallback to full brainstorm list.
     """
     if not surviving_ideas:
-        return []
+        return [], False
 
     # Compact family summary for ranking context
     families = knowledge.get("families", {})
@@ -871,6 +926,23 @@ def _stage_select(surviving_ideas, debate_results, knowledge, templates, researc
                 "rebuttal": r.get("rebuttal", ""),
                 "variation": r.get("variation", ""),
             })
+
+    fallback_used = False
+    if not items:
+        # 0 survivors: loud warning, fall back to full brainstorm list
+        print("⚠️  WARNING: 0 survivors after debate — selecting from full brainstorm list", file=sys.stderr)
+        fallback_used = True
+        for r in debate_results:
+            idx = r["index"]
+            if idx < len(surviving_ideas):
+                idea = surviving_ideas[idx]
+                items.append({
+                    "idx": idx,
+                    "idea": idea,
+                    "attack": r.get("attack", ""),
+                    "rebuttal": r.get("rebuttal", ""),
+                    "variation": r.get("variation", ""),
+                })
 
     items_text = "\n".join(
         f"{i}: [{item['idea'].get('type','?')}] {item['idea'].get('name','?')} "
@@ -924,10 +996,10 @@ Return ONLY this JSON:
         {"role": "user", "content": select_prompt},
     ]
     response = _call_llm(select_messages, max_tokens=4096)
-    return response.get("proposals", [])
+    return response.get("proposals", []), fallback_used
 
 
-def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, selection_reasoning, final_proposals):
+def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report, selection_reasoning, final_proposals, fallback_used=False):
     """Save full audit trail to ideation_logs/<UTC timestamp>.json."""
     _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -942,10 +1014,12 @@ def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, selection_re
         "stage2_debate": {
             "risk_report": risk_report,
             "quant_report": quant_report,
+            "judge_report": judge_report,
         },
         "stage3_selection": {
             "reasoning": selection_reasoning,
             "n_proposed": len(final_proposals),
+            "fallback_used": fallback_used,
         },
         "final_proposals": final_proposals,
     }
@@ -976,8 +1050,8 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
 
     # ── Stage 2: Debate ──
     try:
-        print("⚔️  IDEATION_V2 Stage 2: Debate (Risk Manager + Quant Researcher)...")
-        debate_results = _stage_debate(brainstorm_ideas)
+        print("⚔️  IDEATION_V2 Stage 2: Debate (Risk Manager + Quant Researcher + Judge)...")
+        debate_results, judge_report = _stage_debate(brainstorm_ideas)
         n_survived = sum(1 for r in debate_results if r.get("survive"))
         print(f"   ✅ {n_survived}/{len(brainstorm_ideas)} ideas survived debate")
     except Exception as e:
@@ -987,9 +1061,8 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
     # ── Stage 3: Select ──
     try:
         print("🎯 IDEATION_V2 Stage 3: Select (ranking + proposal generation)...")
-        # Build surviving ideas list (keep original ideas for reference)
         surviving = brainstorm_ideas  # pass all; _stage_select filters by debate survive flag
-        proposals = _stage_select(surviving, debate_results, knowledge, templates, research_docs, max_proposals)
+        proposals, select_fallback_used = _stage_select(surviving, debate_results, knowledge, templates, research_docs, max_proposals)
         print(f"   📝 {len(proposals)} full proposals generated")
     except Exception as e:
         print(f"⚠️  IDEATION_V2 select failed: {e} — falling back to single-call path", file=sys.stderr)
@@ -1095,8 +1168,9 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
     quant_report = [{"index": r["index"], "rebuttal": r["rebuttal"], "variation": r["variation"]}
                     for r in debate_results]
     try:
-        _save_ideation_log(brainstorm_ideas, risk_report, quant_report,
-                          f"Selected {len(proposals)} from {n_survived} survivors", proposals)
+        _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report,
+                          f"Selected {len(proposals)} from {n_survived} survivors", proposals,
+                          fallback_used=select_fallback_used)
     except Exception as e:
         print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
 
