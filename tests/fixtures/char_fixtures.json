@@ -1,0 +1,501 @@
+{
+  "infra_error": {
+    "result": {
+      "error": "connection refused",
+      "error_type": "infra"
+    },
+    "verdict": "error",
+    "evaluation": {
+      "verdict": "error",
+      "error": "connection refused",
+      "error_type": "infra",
+      "reasons": [
+        "\ud83d\udd27 Infra error (not counted as rejection): connection refused"
+      ]
+    }
+  },
+  "code_error": {
+    "result": {
+      "error": "KeyError: 'close'",
+      "error_type": "code"
+    },
+    "verdict": "code_error",
+    "evaluation": {
+      "verdict": "code_error",
+      "error": "KeyError: 'close'",
+      "error_type": "code",
+      "reasons": [
+        "\ud83d\udcbb Code error (strategy code crashed): KeyError: 'close'"
+      ]
+    }
+  },
+  "unknown_error": {
+    "result": {
+      "error": "something weird",
+      "error_type": "gremlins"
+    },
+    "verdict": "error",
+    "evaluation": {
+      "verdict": "error",
+      "error": "something weird",
+      "error_type": "unknown",
+      "reasons": [
+        "\ud83d\udd27 Unknown error (not counted as rejection): something weird"
+      ]
+    }
+  },
+  "missing_error_type": {
+    "result": {
+      "error": "bare error"
+    },
+    "verdict": "error",
+    "evaluation": {
+      "verdict": "error",
+      "error": "bare error",
+      "error_type": "unknown",
+      "reasons": [
+        "\ud83d\udd27 Unknown error (not counted as rejection): bare error"
+      ]
+    }
+  },
+  "walkforward_disabled": {
+    "result": {
+      "walkforward": {
+        "enabled": false
+      }
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "error": "walkforward disabled",
+      "reasons": [
+        "\u274c Walkforward not enabled"
+      ]
+    }
+  },
+  "val_gate_fail_sharpe": {
+    "result": {
+      "walkforward": {
+        "enabled": true,
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "holdout_ratio": 0.2
+      },
+      "in_sample": {
+        "sharpe_ratio": 0.1,
+        "total_return_pct": -2.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      },
+      "out_of_sample": {
+        "sharpe_ratio": 0.1,
+        "total_return_pct": -3.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 80
+      },
+      "holdout": {
+        "sharpe_ratio": 0.05,
+        "total_return_pct": -1.0,
+        "max_drawdown_pct": -15.0,
+        "num_days": 40
+      }
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 0.1,
+      "total_return_pct": -3.0,
+      "max_drawdown_pct": -30.0,
+      "reasons": [
+        "\u274c Val Sharpe 0.10 < 2.09 (deflated, N=0, T=80)",
+        "\u274c Val Return -3.0% <= 0%",
+        "\u274c Val Drawdown -30.0% < -25.0%"
+      ],
+      "gate_results": {
+        "validation": false
+      },
+      "effective_min_sharpe": 2.0897,
+      "in_sample": {
+        "sharpe_ratio": 0.1,
+        "total_return_pct": -2.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      }
+    }
+  },
+  "val_gate_fail_drawdown": {
+    "result": {
+      "walkforward": {
+        "enabled": true,
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "holdout_ratio": 0.2
+      },
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 12.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      },
+      "out_of_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 12.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 252
+      },
+      "holdout": {
+        "sharpe_ratio": 0.8,
+        "total_return_pct": 10.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 80
+      }
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 1.5,
+      "total_return_pct": 12.0,
+      "max_drawdown_pct": -30.0,
+      "reasons": [
+        "\u2705 Val Sharpe 1.50 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 12.0% > 0%",
+        "\u274c Val Drawdown -30.0% < -25.0%"
+      ],
+      "gate_results": {
+        "validation": false
+      },
+      "effective_min_sharpe": 1.1774,
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 12.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      }
+    }
+  },
+  "holdout_fail": {
+    "result": {
+      "walkforward": {
+        "enabled": true,
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "holdout_ratio": 0.2
+      },
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 18.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 150
+      },
+      "out_of_sample": {
+        "sharpe_ratio": 1.2,
+        "total_return_pct": 15.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 252
+      },
+      "holdout": {
+        "sharpe_ratio": -0.1,
+        "total_return_pct": -5.0,
+        "max_drawdown_pct": -15.0,
+        "num_days": 80
+      }
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 1.2,
+      "total_return_pct": 15.0,
+      "max_drawdown_pct": -10.0,
+      "holdout_sharpe": -0.1,
+      "holdout_return_pct": -5.0,
+      "reasons": [
+        "\u2705 Val Sharpe 1.20 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 15.0% > 0%",
+        "\u2705 Val Drawdown -10.0% >= -25.0%",
+        "\ud83d\udcd0 Deflated threshold: 1.18 (base=0.5, N_family=0, T_val=252)",
+        "\u274c Holdout Sharpe -0.10 < 0.50 (threshold=min(0.5, 0.5*val))",
+        "\u274c Holdout Return -5.0% <= 0"
+      ],
+      "gate_results": {
+        "validation": true,
+        "deflation": true,
+        "holdout": false
+      },
+      "effective_min_sharpe": 1.1774,
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 18.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 150
+      }
+    }
+  },
+  "full_adoption": {
+    "result": {
+      "walkforward": {
+        "enabled": true,
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "holdout_ratio": 0.2
+      },
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 18.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 150
+      },
+      "out_of_sample": {
+        "sharpe_ratio": 1.2,
+        "total_return_pct": 15.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 252
+      },
+      "holdout": {
+        "sharpe_ratio": 0.8,
+        "total_return_pct": 10.0,
+        "max_drawdown_pct": -8.0,
+        "num_days": 80
+      }
+    },
+    "verdict": "adopted",
+    "evaluation": {
+      "verdict": "adopted",
+      "sharpe_ratio": 1.2,
+      "total_return_pct": 15.0,
+      "max_drawdown_pct": -10.0,
+      "holdout_sharpe": 0.8,
+      "holdout_return_pct": 10.0,
+      "reasons": [
+        "\ud83c\udfc6 ALL GATES PASSED",
+        "\u2705 Val Sharpe 1.20 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 15.0% > 0%",
+        "\u2705 Val Drawdown -10.0% >= -25.0%",
+        "\ud83d\udcd0 Deflated threshold: 1.18 (base=0.5, N_family=0, T_val=252)",
+        "\u2705 Holdout Sharpe 0.80 >= 0.50 (threshold=min(0.5, 0.5*val))",
+        "\u2705 Holdout Return 10.0% > 0"
+      ],
+      "gate_results": {
+        "validation": true,
+        "deflation": true,
+        "holdout": true,
+        "cluster": "new"
+      },
+      "effective_min_sharpe": 1.1774,
+      "cluster_id": "fed89a1e",
+      "in_sample": {
+        "sharpe_ratio": 1.5,
+        "total_return_pct": 18.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 150
+      }
+    }
+  },
+  "near_miss_drawdown": {
+    "result": {
+      "walkforward": {
+        "enabled": true,
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "holdout_ratio": 0.2
+      },
+      "in_sample": {
+        "sharpe_ratio": 1.1,
+        "total_return_pct": 10.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      },
+      "out_of_sample": {
+        "sharpe_ratio": 1.1,
+        "total_return_pct": 10.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 252
+      },
+      "holdout": {
+        "sharpe_ratio": 0.6,
+        "total_return_pct": 5.0,
+        "max_drawdown_pct": -10.0,
+        "num_days": 80
+      }
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 1.1,
+      "total_return_pct": 10.0,
+      "max_drawdown_pct": -30.0,
+      "reasons": [
+        "\u274c Val Sharpe 1.10 < 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 10.0% > 0%",
+        "\u274c Val Drawdown -30.0% < -25.0%"
+      ],
+      "gate_results": {
+        "validation": false
+      },
+      "effective_min_sharpe": 1.1774,
+      "in_sample": {
+        "sharpe_ratio": 1.1,
+        "total_return_pct": 10.0,
+        "max_drawdown_pct": -30.0,
+        "num_days": 150
+      }
+    }
+  },
+  "manifest_missing_metrics": {
+    "runner_result": {
+      "bad": "data"
+    },
+    "verdict": "error",
+    "evaluation": {
+      "verdict": "error",
+      "error": "Malformed runner response: missing 'metrics'",
+      "error_type": "infra",
+      "reasons": [
+        "\ud83d\udd27 Infra error (not counted as rejection): missing 'metrics' in runner response"
+      ]
+    }
+  },
+  "manifest_adopted": {
+    "runner_result": {
+      "metrics": {
+        "val_sharpe": 1.2,
+        "val_max_drawdown_pct": -10.0,
+        "val_total_return_pct": 15.0,
+        "holdout_sharpe": 0.8,
+        "holdout_total_return_pct": 10.0
+      },
+      "n_days": 252,
+      "manifest_name": "test_strat"
+    },
+    "verdict": "adopted",
+    "evaluation": {
+      "verdict": "adopted",
+      "sharpe_ratio": 1.2,
+      "total_return_pct": 15.0,
+      "max_drawdown_pct": -10.0,
+      "holdout_sharpe": 0.8,
+      "holdout_return_pct": 10.0,
+      "reasons": [
+        "\ud83c\udfc6 ALL GATES PASSED",
+        "\u2705 Val Sharpe 1.20 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 15.0% > 0%",
+        "\u2705 Val Drawdown -10.0% >= -25.0%",
+        "\ud83d\udcd0 Deflated threshold: 1.18 (base=0.5, N_family=0, T_val=252)",
+        "\u2705 Holdout Sharpe 0.80 >= 0.50 (threshold=min(0.5, 0.5*val))",
+        "\u2705 Holdout Return 10.0% > 0"
+      ],
+      "gate_results": {
+        "validation": true,
+        "deflation": true,
+        "holdout": true,
+        "cluster": "new"
+      },
+      "effective_min_sharpe": 1.1774
+    }
+  },
+  "manifest_val_fail": {
+    "runner_result": {
+      "metrics": {
+        "val_sharpe": 0.1,
+        "val_max_drawdown_pct": -30.0,
+        "val_total_return_pct": -5.0,
+        "holdout_sharpe": 0.1,
+        "holdout_total_return_pct": 2.0
+      },
+      "n_days": 252
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 0.1,
+      "total_return_pct": -5.0,
+      "max_drawdown_pct": -30.0,
+      "reasons": [
+        "\u274c Val Sharpe 0.10 < 1.18 (deflated, N=0, T=252)",
+        "\u274c Val Return -5.0% <= 0%",
+        "\u274c Val Drawdown -30.0% < -25.0%"
+      ],
+      "gate_results": {
+        "validation": false
+      },
+      "effective_min_sharpe": 1.1774
+    }
+  },
+  "manifest_holdout_fail": {
+    "runner_result": {
+      "metrics": {
+        "val_sharpe": 1.2,
+        "val_max_drawdown_pct": -10.0,
+        "val_total_return_pct": 15.0,
+        "holdout_sharpe": -0.1,
+        "holdout_total_return_pct": -5.0
+      },
+      "n_days": 252
+    },
+    "verdict": "rejected",
+    "evaluation": {
+      "verdict": "rejected",
+      "sharpe_ratio": 1.2,
+      "total_return_pct": 15.0,
+      "max_drawdown_pct": -10.0,
+      "holdout_sharpe": -0.1,
+      "holdout_return_pct": -5.0,
+      "reasons": [
+        "\u2705 Val Sharpe 1.20 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 15.0% > 0%",
+        "\u2705 Val Drawdown -10.0% >= -25.0%",
+        "\ud83d\udcd0 Deflated threshold: 1.18 (base=0.5, N_family=0, T_val=252)",
+        "\u274c Holdout Sharpe -0.10 < 0.50 (threshold=min(0.5, 0.5*val))",
+        "\u274c Holdout Return -5.0% <= 0"
+      ],
+      "gate_results": {
+        "validation": true,
+        "deflation": true,
+        "holdout": false
+      },
+      "effective_min_sharpe": 1.1774
+    }
+  },
+  "manifest_expert_extras": {
+    "runner_result": {
+      "metrics": {
+        "val_sharpe": 1.2,
+        "val_max_drawdown_pct": -10.0,
+        "val_total_return_pct": 15.0,
+        "holdout_sharpe": 0.8,
+        "holdout_total_return_pct": 10.0
+      },
+      "n_days": 252,
+      "expert_extras": {
+        "my_metric": 42
+      }
+    },
+    "verdict": "adopted",
+    "evaluation": {
+      "verdict": "adopted",
+      "sharpe_ratio": 1.2,
+      "total_return_pct": 15.0,
+      "max_drawdown_pct": -10.0,
+      "holdout_sharpe": 0.8,
+      "holdout_return_pct": 10.0,
+      "reasons": [
+        "\ud83c\udfc6 ALL GATES PASSED",
+        "\u2705 Val Sharpe 1.20 >= 1.18 (deflated, N=0, T=252)",
+        "\u2705 Val Return 15.0% > 0%",
+        "\u2705 Val Drawdown -10.0% >= -25.0%",
+        "\ud83d\udcd0 Deflated threshold: 1.18 (base=0.5, N_family=0, T_val=252)",
+        "\u2705 Holdout Sharpe 0.80 >= 0.50 (threshold=min(0.5, 0.5*val))",
+        "\u2705 Holdout Return 10.0% > 0"
+      ],
+      "gate_results": {
+        "validation": true,
+        "deflation": true,
+        "holdout": true,
+        "cluster": "new"
+      },
+      "effective_min_sharpe": 1.1774,
+      "expert_extras": {
+        "my_metric": 42
+      }
+    }
+  }
+}
