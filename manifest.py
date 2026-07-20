@@ -32,6 +32,9 @@ VALID_COMPUTE_MODES = frozenset({"inference", "training"})
 VALID_EVALUATOR_TYPES = frozenset({"portfolio", "single_asset", "custom"})
 VALID_EXECUTION_MODES = frozenset({"structured", "expert"})
 VALID_NEWS_SOURCES = frozenset({"arxiv_investment", "general_arxiv"})
+VALID_INSIDER_ROLES = frozenset({
+    "CEO", "CFO", "COO", "President", "Director", "10%_owner", "Other",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +181,53 @@ class NewsSentimentSource(DataSource):
         }
         if self.end is not None:
             result["end"] = self.end
+        return result
+
+
+@DataSource.register("insider_trades")
+class InsiderSource(DataSource):
+    """Insider trades data source (SEC Form 4) — Phase 2 PR-J.
+
+    Reads from a pre-fetched insider trading corpus
+    (no network at runtime).
+    """
+
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        start: str = "",
+        end: Optional[str] = None,
+        min_transaction_usd: float = 10000.0,
+        roles: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(source_type="insider_trades")
+        self.universe: List[str] = universe if universe is not None else []
+        self.start = start
+        self.end = end
+        self.min_transaction_usd = min_transaction_usd
+        self.roles: List[str] = roles if roles is not None else []
+
+    @classmethod
+    def _from_dict(cls, d: Dict[str, Any]) -> "InsiderSource":
+        return cls(
+            universe=d.get("universe", []),
+            start=d.get("start", ""),
+            end=d.get("end"),
+            min_transaction_usd=float(d.get("min_transaction_usd", 10000.0)),
+            roles=d.get("roles"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "type": self.type,
+            "universe": self.universe,
+            "start": self.start,
+            "min_transaction_usd": self.min_transaction_usd,
+        }
+        if self.end is not None:
+            result["end"] = self.end
+        if self.roles:
+            result["roles"] = self.roles
         return result
 
 
@@ -363,6 +413,8 @@ class StrategyManifest:
                 violations.extend(_validate_ohlcv_source(ds, i))
             elif isinstance(ds, NewsSentimentSource):
                 violations.extend(_validate_news_sentiment_source(ds, i))
+            elif isinstance(ds, InsiderSource):
+                violations.extend(_validate_insider_source(ds, i))
 
         # 4. model_artifacts
         for i, ma in enumerate(self.model_artifacts):
@@ -538,5 +590,81 @@ def _validate_news_sentiment_source(source: "NewsSentimentSource", index: int) -
                 f"data_sources[{index}].min_relevance must be in [0.0, 1.0], "
                 f"got {mr}"
             )
+
+    return violations
+
+
+def _validate_insider_source(source: "InsiderSource", index: int) -> List[str]:
+    """Validate InsiderSource fields."""
+    violations: List[str] = []
+
+    # universe: required non-empty list with valid symbols
+    if not isinstance(source.universe, list) or len(source.universe) == 0:
+        violations.append(
+            f"data_sources[{index}].universe must be a non-empty list"
+        )
+    else:
+        for j, symbol in enumerate(source.universe):
+            if not isinstance(symbol, str):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] must be a string"
+                )
+            elif not SYMBOL_REGEX.match(symbol):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] '{symbol}' "
+                    f"does not match symbol regex"
+                )
+
+    # start: required, YYYY-MM-DD
+    if not source.start or not isinstance(source.start, str):
+        violations.append(
+            f"data_sources[{index}].start must be a non-empty string"
+        )
+    elif not DATE_REGEX.match(source.start):
+        violations.append(
+            f"data_sources[{index}].start '{source.start}' "
+            f"must be YYYY-MM-DD format"
+        )
+
+    # end: optional, YYYY-MM-DD
+    if source.end is not None:
+        if not isinstance(source.end, str):
+            violations.append(
+                f"data_sources[{index}].end must be a string or null"
+            )
+        elif not DATE_REGEX.match(source.end):
+            violations.append(
+                f"data_sources[{index}].end '{source.end}' "
+                f"must be YYYY-MM-DD format"
+            )
+
+    # min_transaction_usd: float >= 0
+    if not isinstance(source.min_transaction_usd, (int, float)):
+        violations.append(
+            f"data_sources[{index}].min_transaction_usd must be a number, "
+            f"got {type(source.min_transaction_usd).__name__}"
+        )
+    elif source.min_transaction_usd < 0:
+        violations.append(
+            f"data_sources[{index}].min_transaction_usd must be >= 0, "
+            f"got {source.min_transaction_usd}"
+        )
+
+    # roles: optional list, each role must be valid
+    if not isinstance(source.roles, list):
+        violations.append(
+            f"data_sources[{index}].roles must be a list"
+        )
+    else:
+        for j, role in enumerate(source.roles):
+            if not isinstance(role, str):
+                violations.append(
+                    f"data_sources[{index}].roles[{j}] must be a string"
+                )
+            elif role not in VALID_INSIDER_ROLES:
+                violations.append(
+                    f"data_sources[{index}].roles[{j}] '{role}' is not valid. "
+                    f"Allowed: {sorted(VALID_INSIDER_ROLES)}"
+                )
 
     return violations

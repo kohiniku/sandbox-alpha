@@ -630,3 +630,128 @@ class TestNewsSentimentSource:
         ds = DataSource.from_dict(d)
         assert isinstance(ds, NewsSentimentSource)
         assert ds.source == "arxiv_investment"
+
+
+# ---------------------------------------------------------------------------
+# InsiderSource validation (Phase 2 PR-J)
+# ---------------------------------------------------------------------------
+
+class TestInsiderSource:
+    def test_valid_insider_trades(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL", "MSFT"],
+             "start": "2023-01-01", "min_transaction_usd": 50000,
+             "roles": ["CEO", "CFO"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_minimal(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"], "start": "2023-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_empty_universe_invalid(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": [], "start": "2023-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("universe" in v for v in violations)
+
+    def test_invalid_symbol_in_universe(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["bad symbol!"],
+             "start": "2023-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("symbol regex" in v for v in violations)
+
+    def test_bad_start_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"],
+             "start": "2023/01/01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("start" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_bad_end_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"],
+             "start": "2023-01-01", "end": "not-a-date"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("end" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_negative_min_transaction_usd(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"],
+             "start": "2023-01-01", "min_transaction_usd": -100}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("min_transaction_usd" in v for v in violations)
+
+    def test_invalid_role(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"],
+             "start": "2023-01-01", "roles": ["CEO", "Janitor"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("Janitor" in v for v in violations)
+
+    def test_default_min_transaction_usd(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"], "start": "2023-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        ds = m.data_sources[0]
+        assert ds.min_transaction_usd == 10000.0
+
+    def test_default_empty_roles(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL"], "start": "2023-01-01"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        ds = m.data_sources[0]
+        assert ds.roles == []
+
+    def test_roundtrip_insider_source(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "insider_trades", "universe": ["AAPL", "MSFT"],
+             "start": "2023-01-01", "end": "2024-12-31",
+             "min_transaction_usd": 50000, "roles": ["CEO", "CFO"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        out = m.to_dict()
+        ds_out = out["data_sources"][0]
+        assert ds_out["type"] == "insider_trades"
+        assert ds_out["min_transaction_usd"] == 50000
+        assert ds_out["roles"] == ["CEO", "CFO"]
+        assert "end" in ds_out
+
+    def test_registry_dispatch(self):
+        d = {"type": "insider_trades", "universe": ["AAPL"], "start": "2023-01-01",
+             "min_transaction_usd": 50000, "roles": ["CEO"]}
+        from manifest import InsiderSource
+        ds = DataSource.from_dict(d)
+        assert isinstance(ds, InsiderSource)
+        assert ds.min_transaction_usd == 50000
+        assert ds.roles == ["CEO"]

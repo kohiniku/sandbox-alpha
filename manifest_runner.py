@@ -32,9 +32,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from manifest import OhlcvSource, NewsSentimentSource, StrategyManifest, ManifestValidationError
+from manifest import OhlcvSource, NewsSentimentSource, InsiderSource, StrategyManifest, ManifestValidationError
 from data_adapters.ohlcv import MissingDataError, align_universe, load_ohlcv
 from data_adapters.news_sentiment import load_news_sentiment
+from data_adapters.insider import load_insider_trades
 from evaluators.dispatch import evaluate
 
 
@@ -192,6 +193,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
     # --- Step 1: Load data ---
     all_data: Dict[str, pd.DataFrame] = {}
     news_df: Optional[pd.DataFrame] = None
+    insider_df: Optional[pd.DataFrame] = None
 
     for ds in manifest.data_sources:
         if isinstance(ds, OhlcvSource):
@@ -217,10 +219,25 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
                 )
             except Exception as e:
                 return _error_json("infra", f"News sentiment loading failed: {e}")
+        elif isinstance(ds, InsiderSource):
+            try:
+                insider_df = load_insider_trades(
+                    universe=ds.universe,
+                    start=ds.start,
+                    end=ds.end,
+                    min_transaction_usd=ds.min_transaction_usd,
+                    roles=ds.roles if ds.roles else None,
+                    data_dir=data_dir,
+                )
+            except Exception as e:
+                return _error_json("infra", f"Insider trades loading failed: {e}")
 
     # Store news under special key if loaded
     if news_df is not None and not news_df.empty:
         all_data["_news_sentiment"] = news_df
+
+    if insider_df is not None and not insider_df.empty:
+        all_data["_insider_trades"] = insider_df
 
     if not all_data:
         return _error_json("infra", "No OHLCV data sources declared in manifest")
@@ -351,6 +368,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
             benchmark_series=benchmark_series,
             benchmark_warning=benchmark_warning,
             news_df=news_df,
+            insider_df=insider_df,
         )
 
 
@@ -365,6 +383,7 @@ def _run_structured_mode(
     benchmark_series: Optional[pd.Series],
     benchmark_warning: Optional[str],
     news_df: Optional[pd.DataFrame] = None,
+    insider_df: Optional[pd.DataFrame] = None,
 ) -> str:
     """Execute structured mode: generate_signals/generate_weights entrypoints."""
     
@@ -372,6 +391,8 @@ def _run_structured_mode(
     extras: Dict[str, Any] = {}
     if news_df is not None and not news_df.empty:
         extras["news_sentiment"] = news_df
+    if insider_df is not None and not insider_df.empty:
+        extras["insider_trades"] = insider_df
 
     # Execute user code
     has_signals = callable(sandbox.get("generate_signals"))

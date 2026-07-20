@@ -759,3 +759,182 @@ class TestNewsSentimentIntegration:
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Insider trades integration tests (Phase 2 PR-J)
+# ---------------------------------------------------------------------------
+
+
+def _write_insider_corpus(data_dir):
+    """Helper: write a minimal insider trades corpus for testing."""
+    import json
+    corpus_dir = os.path.join(data_dir, "insider_corpus")
+    os.makedirs(corpus_dir, exist_ok=True)
+    trades = [
+        {
+            "transaction_date": "2023-06-01",
+            "ticker": "AAPL",
+            "insider_name": "Tim Cook",
+            "role": "CEO",
+            "transaction_type": "Sale",
+            "shares": 10000,
+            "price": 150.0,
+            "value_usd": 1500000.0,
+        },
+        {
+            "transaction_date": "2023-07-15",
+            "ticker": "GOOG",
+            "insider_name": "Sundar Pichai",
+            "role": "CEO",
+            "transaction_type": "Sale",
+            "shares": 5000,
+            "price": 140.0,
+            "value_usd": 700000.0,
+        },
+    ]
+    out_path = os.path.join(corpus_dir, "2023-Q2.jsonl")
+    with open(out_path, "w") as fh:
+        for trade in trades:
+            fh.write(json.dumps(trade) + "\n")
+
+
+class TestInsiderTradesIntegration:
+    def test_expert_mode_receives_insider_trades(self, tmp_path):
+        """Expert mode run() receives _insider_trades in data dict."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_insider_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_insider_trades" in data, "Missing insider trades data!"
+                insider = data["_insider_trades"]
+                insider_count = len(insider)
+
+                first_sym = list(data.keys())[0]
+                returns = data[first_sym]["Close"].pct_change().dropna()
+                val_returns = returns[(returns.index > train_end) & (returns.index <= val_end)]
+                holdout_returns = returns[returns.index > val_end]
+
+                mu_val = val_returns.mean()
+                sigma_val = val_returns.std(ddof=1) if len(val_returns) > 1 else 0.01
+                val_sharpe = float(mu_val / sigma_val * np.sqrt(252)) if sigma_val > 0 else 0.0
+
+                mu_ho = holdout_returns.mean()
+                sigma_ho = holdout_returns.std(ddof=1) if len(holdout_returns) > 1 else 0.01
+                holdout_sharpe = float(mu_ho / sigma_ho * np.sqrt(252)) if sigma_ho > 0 else 0.0
+
+                return {
+                    "val_sharpe": val_sharpe,
+                    "val_max_drawdown_pct": 5.0,
+                    "val_total_return_pct": 10.0,
+                    "holdout_sharpe": holdout_sharpe,
+                    "holdout_max_drawdown_pct": 3.0,
+                    "holdout_total_return_pct": 8.0,
+                    "insider_count": insider_count,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "insider_expert_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "insider_trades", "universe": ["AAPL", "GOOG"], "start": "2023-01-01",
+                 "min_transaction_usd": 0, "roles": ["CEO"]},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe", "max_drawdown_pct"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"
+        assert "expert_extras" in result
+        assert result["expert_extras"]["insider_count"] > 0
+
+    def test_structured_generate_signals_with_insider_extras(self, tmp_path):
+        """generate_signals(data, extras) receives insider_trades."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_insider_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data, extras):
+                insider = extras.get("insider_trades", pd.DataFrame())
+                insider_count = len(insider)
+
+                signals = {}
+                for sym, df in data.items():
+                    if sym.startswith("_"):
+                        continue
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals)
+        """)
+
+        manifest_dict = {
+            "name": "insider_structured_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "insider_trades", "universe": ["AAPL", "GOOG"], "start": "2023-01-01",
+                 "min_transaction_usd": 0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "structured",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "structured"
+
+    def test_insider_corpus_missing_graceful(self, tmp_path):
+        """Missing insider corpus is handled gracefully."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_insider_trades" not in data
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "insider_missing_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "insider_trades", "universe": ["AAPL"], "start": "2023-01-01",
+                 "min_transaction_usd": 0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
