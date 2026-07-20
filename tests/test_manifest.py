@@ -273,10 +273,10 @@ class TestDiscriminatedUnion:
 
     def test_register_new_subclass(self):
         """Adding a new subclass through the registry works."""
-        @DataSource.register("news_sentiment")
-        class NewsSentimentSource(DataSource):
+        @DataSource.register("test_news_type")
+        class TestNewsSource(DataSource):
             def __init__(self, corpus_url="", start=""):
-                super().__init__(source_type="news_sentiment")
+                super().__init__(source_type="test_news_type")
                 self.corpus_url = corpus_url
                 self.start = start
 
@@ -289,16 +289,16 @@ class TestDiscriminatedUnion:
 
         d = _minimal_dict()
         d["data_sources"] = [
-            {"type": "news_sentiment", "corpus_url": "https://example.com/corpus", "start": "2020-01-01"}
+            {"type": "test_news_type", "corpus_url": "https://example.com/corpus", "start": "2020-01-01"}
         ]
         m = StrategyManifest.from_dict(d)
         assert len(m.data_sources) == 1
-        assert isinstance(m.data_sources[0], NewsSentimentSource)
+        assert isinstance(m.data_sources[0], TestNewsSource)
         out = m.to_dict()
-        assert out["data_sources"][0]["type"] == "news_sentiment"
+        assert out["data_sources"][0]["type"] == "test_news_type"
 
         # Cleanup registry
-        del DataSource._registry["news_sentiment"]
+        del DataSource._registry["test_news_type"]
 
 
 # ---------------------------------------------------------------------------
@@ -509,3 +509,124 @@ class TestDataSourceFromDictErrors:
     def test_missing_type_key(self):
         with pytest.raises(ManifestValidationError, match="missing 'type'"):
             DataSource.from_dict({"universe": ["AAPL"]})
+
+
+# ---------------------------------------------------------------------------
+# NewsSentimentSource validation (Phase 2 PR-H)
+# ---------------------------------------------------------------------------
+
+class TestNewsSentimentSource:
+    def test_valid_news_sentiment(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "arxiv_investment", "min_relevance": 0.5}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_empty_universe(self):
+        """Empty universe = market-wide is valid."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": [], "start": "2023-01-01",
+             "source": "arxiv_investment"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_invalid_source_type(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "invalid_source"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("source" in v and "invalid_source" in v for v in violations)
+
+    def test_invalid_symbol_in_universe(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["bad symbol!"], "start": "2023-01-01",
+             "source": "arxiv_investment"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("symbol regex" in v for v in violations)
+
+    def test_bad_start_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023/01/01",
+             "source": "arxiv_investment"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("start" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_bad_end_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "end": "not-a-date", "source": "arxiv_investment"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("end" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_min_relevance_out_of_range(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "arxiv_investment", "min_relevance": 1.5}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("min_relevance" in v and "1.5" in v for v in violations)
+
+    def test_min_relevance_negative(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "arxiv_investment", "min_relevance": -0.1}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("min_relevance" in v for v in violations)
+
+    def test_default_min_relevance(self):
+        """Default min_relevance is 0.3."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "arxiv_investment"}
+        ]
+        m = StrategyManifest.from_dict(d)
+        ds = m.data_sources[0]
+        assert ds.min_relevance == 0.3
+
+    def test_roundtrip_news_sentiment_source(self):
+        """Round-trip includes all fields."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "news_sentiment", "universe": ["AAPL", "MSFT"],
+             "start": "2023-01-01", "end": "2024-12-31",
+             "source": "general_arxiv", "min_relevance": 0.7}
+        ]
+        m = StrategyManifest.from_dict(d)
+        out = m.to_dict()
+        ds_out = out["data_sources"][0]
+        assert ds_out["type"] == "news_sentiment"
+        assert ds_out["source"] == "general_arxiv"
+        assert ds_out["min_relevance"] == 0.7
+        assert "end" in ds_out
+
+    def test_registry_dispatch(self):
+        """NewsSentimentSource is correctly dispatched by DataSource.from_dict."""
+        d = {"type": "news_sentiment", "universe": ["AAPL"], "start": "2023-01-01",
+             "source": "arxiv_investment"}
+        from manifest import NewsSentimentSource
+        ds = DataSource.from_dict(d)
+        assert isinstance(ds, NewsSentimentSource)
+        assert ds.source == "arxiv_investment"

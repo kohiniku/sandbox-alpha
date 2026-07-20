@@ -31,6 +31,7 @@ VALID_METRICS = frozenset({
 VALID_COMPUTE_MODES = frozenset({"inference", "training"})
 VALID_EVALUATOR_TYPES = frozenset({"portfolio", "single_asset", "custom"})
 VALID_EXECUTION_MODES = frozenset({"structured", "expert"})
+VALID_NEWS_SOURCES = frozenset({"arxiv_investment", "general_arxiv"})
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,51 @@ class OhlcvSource(DataSource):
             "type": self.type,
             "universe": self.universe,
             "start": self.start,
+        }
+        if self.end is not None:
+            result["end"] = self.end
+        return result
+
+
+@DataSource.register("news_sentiment")
+class NewsSentimentSource(DataSource):
+    """News/sentiment alternative data source (Phase 2 PR-H).
+
+    Reads from a pre-fetched arxiv paper corpus (no network at runtime).
+    """
+
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        start: str = "",
+        end: Optional[str] = None,
+        source: str = "arxiv_investment",
+        min_relevance: float = 0.3,
+    ) -> None:
+        super().__init__(source_type="news_sentiment")
+        self.universe: List[str] = universe if universe is not None else []
+        self.start = start
+        self.end = end
+        self.source = source
+        self.min_relevance = min_relevance
+
+    @classmethod
+    def _from_dict(cls, d: Dict[str, Any]) -> "NewsSentimentSource":
+        return cls(
+            universe=d.get("universe", []),
+            start=d.get("start", ""),
+            end=d.get("end"),
+            source=d.get("source", "arxiv_investment"),
+            min_relevance=float(d.get("min_relevance", 0.3)),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "type": self.type,
+            "universe": self.universe,
+            "start": self.start,
+            "source": self.source,
+            "min_relevance": self.min_relevance,
         }
         if self.end is not None:
             result["end"] = self.end
@@ -315,6 +361,8 @@ class StrategyManifest:
         for i, ds in enumerate(self.data_sources):
             if isinstance(ds, OhlcvSource):
                 violations.extend(_validate_ohlcv_source(ds, i))
+            elif isinstance(ds, NewsSentimentSource):
+                violations.extend(_validate_news_sentiment_source(ds, i))
 
         # 4. model_artifacts
         for i, ma in enumerate(self.model_artifacts):
@@ -421,6 +469,74 @@ def _validate_ohlcv_source(source: OhlcvSource, index: int) -> List[str]:
             violations.append(
                 f"data_sources[{index}].end '{source.end}' "
                 f"must be YYYY-MM-DD format"
+            )
+
+    return violations
+
+
+def _validate_news_sentiment_source(source: "NewsSentimentSource", index: int) -> List[str]:
+    """Validate NewsSentimentSource fields."""
+    violations: List[str] = []
+
+    # universe: optional list, but each entry must match symbol regex
+    if not isinstance(source.universe, list):
+        violations.append(
+            f"data_sources[{index}].universe must be a list"
+        )
+    else:
+        for j, symbol in enumerate(source.universe):
+            if not isinstance(symbol, str):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] must be a string"
+                )
+            elif not SYMBOL_REGEX.match(symbol):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] '{symbol}' "
+                    f"does not match symbol regex"
+                )
+
+    # start: required, YYYY-MM-DD
+    if not source.start or not isinstance(source.start, str):
+        violations.append(
+            f"data_sources[{index}].start must be a non-empty string"
+        )
+    elif not DATE_REGEX.match(source.start):
+        violations.append(
+            f"data_sources[{index}].start '{source.start}' "
+            f"must be YYYY-MM-DD format"
+        )
+
+    # end: optional, YYYY-MM-DD
+    if source.end is not None:
+        if not isinstance(source.end, str):
+            violations.append(
+                f"data_sources[{index}].end must be a string or null"
+            )
+        elif not DATE_REGEX.match(source.end):
+            violations.append(
+                f"data_sources[{index}].end '{source.end}' "
+                f"must be YYYY-MM-DD format"
+            )
+
+    # source: must be in valid set
+    if source.source not in VALID_NEWS_SOURCES:
+        violations.append(
+            f"data_sources[{index}].source must be one of {sorted(VALID_NEWS_SOURCES)}, "
+            f"got '{source.source}'"
+        )
+
+    # min_relevance: float in [0.0, 1.0]
+    if not isinstance(source.min_relevance, (int, float)):
+        violations.append(
+            f"data_sources[{index}].min_relevance must be a float, "
+            f"got {type(source.min_relevance).__name__}"
+        )
+    else:
+        mr = float(source.min_relevance)
+        if mr < 0.0 or mr > 1.0:
+            violations.append(
+                f"data_sources[{index}].min_relevance must be in [0.0, 1.0], "
+                f"got {mr}"
             )
 
     return violations
