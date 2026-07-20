@@ -1659,7 +1659,7 @@ Reminders:
         return None
 
 
-def _syntax_preflight_with_fix(manifest_dict, max_attempts=2):
+def _syntax_preflight_with_fix(manifest_dict, max_attempts=3):
     """Run syntax preflight; on failure, ask the LLM to repair up to
     ``max_attempts`` times. On success, mutate manifest_dict['code_b64'] to
     the fixed source and return (True, "", fix_count). On final failure,
