@@ -363,13 +363,27 @@ _ALLOWED_METRICS_NOTE = (
 
 
 _EXPERT_MODE_CATALOG = """Expert mode unlocks:
-- RL/deep learning training loops (PyTorch allowed, GPU optional)
-- Foundation-model inference (Transformer, TimesFM, etc.)
-- Cross-sectional/pairs/rotation strategies with custom evaluators
-- Regime detection with dynamic switching
-- Custom evaluators (not limited to portfolio metrics; define your own scoring function)
-- Multi-asset portfolio construction with custom allocators
-- Training mode: write checkpoints, iterate, validate against holdout
+- Cross-sectional / pairs / rotation strategies with custom allocators
+- Regime detection with dynamic switching (Gaussian mixture, HMM via
+  sklearn.mixture, statistical breakpoint via scipy.stats)
+- Custom evaluators (not limited to portfolio metrics; define your own scoring)
+- Multi-asset portfolio construction (Markowitz mean-variance via
+  scipy.optimize, Black-Litterman, factor-based via statsmodels)
+- Statistical arbitrage / cointegration (statsmodels.tsa.coint,
+  scipy.stats.linregress, ridge via sklearn.linear_model)
+- Machine learning (sklearn.ensemble, RandomForest, GradientBoosting)
+
+INSTALLED IN SANDBOX: pandas, numpy, scipy, sklearn (scikit-learn),
+statsmodels, math, statistics, dataclasses, typing, collections,
+functools, itertools, json. NOTHING ELSE. Do NOT import torch,
+tensorflow, hmmlearn, jax, transformers — they are not installed
+and your code will crash with ModuleNotFoundError.
+
+CODE HYGIENE (SyntaxError kills the whole proposal at preflight):
+- Each import on its own line: `import numpy as np` NOT `import numpy as np, from x import y`
+- No `import X, from Y import Z` — this is INVALID Python
+- No unicode operators (%, ¥, etc.) inside numeric literals
+- Test your code mentally by running compile() in your head
 """
 
 
