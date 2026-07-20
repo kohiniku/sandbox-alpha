@@ -1674,6 +1674,115 @@ Reminders:
         return None
 
 
+def _runtime_preflight_manifest(manifest_dict):
+    """Ask the runner to execute the manifest against synthetic data.
+
+    Returns (valid: bool, error_msg: str, traceback_str: str). None-valid if
+    runner is unreachable (skip preflight in that case, do not drop).
+    """
+    runner_url = os.environ.get("SANDBOX_RUNNER_URL", "").rstrip("/")
+    if not runner_url:
+        return None, "skipped (runner unreachable)", ""
+    payload = json.dumps(manifest_dict).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"{runner_url}/validate_manifest",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return None, f"skipped ({e})", ""
+    if body.get("valid"):
+        return True, "", ""
+    return False, body.get("error", "unknown"), body.get("traceback", "")
+
+
+def _runtime_fix_attempt(code_str, error_msg, traceback_str, spec_context):
+    """Ask the LLM to fix a runtime error from synthetic preflight."""
+    fix_prompt = f"""Your strategy code for "{spec_context}" failed a synthetic-data preflight test.
+
+ERROR: {error_msg}
+
+TRACEBACK (last lines):
+{traceback_str}
+
+ORIGINAL CODE:
+```
+{code_str}
+```
+
+Common pandas/numpy pitfalls to check:
+- pd.Series has no .reshape — use .values.reshape or np.asarray(s).reshape
+- Use .iloc[i] for positional indexing, .loc[label] for label
+- DataFrame column access: df["Close"] (not df.close); columns are capitalized
+- np arrays: reshape(-1, 1) for sklearn features
+- Rolling window on shorter series returns NaN — use .dropna() before .values
+- Data dict access: data["SPY"]["Close"], not data.SPY.Close
+
+Return ONLY the corrected Python source (no markdown fences, no commentary).
+Keep the same overall structure and entrypoint signature. Fix the runtime
+error only.
+"""
+    messages = [
+        {"role": "system", "content": "You output ONLY corrected Python code. No markdown fences."},
+        {"role": "user", "content": fix_prompt},
+    ]
+    try:
+        response = _call_llm(messages, max_tokens=4096, response_json=False)
+        code = str(response).strip()
+        if code.startswith("```"):
+            code = code.split("\n", 1)[-1]
+            if code.endswith("```"):
+                code = code[:-3].strip()
+        if not code:
+            return None
+        if "def generate_signals" not in code and "def run" not in code and "def generate_weights" not in code:
+            return None
+        return code
+    except Exception as e:
+        print(f"  ⚠️  Runtime fix LLM call failed: {e}")
+        return None
+
+
+def _runtime_preflight_with_fix(manifest_dict, max_attempts=2):
+    """Run synthetic preflight; on runtime failure, ask LLM to repair up
+    to ``max_attempts`` times. Mutates manifest_dict['code_b64'] on success.
+
+    Returns (valid: bool, error_msg: str, fix_count: int).
+    """
+    name = manifest_dict.get("name", "?")
+    valid, err, tb = _runtime_preflight_manifest(manifest_dict)
+    if valid is None:
+        # Runner unreachable — skip, don't drop
+        print(f"  ⏭️  Manifest '{name}': runtime preflight {err}")
+        return True, "", 0
+    if valid:
+        return True, "", 0
+
+    try:
+        source = base64.b64decode(manifest_dict.get("code_b64", "")).decode("utf-8", errors="replace")
+    except Exception as e:
+        return False, f"code_b64 decode failed after runtime error: {e}", 0
+
+    for attempt in range(max_attempts):
+        print(f"  🔄 Manifest '{name}': runtime fix attempt {attempt + 1}/{max_attempts} — {err[:80]}")
+        fixed = _runtime_fix_attempt(source, err, tb, name)
+        if not fixed:
+            continue
+        # Re-encode and re-preflight
+        manifest_dict["code_b64"] = base64.b64encode(fixed.encode("utf-8")).decode("ascii")
+        valid, err, tb = _runtime_preflight_manifest(manifest_dict)
+        if valid is None:
+            return True, "", attempt + 1  # runner gone, don't drop
+        if valid:
+            return True, "", attempt + 1
+        source = fixed
+    return False, err, max_attempts
+
+
 def _syntax_preflight_with_fix(manifest_dict, max_attempts=3):
     """Run syntax preflight; on failure, ask the LLM to repair up to
     ``max_attempts`` times. On success, mutate manifest_dict['code_b64'] to
@@ -1798,30 +1907,38 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         execution_mode = manifest.execution_mode
         manifest_name = manifest.name
 
-        # ── Syntax preflight (both modes, cheap) with fix-retry ──
-        syn_valid, syn_err, _fix_n = _syntax_preflight_with_fix(manifest_dict)
-        if _fix_n and syn_valid:
-            print(f"  🔧 Manifest {i+1} '{manifest_name}': syntax fixed after {_fix_n} attempt(s)")
+        # ── Stage A: syntax preflight (both modes, cheap) with fix-retry ──
+        syn_valid, syn_err, _syn_fix_n = _syntax_preflight_with_fix(manifest_dict)
+        if _syn_fix_n and syn_valid:
+            print(f"  🔧 Manifest {i+1} '{manifest_name}': syntax fixed after {_syn_fix_n} attempt(s)")
         if not syn_valid:
             print(f"  🚫 Manifest {i+1} '{manifest_name}': syntax preflight FAILED — {syn_err}")
             continue
 
-        # ── Full preflight for structured mode (skip expert) ──
+        # ── Stage B: runtime preflight (synthetic execution) with fix-retry ──
+        # Both modes benefit — catches pandas/numpy misuse, missing keys,
+        # wrong signatures BEFORE backlog investment. Runner-unreachable
+        # falls back to skip (does not drop the manifest).
+        rt_valid, rt_err, _rt_fix_n = _runtime_preflight_with_fix(manifest_dict)
+        if _rt_fix_n and rt_valid:
+            print(f"  🔧 Manifest {i+1} '{manifest_name}': runtime fixed after {_rt_fix_n} attempt(s)")
+        if not rt_valid:
+            print(f"  🚫 Manifest {i+1} '{manifest_name}': runtime preflight FAILED — {rt_err[:120]}")
+            continue
+
+        # ── Legacy structured full-preflight kept as belt-and-suspenders ──
         if execution_mode == "structured":
             valid, error = _preflight_manifest(manifest_dict)
             if valid is None:
                 pf_skipped += 1
-                print(f"  ⏭️  Manifest {i+1} '{manifest_name}': preflight skipped (runner unavailable)")
             elif valid:
                 pf_passed += 1
-                print(f"  ✅ Manifest {i+1} '{manifest_name}': preflight passed")
+                print(f"  ✅ Manifest {i+1} '{manifest_name}': structured preflight passed")
             else:
-                print(f"  🚫 Manifest {i+1} '{manifest_name}': preflight FAILED — {error}")
-                # Dropped on preflight failure
+                print(f"  🚫 Manifest {i+1} '{manifest_name}': structured preflight FAILED — {error}")
                 continue
         else:
-            # Expert mode: syntax check above + validation-only via manifest.validate()
-            print(f"  🔬 Manifest {i+1} '{manifest_name}' (expert): syntax-checked, skipping full preflight")
+            print(f"  ✅ Manifest {i+1} '{manifest_name}' (expert): syntax+runtime preflight passed")
 
         # Build backlog entry
         # Determine source from the LLM response or fall back

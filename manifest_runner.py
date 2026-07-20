@@ -644,10 +644,129 @@ def _run_expert_mode(
 # CLI entry
 # ---------------------------------------------------------------------------
 
+def _synthetic_ohlcv(symbols, n_days=250, seed=42):
+    """Deterministic multi-symbol OHLCV for preflight execution.
+
+    Same shape/columns as load_ohlcv output so the manifest code sees a
+    realistic input without touching the runner cache.
+    """
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end=pd.Timestamp("2026-07-01"), periods=n_days)
+    data = {}
+    for i, sym in enumerate(symbols):
+        rets = rng.normal(0.0005, 0.015, size=n_days)
+        close = 100 * (1 + rets).cumprod()
+        # give each symbol its own drift so cross-sectional strategies see variance
+        close = close * (1 + i * 0.02)
+        df = pd.DataFrame({
+            "Open": close * (1 + rng.normal(0, 0.002, size=n_days)),
+            "High": close * (1 + np.abs(rng.normal(0, 0.005, size=n_days))),
+            "Low":  close * (1 - np.abs(rng.normal(0, 0.005, size=n_days))),
+            "Close": close,
+            "Volume": rng.integers(1_000_000, 10_000_000, size=n_days),
+        }, index=idx)
+        df.index.name = "Date"
+        data[sym] = df
+    return data
+
+
+def _validate_manifest_synthetic(manifest):
+    """Run the manifest against synthetic data to catch runtime bugs.
+
+    Returns a JSON string with {valid: bool, error, error_type, traceback}.
+    Never raises. Used by the runner's /validate_manifest endpoint via
+    manifest_runner --synthetic-run.
+    """
+    # Extract universe from the first ohlcv source, defaulting to a small set
+    universe = None
+    for ds in manifest.data_sources:
+        if getattr(ds, "type", None) == "ohlcv":
+            universe = list(getattr(ds, "universe", []) or [])
+            break
+    if not universe:
+        universe = ["SPY", "QQQ", "AAPL"]
+    universe = universe[:5]  # cap for preflight speed
+    data = _synthetic_ohlcv(universe)
+
+    # Decode user code
+    try:
+        code_str = base64.b64decode(manifest.code_b64).decode("utf-8")
+    except Exception as e:
+        return json.dumps({"valid": False, "error_type": "code",
+                           "error": f"code_b64 decode failed: {e}"})
+
+    allowlist = _STRUCTURED_MODULES if manifest.execution_mode == "structured" else _EXPERT_MODULES
+    sandbox = {
+        "pd": pd, "np": np, "pandas": pd, "numpy": np, "data": data,
+        "__builtins__": {
+            "len": len, "range": range, "enumerate": enumerate, "zip": zip,
+            "map": map, "filter": filter, "sum": sum, "min": min, "max": max,
+            "abs": abs, "int": int, "float": float, "str": str, "list": list,
+            "dict": dict, "set": set, "tuple": tuple, "bool": bool, "type": type,
+            "print": print, "isinstance": isinstance, "hasattr": hasattr,
+            "getattr": getattr, "sorted": sorted, "reversed": reversed,
+            "round": round, "any": any, "all": all,
+            "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
+            "IndexError": IndexError, "AttributeError": AttributeError,
+            "Exception": Exception, "True": True, "False": False, "None": None,
+            "__import__": lambda name, *a, **k: _safe_import(name, allowlist, *a, **k),
+        },
+    }
+
+    # Compile+exec (SyntaxError caught here even though caller usually pre-checks)
+    try:
+        exec(code_str, sandbox)
+    except Exception as e:
+        return json.dumps({"valid": False, "error_type": "code",
+                           "error": f"exec raised {type(e).__name__}: {e}",
+                           "traceback": traceback.format_exc()[-1500:]})
+
+    # Call the appropriate entrypoint on synthetic data
+    idx = next(iter(data.values())).index
+    train_end = idx[int(len(idx) * 0.6)]
+    val_end = idx[int(len(idx) * 0.8)]
+
+    try:
+        if manifest.execution_mode == "expert":
+            fn = sandbox.get("run")
+            if not callable(fn):
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": "expert mode requires def run(data, train_end, val_end, benchmark, config)"})
+            bench = data[universe[0]]["Close"].pct_change()
+            result = fn(data, train_end, val_end, bench, manifest.evaluator.extras or {})
+            if not isinstance(result, dict):
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": f"run() returned {type(result).__name__}, expected dict"})
+            required = {"val_sharpe", "val_max_drawdown_pct", "val_total_return_pct",
+                        "holdout_sharpe", "holdout_max_drawdown_pct", "holdout_total_return_pct"}
+            missing = sorted(required - set(result))
+            if missing:
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": f"run() dict missing required keys: {missing}"})
+        else:
+            fn = sandbox.get("generate_weights") or sandbox.get("generate_signals")
+            if not callable(fn):
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": "structured mode requires def generate_signals(data) or def generate_weights(data)"})
+            _out = fn(data)
+            # Basic shape check
+            if _out is None:
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": "generate_signals/weights returned None"})
+    except Exception as e:
+        return json.dumps({"valid": False, "error_type": "code",
+                           "error": f"entrypoint raised {type(e).__name__}: {e}",
+                           "traceback": traceback.format_exc()[-1500:]})
+
+    return json.dumps({"valid": True})
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest-b64", required=True)
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir")
+    parser.add_argument("--synthetic-run", action="store_true",
+                        help="Preflight mode: run against synthetic data, no data-dir needed.")
     args = parser.parse_args()
 
     # Decode manifest
@@ -680,6 +799,14 @@ def main():
         }))
         return 0
 
+    # Synthetic preflight branch
+    if args.synthetic_run:
+        print(_validate_manifest_synthetic(manifest))
+        return 0
+
+    if not args.data_dir:
+        print(_error_json("infra", "--data-dir required in normal mode"))
+        return 0
     # Run
     output = run_manifest(manifest, args.data_dir)
     print(output)
