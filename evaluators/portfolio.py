@@ -123,8 +123,8 @@ def cvar_95(
     return float(-worst.mean())
 
 
-@Evaluator.register("max_drawdown")
-def max_drawdown(
+@Evaluator.register("max_drawdown_pct")
+def max_drawdown_pct(
     returns: pd.DataFrame,
     weights: Optional[pd.DataFrame],
     benchmark: Optional[pd.Series],
@@ -133,15 +133,15 @@ def max_drawdown(
     """Worst peak-to-trough of cumulative return series (percent, e.g. -18.5)."""
     pr = _portfolio_returns(returns, weights)
     if len(pr) < _MIN_ROWS:
-        raise ValueError(f"max_drawdown requires >= {_MIN_ROWS} rows, got {len(pr)}")
+        raise ValueError(f"max_drawdown_pct requires >= {_MIN_ROWS} rows, got {len(pr)}")
     cum = (1.0 + pr).cumprod()
     peak = cum.cummax()
     drawdown = (cum - peak) / peak
     return float(drawdown.min() * 100.0)
 
 
-@Evaluator.register("total_return")
-def total_return(
+@Evaluator.register("total_return_pct")
+def total_return_pct(
     returns: pd.DataFrame,
     weights: Optional[pd.DataFrame],
     benchmark: Optional[pd.Series],
@@ -150,7 +150,7 @@ def total_return(
     """Cumulative product of (1+r) - 1, in percent."""
     pr = _portfolio_returns(returns, weights)
     if len(pr) < _MIN_ROWS:
-        raise ValueError(f"total_return requires >= {_MIN_ROWS} rows, got {len(pr)}")
+        raise ValueError(f"total_return_pct requires >= {_MIN_ROWS} rows, got {len(pr)}")
     cum = (1.0 + pr).prod() - 1.0
     return float(cum * 100.0)
 

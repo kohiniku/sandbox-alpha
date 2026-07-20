@@ -148,7 +148,7 @@ class TestMaxDrawdown:
     def test_negative_value(self):
         """Max drawdown should be negative (or zero for monotone-up)."""
         ret = _random_returns(seed=5)
-        fn = Evaluator.get("max_drawdown")
+        fn = Evaluator.get("max_drawdown_pct")
         result = fn(ret, None, None, {})
         assert result <= 0.0
 
@@ -158,7 +158,7 @@ class TestMaxDrawdown:
         vals = [0.01] * 10 + [-0.02] * 10 + [0.005] * 10
         idx = pd.date_range("2023-01-01", periods=30, freq="B")
         ret = pd.DataFrame({"A": vals}, index=idx)
-        fn = Evaluator.get("max_drawdown")
+        fn = Evaluator.get("max_drawdown_pct")
         result = fn(ret, None, None, {})
         # Compute manually
         cum = (1.0 + ret["A"]).cumprod()
@@ -171,7 +171,7 @@ class TestTotalReturn:
     def test_constant(self):
         """0.001 daily for 252 days -> (1.001^252 - 1) * 100."""
         ret = _constant_returns(0.001, days=252)
-        fn = Evaluator.get("total_return")
+        fn = Evaluator.get("total_return_pct")
         result = fn(ret, None, None, {})
         expected = ((1.001 ** 252) - 1.0) * 100.0
         assert abs(result - expected) < 1e-6
@@ -207,9 +207,9 @@ class TestDispatch:
     def test_multi_metric(self):
         """Spec with 3 metrics returns dict with those 3 keys."""
         ret = _random_returns(seed=7)
-        spec = FakeSpec(metrics=["sharpe", "cvar_95", "max_drawdown"])
+        spec = FakeSpec(metrics=["sharpe", "cvar_95", "max_drawdown_pct"])
         result = evaluate(spec, ret)
-        assert set(result.keys()) == {"sharpe", "cvar_95", "max_drawdown"}
+        assert set(result.keys()) == {"sharpe", "cvar_95", "max_drawdown_pct"}
 
     def test_factor_exposure_expansion(self):
         """factor_exposure should expand into multiple keys."""

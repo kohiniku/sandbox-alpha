@@ -351,13 +351,13 @@ class TestEvaluatorValidation:
 
     def test_valid_single_asset(self):
         d = _minimal_dict()
-        d["evaluator"] = {"type": "single_asset", "metrics": ["sharpe", "max_drawdown"]}
+        d["evaluator"] = {"type": "single_asset", "metrics": ["sharpe", "max_drawdown_pct"]}
         m = StrategyManifest.from_dict(d)
         assert m.validate() == []
 
     def test_valid_custom(self):
         d = _minimal_dict()
-        d["evaluator"] = {"type": "custom", "metrics": ["total_return"], "extras": {"objective": "recursive_utility"}}
+        d["evaluator"] = {"type": "custom", "metrics": ["total_return_pct"], "extras": {"objective": "recursive_utility"}}
         m = StrategyManifest.from_dict(d)
         assert m.validate() == []
 

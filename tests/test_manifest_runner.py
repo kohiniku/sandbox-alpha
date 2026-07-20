@@ -50,7 +50,7 @@ def _make_manifest(
     if universe is None:
         universe = ["AAPL", "MSFT", "GOOG"]
     if metrics is None:
-        metrics = ["sharpe", "max_drawdown"]
+        metrics = ["sharpe", "max_drawdown_pct"]
     code_b64 = base64.b64encode(code.encode()).decode()
     payload = {
         "name": name,
@@ -102,7 +102,7 @@ class TestHappyPathSignals:
                 return pd.DataFrame(signals)
         """)
 
-        manifest = _make_manifest(code=code, universe=symbols, metrics=["sharpe", "max_drawdown"])
+        manifest = _make_manifest(code=code, universe=symbols, metrics=["sharpe", "max_drawdown_pct"])
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "ok"
@@ -111,9 +111,9 @@ class TestHappyPathSignals:
         assert result["n_days"] > 0
         assert result["execution_mode"] == "structured"
         assert "val_sharpe" in result["metrics"]
-        assert "val_max_drawdown" in result["metrics"]
+        assert "val_max_drawdown_pct" in result["metrics"]
         assert "holdout_sharpe" in result["metrics"]
-        assert "holdout_max_drawdown" in result["metrics"]
+        assert "holdout_max_drawdown_pct" in result["metrics"]
         assert "val_max_drawdown_pct" in result["metrics"]
         assert "holdout_max_drawdown_pct" in result["metrics"]
         assert "val_total_return_pct" in result["metrics"]
@@ -248,7 +248,7 @@ class TestMissingBenchmark:
         manifest = _make_manifest(
             code=code,
             universe=symbols,
-            metrics=["sharpe", "ir", "max_drawdown"],
+            metrics=["sharpe", "ir", "max_drawdown_pct"],
             benchmark="SPY",  # not in universe
         )
         result = json.loads(run_manifest(manifest, str(tmp_path)))
@@ -257,7 +257,7 @@ class TestMissingBenchmark:
         assert "warning" in result
         assert "SPY" in result["warning"]
         assert "val_sharpe" in result["metrics"]
-        assert "val_max_drawdown" in result["metrics"]
+        assert "val_max_drawdown_pct" in result["metrics"]
         # IR should be NaN since benchmark is None
         assert np.isnan(result["metrics"].get("val_ir", result["metrics"].get("holdout_ir", float("nan"))))
 

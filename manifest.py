@@ -24,8 +24,8 @@ SYMBOL_REGEX = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
 DATE_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 VALID_METRICS = frozenset({
-    "sharpe", "ir", "turnover", "cvar_95", "max_drawdown",
-    "total_return", "factor_exposure",
+    "sharpe", "ir", "turnover", "cvar_95", "max_drawdown_pct",
+    "total_return_pct", "factor_exposure",
 })
 
 VALID_COMPUTE_MODES = frozenset({"inference", "training"})

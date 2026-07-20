@@ -1,0 +1,496 @@
+{
+  "entries": [
+    {
+      "id": "e2e-code-1",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.9,
+      "created_at": "2026-07-19T04:27:36.452952",
+      "source": {
+        "kind": "idea",
+        "ref": "e2e-integration-test"
+      },
+      "spec": {
+        "name": "vol_filtered_momentum",
+        "description": "\u4f4e\u30dc\u30e9\u74b0\u5883\u3067\u306e\u307f\u30e2\u30e1\u30f3\u30bf\u30e0\u306b\u4e57\u308b",
+        "symbol": "SPY",
+        "code": "import pandas as pd\n\ndef generate_signals(df):\n    ret5 = df[\"Close\"].pct_change(5)\n    vol20 = df[\"Close\"].pct_change().rolling(20).std()\n    sig = pd.Series(0, index=df.index)\n    sig[(ret5 > 0) & (vol20 < vol20.rolling(60).median())] = 1\n    sig[(ret5 < 0) & (vol20 > vol20.rolling(60).median())] = -1\n    return sig\n"
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_drawdown_pct >= -20"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.81)",
+        "finished_at": "2026-07-19T04:27:40.680583"
+      }
+    },
+    {
+      "id": "e2e-param-1",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.5,
+      "created_at": "2026-07-19T04:27:36.452961",
+      "source": {
+        "kind": "failure_response",
+        "ref": "rsi|QQQ"
+      },
+      "spec": {
+        "strategy": "rsi",
+        "symbol": "QQQ",
+        "params": {
+          "rsi_window": 21,
+          "oversold": 25,
+          "overbought": 75
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.32)",
+        "finished_at": "2026-07-19T04:27:43.198283"
+      }
+    },
+    {
+      "id": "bd8d5f86-40ba-4383-a61c-283c2489a77b",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.7,
+      "created_at": "2026-07-19T05:18:33.249726+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "rsi|GOOGL"
+      },
+      "spec": {
+        "strategy": "rsi",
+        "symbol": "GOOGL",
+        "params": {
+          "rsi_window": 10,
+          "oversold": 20,
+          "overbought": 80
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 1.08)",
+        "finished_at": "2026-07-19T05:23:42.308134"
+      }
+    },
+    {
+      "id": "9c670c19-a423-423b-944e-973377f4a23b",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.75,
+      "created_at": "2026-07-19T05:18:33.249992+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "momentum|AMZN"
+      },
+      "spec": {
+        "strategy": "momentum",
+        "symbol": "AMZN",
+        "params": {
+          "lookback": 25,
+          "hold_period": 10
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.10)",
+        "finished_at": "2026-07-19T05:23:39.803027"
+      }
+    },
+    {
+      "id": "ddf61aa5-3164-4a91-ad9d-7d69a83e2487",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.65,
+      "created_at": "2026-07-19T05:18:33.250540+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "sma_crossover|SPY"
+      },
+      "spec": {
+        "strategy": "sma_crossover",
+        "symbol": "SPY",
+        "params": {
+          "fast_window": 10,
+          "slow_window": 30
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.92)",
+        "finished_at": "2026-07-19T05:23:47.292992"
+      }
+    },
+    {
+      "id": "40fe9e51-ae9d-4738-95e0-ff480bf3cd60",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.6,
+      "created_at": "2026-07-19T05:18:33.250692+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "adaptive SMA with volatility-adjusted windows"
+      },
+      "spec": {
+        "name": "adaptive_sma",
+        "description": "SMA crossover where windows are adjusted based on recent volatility to reduce whipsaws.",
+        "symbol": "SPY",
+        "code": "import numpy as np\nimport pandas as pd\n\ndef generate_signals(df):\n    prices = df['close'].values\n    returns = np.diff(prices) / prices[:-1]\n    vol = pd.Series(returns).rolling(window=20).std().values\n    vol = np.append(np.nan, vol)  # align length\n    # base windows\n    base_fast = 10\n    base_slow = 30\n    # adjust: increase windows when volatility is high\n    vol_ratio = np.nan_to_num(vol / np.nanmean(vol), nan=1.0)\n    fast_window = (base_fast * (1 + vol_ratio)).astype(int)\n    slow_window = (base_slow * (1 + vol_ratio)).astype(int)\n    # cap windows to max 99 and min 5\n    fast_window = np.clip(fast_window, 5, 29)\n    slow_window = np.clip(slow_window, 20, 99)\n    # compute SMA\n    sma_fast = pd.Series(prices).rolling(window=int(np.nanmean(fast_window))).mean()\n    sma_slow = pd.Series(prices).rolling(window=int(np.nanmean(slow_window))).mean()\n    signal = np.where(sma_fast > sma_slow, 1, -1)\n    return signal"
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_drawdown >= -20"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: signal validation failed: 'close'",
+        "finished_at": "2026-07-19T05:23:49.730118"
+      }
+    },
+    {
+      "id": "d40a6060-7fdf-413c-815e-79966ef976c9",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.7,
+      "created_at": "2026-07-19T05:18:33.250898+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "mean_reversion|NVDA"
+      },
+      "spec": {
+        "strategy": "mean_reversion",
+        "symbol": "NVDA",
+        "params": {
+          "window": 25,
+          "threshold": 2.0
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 1.33)",
+        "finished_at": "2026-07-19T05:23:44.795570"
+      }
+    },
+    {
+      "id": "d4d26da2-fc3a-4645-aa3e-8a8efac92689",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.8,
+      "created_at": "2026-07-19T20:02:18.161028+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "mean_reversion|NVDA"
+      },
+      "spec": {
+        "strategy": "mean_reversion",
+        "symbol": "NVDA",
+        "params": {
+          "window": 30,
+          "threshold": 1.5
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.68)",
+        "finished_at": "2026-07-19T22:04:51.978332"
+      }
+    },
+    {
+      "id": "484857fb-219d-490b-a099-1a36fab6bb1b",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.75,
+      "created_at": "2026-07-19T20:02:18.161335+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "RSI mean reversion on AMZN with moderate thresholds"
+      },
+      "spec": {
+        "strategy": "rsi",
+        "symbol": "AMZN",
+        "params": {
+          "rsi_window": 20,
+          "oversold": 30,
+          "overbought": 70
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.15)",
+        "finished_at": "2026-07-19T22:04:55.777160"
+      }
+    },
+    {
+      "id": "a7846e10-d762-441c-85fc-10602dc3f570",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.75,
+      "created_at": "2026-07-20T02:37:01.023080+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "atr_channel_breakout_innovation"
+      },
+      "spec": {
+        "name": "atr_channel_breakout",
+        "description": "Breakout strategy using ATR-based dynamic channels",
+        "symbol": "SPY",
+        "code": "import numpy as np\nimport pandas as pd\n\ndef generate_signals(df):\n    period = 20\n    multiplier = 2.0\n    high = df['High']\n    low = df['Low']\n    close = df['Close']\n    tr1 = high - low\n    tr2 = (high - close.shift()).abs()\n    tr3 = (low - close.shift()).abs()\n    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)\n    atr = tr.rolling(period).mean()\n    mid = close.rolling(period).mean()\n    upper = mid + multiplier * atr\n    lower = mid - multiplier * atr\n    signal = pd.Series(0, index=df.index)\n    signal[close > upper] = 1\n    signal[close < lower] = -1\n    return signal"
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_drawdown >= -30",
+          "max_hold_days <= 20"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.71)",
+        "finished_at": "2026-07-20T03:22:38.852416"
+      }
+    },
+    {
+      "id": "5d0259be-3977-40c2-bb72-734eece4185a",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.65,
+      "created_at": "2026-07-20T02:37:01.023591+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "underexplored_mean_reversion_BTC"
+      },
+      "spec": {
+        "strategy": "mean_reversion",
+        "symbol": "BTC-USD",
+        "params": {
+          "window": 20,
+          "threshold": 2.0
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "sharpe_ratio > 0.5",
+          "max_hold_days <= 10"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.27)",
+        "finished_at": "2026-07-20T03:22:41.349921"
+      }
+    },
+    {
+      "id": "d434c701-bb56-4a66-8ac1-e87957a3c644",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.9,
+      "created_at": "2026-07-20T02:57:42.123840+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "2"
+      },
+      "spec": {
+        "name": "dual_hold_momentum_googl",
+        "description": "Momentum with dual lookback periods on GOOGL. Combines short and long lookback momentum signals to filter noise and capture sustained trends. Signal is 1 when both lookbacks are positive, -1 when both negative, 0 otherwise.",
+        "symbol": "GOOGL",
+        "code": "import numpy as np\nimport pandas as pd\n\ndef generate_signals(df):\n    \"\"\"\n    Dual momentum: combines short-term (10-day) and long-term (40-day) momentum.\n    Signal = 1 if both positive, -1 if both negative, 0 else.\n    \"\"\"\n    # Price series\n    close = df['Close']\n    # Short-term ROC\n    roc_short = close.pct_change(periods=10)\n    # Long-term ROC\n    roc_long = close.pct_change(periods=40)\n    # Signs\n    sign_short = np.sign(roc_short)\n    sign_long = np.sign(roc_long)\n    # Combined signal: require both same direction\n    signal = np.where((sign_short == 1) & (sign_long == 1), 1,\n                     np.where((sign_short == -1) & (sign_long == -1), -1, 0))\n    signal = pd.Series(signal, index=df.index)\n    # Fill initial NaN with 0\n    signal = signal.fillna(0).astype(int)\n    return signal\n"
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_hold_days <= 10"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.48)",
+        "finished_at": "2026-07-20T03:16:24.531199"
+      }
+    },
+    {
+      "id": "2bf742e1-1894-4154-9576-21094c274818",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.8,
+      "created_at": "2026-07-20T02:57:42.708181+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "4"
+      },
+      "spec": {
+        "name": "volatility_adaptive_sma_btc",
+        "description": "SMA crossover with windows adapted to Bitcoin volatility. Uses shorter windows in high volatility regimes and longer windows in low volatility regimes to reduce whipsaws.",
+        "symbol": "BTC-USD",
+        "code": "import numpy as np\nimport pandas as pd\n\ndef generate_signals(df):\n    \"\"\"\n    Volatility-adaptive SMA crossover for BTC-USD.\n    Regime determined by ATR relative to its median: high vol -> fast (5,20), low vol -> slow (20,50).\n    \"\"\"\n    high = df['High']\n    low = df['Low']\n    close = df['Close']\n    # ATR (14-day)\n    tr = pd.DataFrame({\n        'h_l': high - low,\n        'h_c_prev': (high - close.shift(1)).abs(),\n        'l_c_prev': (low - close.shift(1)).abs()\n    }).max(axis=1)\n    atr = tr.rolling(14).mean()\n    # Median ATR over last 60 days\n    median_atr = atr.rolling(60).median()\n    # Regime: high volatility if atr > 1.2 * median_atr\n    regime_high = atr > (1.2 * median_atr)\n    # Compute regime-dependent SMAs\n    fast_high = close.rolling(5).mean()\n    slow_high = close.rolling(20).mean()\n    fast_low = close.rolling(20).mean()\n    slow_low = close.rolling(50).mean()\n    # Select SMA pair based on regime\n    fast_sma = np.where(regime_high, fast_high, fast_low)\n    slow_sma = np.where(regime_high, slow_high, slow_low)\n    # Signal\n    signal = np.where(fast_sma > slow_sma, 1, np.where(fast_sma < slow_sma, -1, 0))\n    signal = pd.Series(signal, index=df.index)\n    signal = signal.fillna(0).astype(int)\n    return signal\n"
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_drawdown >= -20"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.46)",
+        "finished_at": "2026-07-20T03:16:30.193186"
+      }
+    },
+    {
+      "id": "f50d8a66-7def-4814-a807-77b2d6031746",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.8,
+      "created_at": "2026-07-20T04:06:04.900926+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "vol_momentum|SPY"
+      },
+      "spec": {
+        "name": "vol_price_breakout",
+        "description": "Volume-confirmed price direction: long on up day with above-average volume, short on down day with above-average volume",
+        "symbol": "SPY",
+        "code": "import numpy as np\nimport pandas as pd\n\ndef generate_signals(df):\n    vol_ma = df[\"Volume\"].rolling(20).mean()\n    up = df[\"Close\"] > df[\"Open\"]\n    down = df[\"Close\"] < df[\"Open\"]\n    signals = pd.Series(0, index=df.index)\n    signals[up & (df[\"Volume\"] > vol_ma)] = 1\n    signals[down & (df[\"Volume\"] > vol_ma)] = -1\n    return signals"
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -1.68)",
+        "finished_at": "2026-07-20T05:32:28.105733"
+      }
+    },
+    {
+      "id": "fd41bbbc-4d6c-4a17-8265-5ed672e4c6af",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.7,
+      "created_at": "2026-07-20T04:06:04.901533+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "rsi|TSLA"
+      },
+      "spec": {
+        "strategy": "rsi",
+        "symbol": "TSLA",
+        "params": {
+          "rsi_window": 14,
+          "oversold": 30,
+          "overbought": 70
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.41)",
+        "finished_at": "2026-07-20T05:32:33.185558"
+      }
+    },
+    {
+      "id": "43e7d48b-7712-4052-a0ea-88685b5c2ccb",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.75,
+      "created_at": "2026-07-20T04:06:04.901896+00:00",
+      "source": {
+        "kind": "failure_response",
+        "ref": "momentum|AMZN"
+      },
+      "spec": {
+        "strategy": "momentum",
+        "symbol": "AMZN",
+        "params": {
+          "lookback": 10,
+          "hold_period": 2
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.67)",
+        "finished_at": "2026-07-20T05:32:30.630995"
+      }
+    },
+    {
+      "id": "6709c7eb-5cb9-4901-ae9f-c6a0219cbad7",
+      "type": "code",
+      "status": "done_rejected",
+      "priority": 0.7,
+      "created_at": "2026-07-20T05:31:00.879461+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "hybrid_momentum_meanrev"
+      },
+      "spec": {
+        "name": "hybrid_momentum_meanrev",
+        "description": "Hybrid strategy combining momentum (lookback 30) and mean reversion (threshold 2.0) for AMZN. Long when price is oversold (z-score < -2.0) and momentum is positive; short when overbought and momentum is negative.",
+        "symbol": "AMZN",
+        "code": "import pandas as pd\n\ndef generate_signals(df):\n    lookback = 30\n    threshold = 2.0\n    close = df['Close']\n    mom = close.pct_change(lookback)\n    rolling_mean = close.rolling(window=lookback).mean()\n    rolling_std = close.rolling(window=lookback).std()\n    zscore = (close - rolling_mean) / rolling_std\n    signal = pd.Series(0, index=df.index)\n    signal[(zscore < -threshold) & (mom > 0)] = 1\n    signal[(zscore > threshold) & (mom < 0)] = -1\n    return signal"
+      },
+      "eval_plan": {
+        "extra_criteria": []
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe 0.00)",
+        "finished_at": "2026-07-20T05:32:35.809962"
+      }
+    },
+    {
+      "id": "3d988d2c-7715-4127-95f6-97d6e09985f4",
+      "type": "param",
+      "status": "done_rejected",
+      "priority": 0.6,
+      "created_at": "2026-07-20T05:31:00.879845+00:00",
+      "source": {
+        "kind": "idea",
+        "ref": "momentum_msft_short"
+      },
+      "spec": {
+        "strategy": "momentum",
+        "symbol": "MSFT",
+        "params": {
+          "lookback": 5,
+          "hold_period": 3
+        }
+      },
+      "eval_plan": {
+        "extra_criteria": [
+          "max_hold_days <= 3"
+        ]
+      },
+      "result": {
+        "verdict": "rejected",
+        "summary": "failed gate: validation (Sharpe -0.15)",
+        "finished_at": "2026-07-20T05:32:40.105056"
+      }
+    }
+  ]
+}
