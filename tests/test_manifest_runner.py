@@ -759,3 +759,189 @@ class TestNewsSentimentIntegration:
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# SEC 13F integration tests (Phase 2 PR-I)
+# ---------------------------------------------------------------------------
+
+
+def _write_sec13f_corpus(data_dir):
+    """Helper: write a minimal sec_13f corpus for testing."""
+    import json
+    corpus_dir = os.path.join(data_dir, "sec_13f_corpus")
+    os.makedirs(corpus_dir, exist_ok=True)
+    records = [
+        {
+            "quarter_end": "2023-06-30",
+            "cik": "0001067983",
+            "filer_name": "Berkshire Hathaway Inc",
+            "ticker": "AAPL",
+            "shares": 300000000,
+            "value_usd": 45000000000.0,
+            "pct_of_aum": 12.5,
+        },
+        {
+            "quarter_end": "2023-06-30",
+            "cik": "0001341439",
+            "filer_name": "Vanguard Group Inc",
+            "ticker": "AAPL",
+            "shares": 1200000000,
+            "value_usd": 180000000000.0,
+            "pct_of_aum": 3.2,
+        },
+        {
+            "quarter_end": "2023-06-30",
+            "cik": "0001341439",
+            "filer_name": "Vanguard Group Inc",
+            "ticker": "MSFT",
+            "shares": 900000000,
+            "value_usd": 150000000000.0,
+            "pct_of_aum": 2.7,
+        },
+    ]
+    out_path = os.path.join(corpus_dir, "2023-Q2.jsonl")
+    with open(out_path, "w") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+
+
+class TestSec13FIntegration:
+    def test_expert_mode_receives_sec_13f(self, tmp_path):
+        """Expert mode run() receives _sec_13f in data dict."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_sec13f_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_sec_13f" in data, "Missing sec_13f data!"
+                sec13f = data["_sec_13f"]
+                sec13f_count = len(sec13f)
+
+                first_sym = [k for k in data.keys() if not k.startswith("_")][0]
+                returns = data[first_sym]["Close"].pct_change().dropna()
+                val_returns = returns[(returns.index > train_end) & (returns.index <= val_end)]
+                holdout_returns = returns[returns.index > val_end]
+
+                mu_val = val_returns.mean()
+                sigma_val = val_returns.std(ddof=1) if len(val_returns) > 1 else 0.01
+                val_sharpe = float(mu_val / sigma_val * np.sqrt(252)) if sigma_val > 0 else 0.0
+
+                mu_ho = holdout_returns.mean()
+                sigma_ho = holdout_returns.std(ddof=1) if len(holdout_returns) > 1 else 0.01
+                holdout_sharpe = float(mu_ho / sigma_ho * np.sqrt(252)) if sigma_ho > 0 else 0.0
+
+                return {
+                    "val_sharpe": val_sharpe,
+                    "val_max_drawdown_pct": 5.0,
+                    "val_total_return_pct": 10.0,
+                    "holdout_sharpe": holdout_sharpe,
+                    "holdout_max_drawdown_pct": 3.0,
+                    "holdout_total_return_pct": 8.0,
+                    "sec13f_count": sec13f_count,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "sec13f_expert_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "sec_13f", "universe": [], "start": "2023-01-01",
+                 "filers": ["top_50"], "min_position_pct": 0.0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe", "max_drawdown_pct"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "expert"
+        assert "expert_extras" in result
+        assert result["expert_extras"]["sec13f_count"] > 0
+
+    def test_structured_with_sec_13f_extras(self, tmp_path):
+        """generate_signals(data, extras) receives sec_13f."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+        _write_sec13f_corpus(str(tmp_path))
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data, extras):
+                sec13f = extras.get("sec_13f", pd.DataFrame())
+                assert len(sec13f) > 0
+
+                signals = {}
+                for sym, df in data.items():
+                    if sym.startswith("_"):
+                        continue
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals)
+        """)
+
+        manifest_dict = {
+            "name": "sec13f_structured_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "sec_13f", "universe": [], "start": "2023-01-01",
+                 "filers": ["top_50"], "min_position_pct": 0.0},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "structured",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"
+        assert result["execution_mode"] == "structured"
+
+    def test_sec13f_corpus_missing_graceful(self, tmp_path):
+        """Missing sec_13f corpus is handled gracefully (no _sec_13f key)."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=200)
+
+        code = textwrap.dedent("""\
+            import numpy as np
+            import pandas as pd
+
+            def run(data, train_end, val_end, benchmark, config):
+                assert "_sec_13f" not in data
+                return {
+                    "val_sharpe": 1.5,
+                    "val_max_drawdown_pct": 3.0,
+                    "val_total_return_pct": 8.0,
+                    "holdout_sharpe": 1.0,
+                    "holdout_max_drawdown_pct": 2.0,
+                    "holdout_total_return_pct": 5.0,
+                }
+        """)
+
+        manifest_dict = {
+            "name": "sec13f_missing_test",
+            "code_b64": base64.b64encode(code.encode()).decode(),
+            "data_sources": [
+                {"type": "ohlcv", "universe": symbols, "start": "2023-01-01", "end": "2023-12-31"},
+                {"type": "sec_13f", "universe": [], "start": "2023-01-01",
+                 "filers": ["top_50"], "min_position_pct": 0.3},
+            ],
+            "compute": {"mode": "inference", "budget_seconds": 300, "gpu": False},
+            "evaluator": {"type": "portfolio", "metrics": ["sharpe"]},
+            "execution_mode": "expert",
+        }
+        manifest = StrategyManifest.from_dict(manifest_dict)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok"

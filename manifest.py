@@ -182,6 +182,114 @@ class NewsSentimentSource(DataSource):
 
 
 # ---------------------------------------------------------------------------
+# Top 50 asset managers by AUM (CIK list for 'top_50' shortcut)
+# ---------------------------------------------------------------------------
+# Sourced from public 13F filings. Each entry is a CIK (10-digit string).
+# These represent the 50 largest institutional investment managers by
+# reported 13F assets under management as of Q4 2025.
+# fmt: off
+TOP_50_CIKS: tuple = (
+    "0001067983",  # Berkshire Hathaway
+    "0001341439",  # Vanguard Group
+    "0000036405",  # BlackRock
+    "0001056288",  # State Street
+    "0000938528",  # Fidelity Management & Research
+    "0001535520",  # Geode Capital Management
+    "0001423053",  # Capital World Investors
+    "0001166559",  # Price T Rowe Associates
+    "0001350694",  # Nuveen Asset Management
+    "0000727139",  # Invesco
+    "0001802145",  # Morgan Stanley
+    "0000038787",  # Goldman Sachs Group
+    "0000769993",  # JP Morgan Chase
+    "0000070858",  # Bank of America / Merrill Lynch
+    "0000094716",  # Northern Trust
+    "0001061165",  # Legal & General Group
+    "0001037389",  # Charles Schwab Investment Management
+    "0001085146",  # UBS Group
+    "0001001085",  # Dimensional Fund Advisors
+    "0001479543",  # D.E. Shaw
+    "0001541617",  # Two Sigma Investments
+    "0001035674",  # Renaissance Technologies
+    "0001166928",  # AQR Capital Management
+    "0001603466",  # Citadel Advisors
+    "0001103804",  # Wellington Management Group
+    "0001289419",  # Millennium Management
+    "0001167483",  # Franklin Resources
+    "0000315066",  # Ameriprise Financial
+    "0000350797",  # Bank of New York Mellon
+    "0000094011",  # Amundi
+    "0001141391",  # AllianceBernstein
+    "0001159157",  # Macquarie Group
+    "0000049679",  # Principal Financial Group
+    "0000051858",  # Raymond James Financial
+    "0000023760",  # Royal Bank of Canada
+    "0001273087",  # Sumitomo Mitsui Trust Holdings
+    "0001364742",  # Blackstone Group
+    "0000891541",  # Deutsche Bank
+    "0000913383",  # PNC Financial Services
+    "0001310018",  # Bridgewater Associates
+    "0001345471",  # Elliott Investment Management
+    "0001075857",  # Janus Henderson Group
+    "0001368754",  # Man Group
+    "0001172265",  # Point72 Asset Management
+    "0000037321",  # Regions Financial
+    "0001398348",  # Viking Global Investors
+    "0000884776",  # AIG
+    "0001167783",  # Baupost Group
+    "0001555555",  # Tiger Global Management
+    "0001593313",  # Marshall Wace
+)
+# fmt: on
+
+
+@DataSource.register("sec_13f")
+class Sec13FSource(DataSource):
+    """SEC 13F institutional holdings data source (Phase 2 PR-I).
+
+    Reads from a pre-fetched JSONL corpus on disk (no network at runtime)
+    via offline ingest scripts/ingest_sec_13f.py.
+    """
+
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        start: str = "",
+        end: Optional[str] = None,
+        filers: Optional[List[str]] = None,
+        min_position_pct: float = 0.5,
+    ) -> None:
+        super().__init__(source_type="sec_13f")
+        self.universe: List[str] = universe if universe is not None else []
+        self.start = start
+        self.end = end
+        self.filers: List[str] = filers if filers is not None else []
+        self.min_position_pct = min_position_pct
+
+    @classmethod
+    def _from_dict(cls, d: Dict[str, Any]) -> "Sec13FSource":
+        return cls(
+            universe=d.get("universe", []),
+            start=d.get("start", ""),
+            end=d.get("end"),
+            filers=d.get("filers", []),
+            min_position_pct=float(d.get("min_position_pct", 0.5)),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "type": self.type,
+            "universe": self.universe,
+            "start": self.start,
+            "filers": self.filers,
+            "min_position_pct": self.min_position_pct,
+        }
+        if self.end is not None:
+            result["end"] = self.end
+        return result
+
+
+# ---------------------------------------------------------------------------
 # ModelArtifact (reserved for Phase 3)
 # ---------------------------------------------------------------------------
 
@@ -363,6 +471,8 @@ class StrategyManifest:
                 violations.extend(_validate_ohlcv_source(ds, i))
             elif isinstance(ds, NewsSentimentSource):
                 violations.extend(_validate_news_sentiment_source(ds, i))
+            elif isinstance(ds, Sec13FSource):
+                violations.extend(_validate_sec13f_source(ds, i))
 
         # 4. model_artifacts
         for i, ma in enumerate(self.model_artifacts):
@@ -537,6 +647,97 @@ def _validate_news_sentiment_source(source: "NewsSentimentSource", index: int) -
             violations.append(
                 f"data_sources[{index}].min_relevance must be in [0.0, 1.0], "
                 f"got {mr}"
+            )
+
+    return violations
+
+
+def _validate_sec13f_source(source: "Sec13FSource", index: int) -> List[str]:
+    """Validate Sec13FSource fields."""
+    violations: List[str] = []
+
+    # universe: optional list, each entry must match symbol regex
+    if not isinstance(source.universe, list):
+        violations.append(
+            f"data_sources[{index}].universe must be a list"
+        )
+    else:
+        for j, symbol in enumerate(source.universe):
+            if not isinstance(symbol, str):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] must be a string"
+                )
+            elif not SYMBOL_REGEX.match(symbol):
+                violations.append(
+                    f"data_sources[{index}].universe[{j}] '{symbol}' "
+                    f"does not match symbol regex"
+                )
+
+    # start: required, YYYY-MM-DD
+    if not source.start or not isinstance(source.start, str):
+        violations.append(
+            f"data_sources[{index}].start must be a non-empty string"
+        )
+    elif not DATE_REGEX.match(source.start):
+        violations.append(
+            f"data_sources[{index}].start '{source.start}' "
+            f"must be YYYY-MM-DD format"
+        )
+
+    # end: optional, YYYY-MM-DD
+    if source.end is not None:
+        if not isinstance(source.end, str):
+            violations.append(
+                f"data_sources[{index}].end must be a string or null"
+            )
+        elif not DATE_REGEX.match(source.end):
+            violations.append(
+                f"data_sources[{index}].end '{source.end}' "
+                f"must be YYYY-MM-DD format"
+            )
+
+    # filers: list[str] or list containing 'top_50'
+    if not isinstance(source.filers, list):
+        violations.append(
+            f"data_sources[{index}].filers must be a list"
+        )
+    elif len(source.filers) == 0:
+        violations.append(
+            f"data_sources[{index}].filers must be a non-empty list. "
+            f"Use ['top_50'] for the 50 largest asset managers."
+        )
+    else:
+        for j, filer in enumerate(source.filers):
+            if not isinstance(filer, str):
+                violations.append(
+                    f"data_sources[{index}].filers[{j}] must be a string"
+                )
+            elif filer == "top_50":
+                # Allow the shortcut — validate no other entries when used
+                if len(source.filers) > 1:
+                    violations.append(
+                        f"data_sources[{index}].filers: 'top_50' shortcut "
+                        f"cannot be combined with other CIKs"
+                    )
+                break
+            elif not filer.isdigit() or len(filer) != 10:
+                violations.append(
+                    f"data_sources[{index}].filers[{j}] '{filer}' "
+                    f"must be a 10-digit CIK or 'top_50'"
+                )
+
+    # min_position_pct: float >= 0.0
+    if not isinstance(source.min_position_pct, (int, float)):
+        violations.append(
+            f"data_sources[{index}].min_position_pct must be a float, "
+            f"got {type(source.min_position_pct).__name__}"
+        )
+    else:
+        mp = float(source.min_position_pct)
+        if mp < 0.0:
+            violations.append(
+                f"data_sources[{index}].min_position_pct must be >= 0.0, "
+                f"got {mp}"
             )
 
     return violations

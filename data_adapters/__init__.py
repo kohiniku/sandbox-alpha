@@ -13,11 +13,13 @@ from data_adapters.ohlcv import (
     to_wide,
 )
 from data_adapters.news_sentiment import load_news_sentiment
+from data_adapters.sec_13f import load_sec_13f
 
 __all__ = [
     "MissingDataError",
     "align_universe",
     "load_news_sentiment",
     "load_ohlcv",
+    "load_sec_13f",
     "to_wide",
 ]

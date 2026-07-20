@@ -630,3 +630,147 @@ class TestNewsSentimentSource:
         ds = DataSource.from_dict(d)
         assert isinstance(ds, NewsSentimentSource)
         assert ds.source == "arxiv_investment"
+
+
+# ---------------------------------------------------------------------------
+# Sec13FSource validation (Phase 2 PR-I)
+# ---------------------------------------------------------------------------
+
+class TestSec13FSource:
+    def test_valid_sec_13f(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["0001067983"], "min_position_pct": 0.5}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_top_50_shortcut(self):
+        """top_50 shortcut is accepted as filer."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["top_50"], "min_position_pct": 1.0}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_valid_empty_universe(self):
+        """Empty universe = all tickers is valid."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": [], "start": "2023-01-01",
+             "filers": ["0001067983"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        assert m.validate() == []
+
+    def test_empty_filers_rejected(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": []}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("filers" in v and "non-empty" in v for v in violations)
+
+    def test_invalid_cik(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["not_a_cik"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("10-digit CIK" in v for v in violations)
+
+    def test_top_50_combined_with_other_ciks(self):
+        """top_50 cannot be combined with explicit CIKs."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["top_50", "0001067983"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("top_50" in v and "combined" in v for v in violations)
+
+    def test_invalid_symbol_in_universe(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["bad symbol!"], "start": "2023-01-01",
+             "filers": ["top_50"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("symbol regex" in v for v in violations)
+
+    def test_bad_start_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023/01/01",
+             "filers": ["top_50"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("start" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_bad_end_date(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "end": "not-a-date", "filers": ["top_50"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("end" in v and "YYYY-MM-DD" in v for v in violations)
+
+    def test_min_position_pct_negative(self):
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["top_50"], "min_position_pct": -0.1}
+        ]
+        m = StrategyManifest.from_dict(d)
+        violations = m.validate()
+        assert any("min_position_pct" in v for v in violations)
+
+    def test_default_min_position_pct(self):
+        """Default min_position_pct is 0.5."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["top_50"]}
+        ]
+        m = StrategyManifest.from_dict(d)
+        ds = m.data_sources[0]
+        assert ds.min_position_pct == 0.5
+
+    def test_roundtrip_sec13f_source(self):
+        """Round-trip includes all fields."""
+        d = _minimal_dict()
+        d["data_sources"] = [
+            {"type": "sec_13f", "universe": ["AAPL", "MSFT"],
+             "start": "2023-01-01", "end": "2024-12-31",
+             "filers": ["0001067983", "0001341439"],
+             "min_position_pct": 0.3}
+        ]
+        m = StrategyManifest.from_dict(d)
+        out = m.to_dict()
+        ds_out = out["data_sources"][0]
+        assert ds_out["type"] == "sec_13f"
+        assert ds_out["filers"] == ["0001067983", "0001341439"]
+        assert ds_out["min_position_pct"] == 0.3
+        assert "end" in ds_out
+
+    def test_registry_dispatch(self):
+        """Sec13FSource is correctly dispatched by DataSource.from_dict."""
+        d = {"type": "sec_13f", "universe": ["AAPL"], "start": "2023-01-01",
+             "filers": ["top_50"]}
+        from manifest import Sec13FSource
+        ds = DataSource.from_dict(d)
+        assert isinstance(ds, Sec13FSource)
+        assert ds.filers == ["top_50"]
+        assert ds.min_position_pct == 0.5
