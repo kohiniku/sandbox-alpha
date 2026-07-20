@@ -854,7 +854,7 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. You are a skeptical risk manager."},
         {"role": "user", "content": risk_prompt},
     ]
-    risk_response = _call_llm(risk_messages, max_tokens=4096)
+    risk_response = _call_llm(risk_messages, max_tokens=8192)
     risk_report = risk_response.get("risk_report", [])
 
     # --- Quant Researcher ---
@@ -880,7 +880,7 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. You are a constructive quant researcher."},
         {"role": "user", "content": quant_prompt},
     ]
-    quant_response = _call_llm(quant_messages, max_tokens=4096)
+    quant_response = _call_llm(quant_messages, max_tokens=8192)
     quant_report = quant_response.get("quant_report", [])
 
     # --- Build per-idea context for judge ---
@@ -925,7 +925,7 @@ Return ONLY this JSON:
     judge_report = []
     judge_failed = False
     try:
-        judge_response = _call_llm(judge_messages, max_tokens=4096)
+        judge_response = _call_llm(judge_messages, max_tokens=8192)
         judge_report = judge_response.get("judge_report", [])
         if not isinstance(judge_report, list) or not judge_report:
             judge_failed = True
@@ -1070,13 +1070,15 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. No markdown."},
         {"role": "user", "content": select_prompt},
     ]
-    # Retry once on empty/unparseable JSON — DeepSeek pro occasionally returns
-    # nothing due to internal reasoning token consumption, and the whole v2
-    # pipeline shouldn't collapse into v1 for a single flaky response.
+    # Use flash for the v2 select for the same reason we use it in v3 select
+    # (measured 2026-07-20: DeepSeek pro consumes 190/200 tokens on reasoning
+    # even for trivial prompts, leaving content truncated). Select is
+    # mechanical structuring — flash is faster AND more reliable.
+    select_model = os.environ.get("HYPO_LLM_MODEL_SELECT", "deepseek-v4-flash")
     last_err = None
     for attempt in range(2):
         try:
-            response = _call_llm(select_messages, max_tokens=4096)
+            response = _call_llm(select_messages, max_tokens=8192, model=select_model)
             proposals = response.get("proposals", [])
             if proposals:
                 return proposals, fallback_used
