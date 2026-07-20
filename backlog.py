@@ -9,6 +9,8 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+from loop_constants import BacklogStatus
+
 # ---------------------------------------------------------------------------
 # Schema helpers
 # ---------------------------------------------------------------------------
@@ -22,7 +24,7 @@ def _new_entry(entry_type, priority, source, spec, eval_plan=None):
     return {
         "id": str(uuid.uuid4()),
         "type": entry_type,
-        "status": "pending",
+        "status": BacklogStatus.PENDING,
         "priority": float(priority),
         "created_at": _now_iso(),
         "source": source,
@@ -109,7 +111,7 @@ class Backlog:
         data["entries"].append(entry)
 
         # Cap pending entries at 50
-        pending = [e for e in data["entries"] if e["status"] == "pending"]
+        pending = [e for e in data["entries"] if e["status"] == BacklogStatus.PENDING]
         if len(pending) > 50:
             pending.sort(key=lambda e: (e["priority"], e["created_at"]))
             evict = pending[: len(pending) - 50]
@@ -122,7 +124,7 @@ class Backlog:
     def next_pending(self):
         """Return highest-priority pending entry, or None."""
         data = self.load()
-        pending = [e for e in data["entries"] if e["status"] == "pending"]
+        pending = [e for e in data["entries"] if e["status"] == BacklogStatus.PENDING]
         if not pending:
             return None
         pending.sort(key=lambda e: (-e["priority"], e["created_at"]))
@@ -144,7 +146,7 @@ class Backlog:
         cutoff = datetime.now(timezone.utc)
         data, fd = self._locked_read()
         for e in data["entries"]:
-            if e["status"] != "pending":
+            if e["status"] != BacklogStatus.PENDING:
                 continue
             try:
                 created = datetime.fromisoformat(e["created_at"])

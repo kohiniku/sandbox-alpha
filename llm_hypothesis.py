@@ -18,6 +18,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
+from loop_constants import MISSING_METRIC
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -157,7 +159,7 @@ def _build_knowledge_summary(knowledge):
         for fam_key, fam in sorted(families.items()):
             strategy, symbol = fam_key.split("|", 1)
             n = fam.get("n_trials", 0)
-            best_sharpe = fam.get("best_val_sharpe", -999)
+            best_sharpe = fam.get("best_val_sharpe", MISSING_METRIC)
             gf = fam.get("gate_failures", {})
             v = gf.get("validation", 0)
             d = gf.get("deflation", 0)

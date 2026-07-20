@@ -67,6 +67,8 @@ STRATEGY_TEMPLATES = {
 MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
 MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
 
+from loop_constants import MISSING_METRIC, Verdict, BacklogStatus
+
 
 def compute_effective_min_sharpe(N_family, T_val):
     """Deflation formula: threshold rises with more trials to penalize data snooping."""
@@ -149,7 +151,7 @@ def _rebuild_families_from_history(knowledge):
             continue
         families.setdefault(key, {
             "n_trials": 0,
-            "best_val_sharpe": -999.0,
+            "best_val_sharpe": MISSING_METRIC,
             "best_params": {},
             "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                               "duplicate_cluster": 0, "exhausted_cluster": 0},
@@ -167,7 +169,7 @@ def _apply_entry_to_family(families, key, entry, hyp):
     """Incrementally update a single family aggregate record from one evaluation entry."""
     fam = families.setdefault(key, {
         "n_trials": 0,
-        "best_val_sharpe": -999.0,
+        "best_val_sharpe": MISSING_METRIC,
         "best_params": {},
         "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                           "duplicate_cluster": 0, "exhausted_cluster": 0},
@@ -175,7 +177,7 @@ def _apply_entry_to_family(families, key, entry, hyp):
     })
     fam["n_trials"] += 1
     ev = entry.get("evaluation", {})
-    val_sharpe = ev.get("sharpe_ratio", -999)
+    val_sharpe = ev.get("sharpe_ratio", MISSING_METRIC)
     if val_sharpe > fam["best_val_sharpe"]:
         fam["best_val_sharpe"] = val_sharpe
         fam["best_params"] = hyp.get("params", {})
@@ -188,7 +190,7 @@ def _apply_entry_to_family(families, key, entry, hyp):
         return
     # Determine why it was rejected (or if it passed everything)
     verdict = ev.get("verdict", entry.get("verdict", ""))
-    if verdict == "adopted":
+    if verdict == Verdict.ADOPTED:
         return  # adopted entries don't count as gate failures
     # Count individual gate failures
     if not gate_results.get("validation", True):
@@ -234,7 +236,7 @@ def _check_exhausted_cluster(hypothesis, knowledge):
         return False, len(matching), None
 
     best_sharpe = max(
-        (e.get("evaluation", {}).get("sharpe_ratio", -999) for e in matching),
+        (e.get("evaluation", {}).get("sharpe_ratio", MISSING_METRIC) for e in matching),
         default=-999
     )
     if best_sharpe >= 0:
@@ -368,7 +370,7 @@ def run_backtest(hypothesis, metrics_since=None):
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
     params = hypothesis["params"]
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
+    runner_url = _get_loop_config()["runner_url"]
 
     if runner_url:
         return _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since)
@@ -478,16 +480,16 @@ def _triage_eval_error(result):
         return None
     error_type = result.get("error_type", "error")  # safe default: unknown = error
     if error_type == "infra":
-        return "error", {"verdict": "error", "error": result["error"],
+        return Verdict.ERROR, {"verdict": Verdict.ERROR, "error": result["error"],
                          "error_type": "infra",
                          "reasons": [f"🔧 Infra error (not counted as rejection): {result['error']}"]}
     elif error_type == "code":
-        return "code_error", {"verdict": "code_error", "error": result["error"],
+        return Verdict.CODE_ERROR, {"verdict": Verdict.CODE_ERROR, "error": result["error"],
                               "error_type": "code",
                               "reasons": [f"💻 Code error (strategy code crashed): {result['error']}"]}
     else:
         # Unknown error_type → safe default: error (never rejection)
-        return "error", {"verdict": "error", "error": result["error"],
+        return Verdict.ERROR, {"verdict": Verdict.ERROR, "error": result["error"],
                          "error_type": "unknown",
                          "reasons": [f"🔧 Unknown error (not counted as rejection): {result['error']}"]}
 
@@ -553,15 +555,15 @@ def evaluate_result(hypothesis, result, knowledge):
 
     wf = result.get("walkforward", {})
     if not wf.get("enabled"):
-        return "rejected", {"verdict": "rejected", "error": "walkforward disabled", "reasons": ["❌ Walkforward not enabled"]}
+        return Verdict.REJECTED, {"verdict": Verdict.REJECTED, "error": "walkforward disabled", "reasons": ["❌ Walkforward not enabled"]}
 
     val_metrics = result.get("out_of_sample", {})
     holdout_metrics = result.get("holdout", {})
     is_metrics = result.get("in_sample", {})
 
-    val_sharpe = val_metrics.get("sharpe_ratio", -999)
-    val_return = val_metrics.get("total_return_pct", -999)
-    val_max_dd = val_metrics.get("max_drawdown_pct", -999)
+    val_sharpe = val_metrics.get("sharpe_ratio", MISSING_METRIC)
+    val_return = val_metrics.get("total_return_pct", MISSING_METRIC)
+    val_max_dd = val_metrics.get("max_drawdown_pct", MISSING_METRIC)
     T_val = val_metrics.get("num_days", 252)
 
     strategy = hypothesis["strategy"]
@@ -581,7 +583,7 @@ def evaluate_result(hypothesis, result, knowledge):
 
     if not val_pass:
         evaluation = {
-            "verdict": "rejected",
+            "verdict": Verdict.REJECTED,
             "sharpe_ratio": val_sharpe,
             "total_return_pct": val_return,
             "max_drawdown_pct": val_max_dd,
@@ -598,15 +600,15 @@ def evaluate_result(hypothesis, result, knowledge):
     gate_results["deflation"] = True
 
     # --- Gate (c): Holdout confirmation ---
-    holdout_sharpe = holdout_metrics.get("sharpe_ratio", -999)
-    holdout_return = holdout_metrics.get("total_return_pct", -999)
+    holdout_sharpe = holdout_metrics.get("sharpe_ratio", MISSING_METRIC)
+    holdout_return = holdout_metrics.get("total_return_pct", MISSING_METRIC)
     holdout_pass, holdout_reasons = _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe)
     reasons.extend(holdout_reasons)
     gate_results["holdout"] = holdout_pass
 
     if not holdout_pass:
         evaluation = {
-            "verdict": "rejected",
+            "verdict": Verdict.REJECTED,
             "sharpe_ratio": val_sharpe,
             "total_return_pct": val_return,
             "max_drawdown_pct": val_max_dd,
@@ -635,7 +637,7 @@ def evaluate_result(hypothesis, result, knowledge):
 
     if incumbent_idx is not None:
         incumbent = adopted[incumbent_idx]
-        inc_holdout = incumbent.get("evaluation", {}).get("holdout_sharpe", -999)
+        inc_holdout = incumbent.get("evaluation", {}).get("holdout_sharpe", MISSING_METRIC)
         if holdout_sharpe > inc_holdout:
             reasons.append(f"🔄 Cluster replace: holdout Sharpe {holdout_sharpe:.2f} > incumbent {inc_holdout:.2f}")
             knowledge.setdefault("superseded", []).append(incumbent)
@@ -645,7 +647,7 @@ def evaluate_result(hypothesis, result, knowledge):
             reasons.append(f"❌ Cluster dedup: holdout Sharpe {holdout_sharpe:.2f} <= incumbent {inc_holdout:.2f}")
             gate_results["cluster"] = "duplicate_cluster"
             evaluation = {
-                "verdict": "rejected",
+                "verdict": Verdict.REJECTED,
                 "sharpe_ratio": val_sharpe,
                 "total_return_pct": val_return,
                 "max_drawdown_pct": val_max_dd,
@@ -664,7 +666,7 @@ def evaluate_result(hypothesis, result, knowledge):
     # All gates passed
     reasons.insert(0, "🏆 ALL GATES PASSED")
     evaluation = {
-        "verdict": "adopted",
+        "verdict": Verdict.ADOPTED,
         "sharpe_ratio": val_sharpe,
         "total_return_pct": val_return,
         "max_drawdown_pct": val_max_dd,
@@ -678,7 +680,7 @@ def evaluate_result(hypothesis, result, knowledge):
     if is_metrics:
         evaluation["in_sample"] = is_metrics
 
-    return "adopted", evaluation
+    return Verdict.ADOPTED, evaluation
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +693,7 @@ def _classify_near_miss(hypothesis, evaluation):
     Returns a near-miss dict or None.
     """
     gate_results = evaluation.get("gate_results", {})
-    val_sharpe = evaluation.get("sharpe_ratio", -999)
+    val_sharpe = evaluation.get("sharpe_ratio", MISSING_METRIC)
     eff_threshold = evaluation.get("effective_min_sharpe", 0)
     holdout_sharpe = evaluation.get("holdout_sharpe")  # None if holdout never ran
 
@@ -847,18 +849,18 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     # Note: runner_result is the FULL parsed runner response (includes metrics + n_days)
     if "metrics" not in runner_result:
         return "error", {
-            "verdict": "error",
+            "verdict": Verdict.ERROR,
             "error": "Malformed runner response: missing 'metrics'",
             "error_type": "infra",
             "reasons": [f"🔧 Infra error (not counted as rejection): missing 'metrics' in runner response"],
         }
 
     metrics = runner_result["metrics"]
-    val_sharpe = metrics.get("val_sharpe", -999)
-    val_max_dd = metrics.get("val_max_drawdown_pct", -999)
-    val_return = metrics.get("val_total_return_pct", -999)
-    holdout_sharpe = metrics.get("holdout_sharpe", -999)
-    holdout_return = metrics.get("holdout_total_return_pct", -999)
+    val_sharpe = metrics.get("val_sharpe", MISSING_METRIC)
+    val_max_dd = metrics.get("val_max_drawdown_pct", MISSING_METRIC)
+    val_return = metrics.get("val_total_return_pct", MISSING_METRIC)
+    holdout_sharpe = metrics.get("holdout_sharpe", MISSING_METRIC)
+    holdout_return = metrics.get("holdout_total_return_pct", MISSING_METRIC)
     T_val = runner_result.get("n_days", 252)
 
     strategy = hypothesis["strategy"]
@@ -877,7 +879,7 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
 
     if not val_pass:
         evaluation = {
-            "verdict": "rejected",
+            "verdict": Verdict.REJECTED,
             "sharpe_ratio": val_sharpe,
             "total_return_pct": val_return,
             "max_drawdown_pct": val_max_dd,
@@ -898,7 +900,7 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
 
     if not holdout_pass:
         evaluation = {
-            "verdict": "rejected",
+            "verdict": Verdict.REJECTED,
             "sharpe_ratio": val_sharpe,
             "total_return_pct": val_return,
             "max_drawdown_pct": val_max_dd,
@@ -917,7 +919,7 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     # All gates passed
     reasons.insert(0, "🏆 ALL GATES PASSED")
     evaluation = {
-        "verdict": "adopted",
+        "verdict": Verdict.ADOPTED,
         "sharpe_ratio": val_sharpe,
         "total_return_pct": val_return,
         "max_drawdown_pct": val_max_dd,
@@ -932,7 +934,7 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     if runner_result.get("expert_extras"):
         evaluation["expert_extras"] = runner_result["expert_extras"]
 
-    return "adopted", evaluation
+    return Verdict.ADOPTED, evaluation
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +983,7 @@ def _check_extra_criteria(metrics, extra_criteria):
             print(f"  ⚠️ 解釈不能なcriteria (無視): {crit_str}")
             continue
 
-        actual = metrics.get(metric, -999)
+        actual = metrics.get(metric, MISSING_METRIC)
         passed = False
         if op == ">=":
             passed = actual >= value
@@ -1112,7 +1114,7 @@ def _consume_manifest_entry(entry, spec, runner_url, bl):
     """
     if not runner_url:
         print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — マニフェストエントリをpendingに戻します")
-        bl.mark(entry["id"], "pending")
+        bl.mark(entry["id"], BacklogStatus.PENDING)
         return None
 
     manifest_spec = spec
@@ -1148,7 +1150,7 @@ def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
     """
     if not runner_url:
         print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — コードエントリをpendingに戻します")
-        bl.mark(entry["id"], "pending")
+        bl.mark(entry["id"], BacklogStatus.PENDING)
         return None
 
     code_str = spec["code"]
@@ -1161,8 +1163,8 @@ def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
         hyp = rec.get("hypothesis", {})
         if ev.get("code_hash") == code_hash and hyp.get("symbol") == spec["symbol"]:
             print(f"  ⚠️ 重複コードハッシュ (code_hash={code_hash[:12]}..., symbol={spec['symbol']}) → スキップ")
-            bl.mark(entry["id"], "done_rejected", {
-                "verdict": "rejected",
+            bl.mark(entry["id"], BacklogStatus.DONE_REJECTED, {
+                "verdict": Verdict.REJECTED,
                 "reason": "duplicate_code",
                 "summary": f"コードハッシュ重複: code_hash={code_hash[:12]}... on {spec['symbol']}",
                 "finished_at": datetime.now().isoformat(),
@@ -1228,7 +1230,7 @@ def _consume_backlog_entry(knowledge):
     """
     from backlog import Backlog
 
-    backlog_path = os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json"))
+    backlog_path = _get_loop_config()["backlog_path"]
     bl = Backlog(backlog_path)
     entry = bl.next_pending()
 
@@ -1253,9 +1255,9 @@ def _consume_backlog_entry(knowledge):
     print(f"📥 バックログ消化: {tag} (priority {priority}, source {source_info.get('kind', '?')}:{source_info.get('ref', '?')})")
 
     # Mark as testing
-    bl.mark(entry["id"], "testing")
+    bl.mark(entry["id"], BacklogStatus.TESTING)
 
-    runner_url = os.environ.get("SANDBOX_RUNNER_URL")
+    runner_url = _get_loop_config()["runner_url"]
 
     # ── Route to per-type handler ──
     if etype == "param":
@@ -1265,7 +1267,7 @@ def _consume_backlog_entry(knowledge):
     elif etype == "code":
         consumed = _consume_code_entry(entry, spec, knowledge, runner_url, bl)
     else:
-        bl.mark(entry["id"], "pending")
+        bl.mark(entry["id"], BacklogStatus.PENDING)
         return None
 
     if consumed is None:
@@ -1280,16 +1282,16 @@ def _consume_backlog_entry(knowledge):
         verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
 
     # ── Extra criteria ──
-    if verdict == "adopted" and extra_criteria:
+    if verdict == Verdict.ADOPTED and extra_criteria:
         metrics = result.get("out_of_sample", result)
         extra_pass, extra_failures = _check_extra_criteria(metrics, extra_criteria)
         if not extra_pass:
             evaluation["reasons"].extend(extra_failures)
             verdict = "rejected"
-            evaluation["verdict"] = "rejected"
+            evaluation["verdict"] = Verdict.REJECTED
 
     # ── Summary line ──
-    if verdict == "adopted":
+    if verdict == Verdict.ADOPTED:
         val_sharpe = evaluation.get("sharpe_ratio", 0)
         holdout_sharpe = evaluation.get("holdout_sharpe", 0)
         summary = f"val Sharpe {val_sharpe:.2f} / holdout Sharpe {holdout_sharpe:.2f}"
@@ -1298,9 +1300,9 @@ def _consume_backlog_entry(knowledge):
         if evaluation.get("error"):
             summary = f"failed gate: {evaluation['error'][:100]}"
         elif not gate_results.get("validation", True):
-            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', -999):.2f})"
+            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', MISSING_METRIC):.2f})"
         elif not gate_results.get("holdout", True):
-            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', -999):.2f})"
+            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', MISSING_METRIC):.2f})"
         else:
             reasons = evaluation.get("reasons", [])
             extra_fail = [r for r in reasons if "Extra criterion failed" in r]
@@ -1310,7 +1312,7 @@ def _consume_backlog_entry(knowledge):
                 summary = f"failed gate: cluster dedup or other"
 
     # ── Route error verdicts for backlog entries ──
-    if verdict == "error":
+    if verdict == Verdict.ERROR:
         # Infra error: retry with attempts counter.
         # attempts persists inside result (backlog.mark writes only status + result),
         # so we must read from the result dict, not from entry top-level —
@@ -1326,22 +1328,22 @@ def _consume_backlog_entry(knowledge):
                 "attempts": attempts,
             })
         else:
-            bl.mark(entry["id"], "done_error", {
+            bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
                 "verdict": verdict,
                 "error": evaluation.get("error", "")[:200],
                 "summary": f"infra error after {attempts} attempts: {evaluation.get('error', '')[:200]}",
                 "finished_at": datetime.now().isoformat(),
                 "attempts": attempts,
             })
-    elif verdict == "code_error":
-        bl.mark(entry["id"], "done_error", {
+    elif verdict == Verdict.CODE_ERROR:
+        bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
             "verdict": verdict,
             "error": evaluation.get("error", "")[:200],
             "summary": f"code error: {evaluation.get('error', '')[:200]}",
             "finished_at": datetime.now().isoformat(),
         })
     else:
-        finish_status = "done_adopted" if verdict == "adopted" else "done_rejected"
+        finish_status = BacklogStatus.DONE_ADOPTED if verdict == Verdict.ADOPTED else BacklogStatus.DONE_REJECTED
         bl.mark(entry["id"], finish_status, {
             "verdict": verdict,
             "summary": summary,
@@ -1354,17 +1356,31 @@ def _consume_backlog_entry(knowledge):
 # ======================================================================
 
 
+def _get_loop_config():
+    """Return a dict of all environment-driven config values.
+
+    Read at call time (not import time) so tests can monkeypatch env vars.
+    """
+    return {
+        "runner_url": os.environ.get("SANDBOX_RUNNER_URL"),
+        "backlog_path": os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json")),
+        "use_llm": os.environ.get("USE_LLM_HYPOTHESIS") == "1",
+    }
+
+
 def run_loop(num_iterations=3):
     """
     メインPDCAループ
     """
-    use_llm = os.environ.get("USE_LLM_HYPOTHESIS") == "1"
+    config = _get_loop_config()
+    use_llm = config["use_llm"]
 
     print("=" * 60)
     print("🚀 Autonomous Alpha Discovery Loop 開始")
     print(f"   開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
     print(f"   イテレーション数: {num_iterations}")
     print(f"   LLM仮説生成: {'有効' if use_llm else '無効'}")
+    print(f"CONFIG runner_url={'set' if config['runner_url'] else 'unset'} backlog_path={config['backlog_path']} use_llm={use_llm}")
     print("=" * 60)
     
     knowledge = load_knowledge()
@@ -1395,7 +1411,7 @@ def run_loop(num_iterations=3):
                 knowledge.setdefault("errors", []).append(record)
                 if len(knowledge["errors"]) > 100:
                     knowledge["errors"] = knowledge["errors"][-100:]
-            elif verdict == "adopted":
+            elif verdict == Verdict.ADOPTED:
                 record["cluster_id"] = evaluation.get("cluster_id", "unknown")
                 knowledge["adopted"].append(record)
             else:
@@ -1432,7 +1448,7 @@ def run_loop(num_iterations=3):
         if exhausted:
             print(f"  ⛔ 枯渇クラスタ ({n_failures} failures, best Sharpe {best_fail_sharpe:.2f}) → バックテスト省略")
             evaluation = {
-                "verdict": "rejected",
+                "verdict": Verdict.REJECTED,
                 "sharpe_ratio": best_fail_sharpe,
                 "total_return_pct": -999,
                 "max_drawdown_pct": -999,
@@ -1475,7 +1491,7 @@ def run_loop(num_iterations=3):
             knowledge.setdefault("errors", []).append(record)
             if len(knowledge["errors"]) > 100:
                 knowledge["errors"] = knowledge["errors"][-100:]
-        elif verdict == "adopted":
+        elif verdict == Verdict.ADOPTED:
             record["cluster_id"] = evaluation.get("cluster_id", "unknown")
             knowledge["adopted"].append(record)
         else:
@@ -1543,21 +1559,21 @@ def run_revalidation(knowledge):
             error_type = result.get("error_type", "unknown")
             if error_type == "infra":
                 entry["verdict"] = "error"
-                entry["evaluation"] = {"verdict": "error", "error": result["error"],
+                entry["evaluation"] = {"verdict": Verdict.ERROR, "error": result["error"],
                                        "error_type": "infra",
                                        "reasons": [f"revalidation failed (infra): {result['error']}"],
                                        "gate_results": {}}
                 knowledge.setdefault("errors", []).append(entry)
             elif error_type == "code":
                 entry["verdict"] = "code_error"
-                entry["evaluation"] = {"verdict": "code_error", "error": result["error"],
+                entry["evaluation"] = {"verdict": Verdict.CODE_ERROR, "error": result["error"],
                                        "error_type": "code",
                                        "reasons": [f"revalidation failed (code): {result['error']}"],
                                        "gate_results": {}}
                 knowledge.setdefault("errors", []).append(entry)
             else:
                 entry["verdict"] = "rejected"
-                entry["evaluation"] = {"verdict": "rejected", "error": result["error"],
+                entry["evaluation"] = {"verdict": Verdict.REJECTED, "error": result["error"],
                                        "reasons": [f"revalidation_failed: {result['error']}"],
                                        "gate_results": {}}
                 knowledge["rejected"].append(entry)
@@ -1571,7 +1587,7 @@ def run_revalidation(knowledge):
             for reason in evaluation["reasons"]:
                 print(f"     {reason}")
 
-        if verdict == "adopted":
+        if verdict == Verdict.ADOPTED:
             entry["backtest_result"] = result
             entry["evaluation"] = evaluation
             entry["verdict"] = verdict
