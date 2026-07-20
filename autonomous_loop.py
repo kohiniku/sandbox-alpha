@@ -803,6 +803,141 @@ def _generate_with_llm_fallback(knowledge):
 
 
 # ---------------------------------------------------------------------------
+# Manifest evaluation helper (Phase 1 PR-G)
+# ---------------------------------------------------------------------------
+
+def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
+    """Evaluate manifest runner results using the same gates as evaluate_result.
+
+    The manifest runner already performs train/val/holdout splits internally,
+    so we apply gates directly to its returned metrics.  This avoids
+    re-interpreting walkforward/full-sample splits that don't exist here.
+
+    Returns (verdict, evaluation_dict) — same shape as evaluate_result.
+    """
+    # Note: runner_result is the FULL parsed runner response (includes metrics + n_days)
+    if "metrics" not in runner_result:
+        return "error", {
+            "verdict": "error",
+            "error": "Malformed runner response: missing 'metrics'",
+            "error_type": "infra",
+            "reasons": [f"🔧 Infra error (not counted as rejection): missing 'metrics' in runner response"],
+        }
+
+    metrics = runner_result["metrics"]
+    val_sharpe = metrics.get("val_sharpe", -999)
+    val_max_dd = metrics.get("val_max_drawdown_pct", -999)
+    val_return = metrics.get("val_total_return_pct", -999)
+    holdout_sharpe = metrics.get("holdout_sharpe", -999)
+    holdout_return = metrics.get("holdout_total_return_pct", -999)
+    T_val = runner_result.get("n_days", 252)
+
+    strategy = hypothesis["strategy"]
+    symbol = hypothesis["symbol"]
+
+    # N_family: count from families dict (updated by update_family_aggregates)
+    fam_key = _family_key(strategy, symbol)
+    families = knowledge.get("families", {})
+    N_family = families.get(fam_key, {}).get("n_trials", 0)
+    effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
+
+    reasons = []
+    gate_results = {}
+
+    # --- Gate (a): Validation gate ---
+    val_pass = (
+        val_sharpe >= effective_min_sharpe
+        and val_return > 0
+        and val_max_dd >= MAX_DRAWDOWN_LIMIT
+    )
+    gate_results["validation"] = val_pass
+
+    if val_sharpe >= effective_min_sharpe:
+        reasons.append(f"✅ Val Sharpe {val_sharpe:.2f} >= {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+    else:
+        reasons.append(f"❌ Val Sharpe {val_sharpe:.2f} < {effective_min_sharpe:.2f} (deflated, N={N_family}, T={T_val})")
+
+    if val_return > 0:
+        reasons.append(f"✅ Val Return {val_return:.1f}% > 0%")
+    else:
+        reasons.append(f"❌ Val Return {val_return:.1f}% <= 0%")
+
+    if val_max_dd >= MAX_DRAWDOWN_LIMIT:
+        reasons.append(f"✅ Val Drawdown {val_max_dd:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
+    else:
+        reasons.append(f"❌ Val Drawdown {val_max_dd:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+
+    if not val_pass:
+        evaluation = {
+            "verdict": "rejected",
+            "sharpe_ratio": val_sharpe,
+            "total_return_pct": val_return,
+            "max_drawdown_pct": val_max_dd,
+            "reasons": reasons,
+            "gate_results": gate_results,
+            "effective_min_sharpe": round(effective_min_sharpe, 4),
+        }
+        return "rejected", evaluation
+
+    # --- Gate (b): Deflation gate (informational — embedded in (a)) ---
+    reasons.append(f"📐 Deflated threshold: {effective_min_sharpe:.2f} (base={MIN_SHARPE_BASE}, N_family={N_family}, T_val={T_val})")
+    gate_results["deflation"] = True
+
+    # --- Gate (c): Holdout confirmation ---
+    holdout_threshold = min(0.5, 0.5 * val_sharpe)
+    holdout_pass = (holdout_sharpe >= holdout_threshold) and (holdout_return > 0)
+    gate_results["holdout"] = holdout_pass
+
+    if holdout_sharpe >= holdout_threshold:
+        reasons.append(f"✅ Holdout Sharpe {holdout_sharpe:.2f} >= {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
+    else:
+        reasons.append(f"❌ Holdout Sharpe {holdout_sharpe:.2f} < {holdout_threshold:.2f} (threshold=min(0.5, 0.5*val))")
+
+    if holdout_return > 0:
+        reasons.append(f"✅ Holdout Return {holdout_return:.1f}% > 0")
+    else:
+        reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
+
+    if not holdout_pass:
+        evaluation = {
+            "verdict": "rejected",
+            "sharpe_ratio": val_sharpe,
+            "total_return_pct": val_return,
+            "max_drawdown_pct": val_max_dd,
+            "holdout_sharpe": holdout_sharpe,
+            "holdout_return_pct": holdout_return,
+            "reasons": reasons,
+            "gate_results": gate_results,
+            "effective_min_sharpe": round(effective_min_sharpe, 4),
+        }
+        return "rejected", evaluation
+
+    # No cluster dedup for manifest entries — each manifest name / universe
+    # pair is a unique cluster by construction.
+    gate_results["cluster"] = "new"
+
+    # All gates passed
+    reasons.insert(0, "🏆 ALL GATES PASSED")
+    evaluation = {
+        "verdict": "adopted",
+        "sharpe_ratio": val_sharpe,
+        "total_return_pct": val_return,
+        "max_drawdown_pct": val_max_dd,
+        "holdout_sharpe": holdout_sharpe,
+        "holdout_return_pct": holdout_return,
+        "reasons": reasons,
+        "gate_results": gate_results,
+        "effective_min_sharpe": round(effective_min_sharpe, 4),
+    }
+
+    # Attach expert_extras if present
+    if runner_result.get("expert_extras"):
+        evaluation["expert_extras"] = runner_result["expert_extras"]
+
+    return "adopted", evaluation
+
+
+# ---------------------------------------------------------------------------
 # Backlog consumption helpers
 # ---------------------------------------------------------------------------
 
@@ -890,6 +1025,14 @@ def _consume_backlog_entry(knowledge):
     # Log
     if etype == "param":
         tag = f"[param] {spec['strategy']} on {spec['symbol']}"
+    elif etype == "manifest":
+        manifest_name = spec.get("name", "?")
+        universe_size = 0
+        for ds in spec.get("data_sources", []):
+            if ds.get("type") == "ohlcv" and ds.get("universe"):
+                universe_size = len(ds["universe"])
+                break
+        tag = f"[manifest] {manifest_name} on {universe_size} symbols"
     else:
         tag = f"[code] {spec.get('name', '?')} on {spec['symbol']}"
     print(f"📥 バックログ消化: {tag} (priority {priority}, source {source_info.get('kind', '?')}:{source_info.get('ref', '?')})")
@@ -901,12 +1044,88 @@ def _consume_backlog_entry(knowledge):
 
     # ── Route by type ──
     if etype == "manifest":
-        # v1 consumer does NOT understand 'manifest' type yet.
-        # Phase 1 PR-G will teach autonomous_loop to dispatch manifest entries via /run_manifest.
-        print(f"⚠️  Manifest entry {entry['id']} (v1 consumer): type='manifest' not yet supported. "
-              f"Skipping — will be consumed by Phase 1 PR-G.", file=sys.stderr)
-        bl.mark(entry["id"], "pending")  # return to queue for future consumer
-        return None
+        # Manifest entry: POST to /run_manifest (Phase 1 PR-G)
+        if not runner_url:
+            print(f"  ⚠️ SANDBOX_RUNNER_URL未設定 — マニフェストエントリをpendingに戻します")
+            bl.mark(entry["id"], "pending")
+            return None
+
+        manifest_spec = spec  # full manifest dict from ideation (manifest.to_dict())
+        manifest_name = manifest_spec.get("name", "unknown")
+
+        # Extract universe from data_sources
+        universe = []
+        for ds in manifest_spec.get("data_sources", []):
+            if ds.get("type") == "ohlcv" and ds.get("universe"):
+                universe = ds["universe"]
+                break
+        sorted_universe = sorted(universe)
+        universe_hash = hashlib.sha256(
+            json.dumps(sorted_universe, sort_keys=True).encode()
+        ).hexdigest()[:8]
+
+        execution_mode = manifest_spec.get("execution_mode", "structured")
+
+        hypothesis = {
+            "id": f"bl_{entry['id'][:12]}",
+            "strategy": f"manifest:{manifest_name}",
+            "symbol": f"universe:{universe_hash}",
+            "params": {
+                "universe_size": len(universe),
+                "execution_mode": execution_mode,
+                "primary_metric": "sharpe",
+            },
+            "description": f"Backlog manifest: {manifest_name} on {len(universe)} symbols [{execution_mode}]",
+            "generated_at": datetime.now().isoformat(),
+        }
+
+        # POST to /run_manifest
+        url = f"{runner_url.rstrip('/')}/run_manifest"
+        body = json.dumps(manifest_spec).encode("utf-8")
+
+        print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {len(universe)} symbols...")
+
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                response_body = resp.read().decode("utf-8")
+                status = resp.status
+            if status != 200:
+                result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
+                          "error_type": "infra"}
+            else:
+                parsed = json.loads(response_body)
+                if not isinstance(parsed, dict):
+                    result = {"error": "Malformed runner response (not a dict)", "error_type": "infra"}
+                elif parsed.get("status") == "error":
+                    err_type = parsed.get("error_type", "")
+                    if err_type == "manifest":
+                        # Manifest validation failure → agent's fault → code_error
+                        result = {"error": parsed.get("error", "manifest validation failed"),
+                                  "error_type": "code"}
+                    else:
+                        result = {"error": parsed.get("error", "runner reported error"),
+                                  "error_type": "infra"}
+                elif parsed.get("status") == "ok":
+                    result = parsed
+                else:
+                    result = {"error": f"Malformed runner response: unknown status '{parsed.get('status', 'missing')}'",
+                              "error_type": "infra"}
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")[:500]
+            except Exception:
+                pass
+            result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
+        except urllib.error.URLError as e:
+            result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
+        except json.JSONDecodeError as e:
+            result = {"error": f"Sandbox runner JSON parse error: {e}", "error_type": "infra"}
+        except Exception as e:
+            result = {"error": f"Sandbox runner error: {e}", "error_type": "infra"}
     elif etype == "param":
         # Param entry: use existing sandbox backtest path
         hypothesis = {
@@ -998,7 +1217,12 @@ def _consume_backlog_entry(knowledge):
         return None
 
     # ── Evaluate ──
-    verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
+    if etype == "manifest" and isinstance(result, dict) and result.get("status") == "ok":
+        # Manifest runner already did train/val/holdout splits internally.
+        # Use the dedicated manifest evaluator that reads its metrics directly.
+        verdict, evaluation = _evaluate_manifest_result(result, hypothesis, knowledge)
+    else:
+        verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
 
     # ── Extra criteria ──
     if verdict == "adopted" and extra_criteria:
