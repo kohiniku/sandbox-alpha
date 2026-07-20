@@ -1,4 +1,3 @@
-from autonomous_loop import MISSING_METRIC
 #!/usr/bin/env python3
 """
 Sandbox Alpha 結果レポート生成モジュール
@@ -13,6 +12,8 @@ import json
 import sys
 from collections import defaultdict
 from datetime import datetime
+
+from loop_constants import MISSING_METRIC
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent

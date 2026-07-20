@@ -1,4 +1,3 @@
-from autonomous_loop import MISSING_METRIC
 #!/usr/bin/env python3
 """
 LLM-driven hypothesis generation for sandbox-alpha.
@@ -18,6 +17,8 @@ import random
 import urllib.request
 import urllib.error
 from datetime import datetime
+
+from loop_constants import MISSING_METRIC
 
 # ---------------------------------------------------------------------------
 # Config helpers

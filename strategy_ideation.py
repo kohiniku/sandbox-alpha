@@ -38,7 +38,9 @@ from llm_hypothesis import _http_post_json as _post_json
 from llm_hypothesis import _SYMBOL_RE
 
 # Import STRATEGY_TEMPLATES from autonomous_loop (read-only)
-from autonomous_loop import STRATEGY_TEMPLATES, MISSING_METRIC
+from autonomous_loop import STRATEGY_TEMPLATES
+
+from loop_constants import MISSING_METRIC
 
 # Import manifest module (Phase 0 PR-A)
 from manifest import StrategyManifest, ManifestValidationError, VALID_METRICS

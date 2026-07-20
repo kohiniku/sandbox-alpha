@@ -1,4 +1,3 @@
-from autonomous_loop import BacklogStatus
 #!/usr/bin/env python3
 """
 JSON-file-backed priority queue for strategy ideation proposals.
@@ -9,6 +8,8 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+
+from loop_constants import BacklogStatus
 
 # ---------------------------------------------------------------------------
 # Schema helpers

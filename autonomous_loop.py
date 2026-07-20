@@ -67,26 +67,7 @@ STRATEGY_TEMPLATES = {
 MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
 MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
 
-# --- Sentinel for missing/absent metrics ---
-MISSING_METRIC = -999  # flows into gates so missing data always fails
-
-
-# --- Verdict and backlog-status string constants ---
-class Verdict:
-    """Evaluation verdict tags — must match JSON/Cron contract exactly."""
-    ADOPTED = 'adopted'
-    REJECTED = 'rejected'
-    ERROR = 'error'
-    CODE_ERROR = 'code_error'
-
-
-class BacklogStatus:
-    """Backlog entry lifecycle states — must match Backlog class contract."""
-    PENDING = 'pending'
-    TESTING = 'testing'
-    DONE_ADOPTED = 'done_adopted'
-    DONE_REJECTED = 'done_rejected'
-    DONE_ERROR = 'done_error'
+from loop_constants import MISSING_METRIC, Verdict, BacklogStatus
 
 
 def compute_effective_min_sharpe(N_family, T_val):
