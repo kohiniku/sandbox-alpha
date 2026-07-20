@@ -524,6 +524,35 @@ def _call_llm(messages, max_tokens=4096, temperature=0.7, model=None, response_j
     return content
 
 
+def _call_llm_retry_get(messages, key, *, stage="LLM", max_tokens=8192,
+                         attempts=3, model=None):
+    """Call _call_llm with retries, extract a list-shaped ``key`` from the
+    response, and raise if all attempts fail. Used by debate stages where
+    a single flaky JSON response shouldn't collapse the whole pipeline.
+
+    Progressive token budget + lower temperature per attempt.
+    """
+    configs = [
+        {"max_tokens": max_tokens, "temperature": 0.7},
+        {"max_tokens": int(max_tokens * 1.5), "temperature": 0.4},
+        {"max_tokens": max_tokens * 2, "temperature": 0.2},
+    ][:attempts]
+    last_err = None
+    for i, cfg in enumerate(configs):
+        try:
+            response = _call_llm(messages, model=model, **cfg)
+            value = response.get(key, [])
+            if isinstance(value, list) and value:
+                return value
+            last_err = f"empty or invalid '{key}' list"
+        except Exception as e:
+            last_err = str(e)
+        if i < len(configs) - 1:
+            print(f"⚠️  {stage} retry ({i+1}/{len(configs)}): {last_err}",
+                  file=sys.stderr)
+    raise ValueError(f"{stage} failed after {len(configs)} attempts: {last_err}")
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -826,14 +855,32 @@ def _stage_brainstorm(knowledge, templates, research_docs):
 
     Returns list of raw idea dicts: [{name, type, family, one_line_rationale}, ...]
     Raises on failure (caught by caller for fallback).
+
+    Retry policy: 3 attempts with progressively larger token budget and
+    lower temperature. High temperature (1.0) sometimes emits malformed
+    JSON (unterminated strings, stray commas); the second/third retries
+    trade some diversity for reliability rather than collapsing to v2.
     """
     model = os.environ.get("HYPO_LLM_MODEL_BRAINSTORM", "deepseek-v4-flash")
     messages = _build_brainstorm_prompt(knowledge, templates, research_docs)
-    response = _call_llm(messages, max_tokens=4096, temperature=1.0, model=model)
-    ideas = response.get("ideas", [])
-    if not isinstance(ideas, list) or not ideas:
-        raise ValueError("Brainstorm returned empty or invalid ideas list")
-    return ideas
+    attempts_cfg = [
+        {"max_tokens": 4096, "temperature": 1.0},
+        {"max_tokens": 6144, "temperature": 0.7},
+        {"max_tokens": 8192, "temperature": 0.4},
+    ]
+    last_err = None
+    for attempt, cfg in enumerate(attempts_cfg):
+        try:
+            response = _call_llm(messages, model=model, **cfg)
+            ideas = response.get("ideas", [])
+            if isinstance(ideas, list) and ideas:
+                return ideas
+            last_err = "empty or invalid ideas list"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < len(attempts_cfg) - 1:
+            print(f"⚠️  Stage 1 brainstorm retry ({attempt+1}/{len(attempts_cfg)}): {last_err}", file=sys.stderr)
+    raise ValueError(f"brainstorm failed after {len(attempts_cfg)} attempts: {last_err}")
 
 
 def _stage_debate(ideas):
@@ -876,8 +923,8 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. You are a skeptical risk manager."},
         {"role": "user", "content": risk_prompt},
     ]
-    risk_response = _call_llm(risk_messages, max_tokens=8192)
-    risk_report = risk_response.get("risk_report", [])
+    risk_report = _call_llm_retry_get(risk_messages, "risk_report",
+                                       stage="Stage 2a risk", max_tokens=8192)
 
     # --- Quant Researcher ---
     quant_prompt = f"""You are a QUANTITATIVE RESEARCHER defending trading-strategy ideas.
@@ -902,8 +949,8 @@ Return ONLY this JSON:
         {"role": "system", "content": "You output ONLY valid JSON. You are a constructive quant researcher."},
         {"role": "user", "content": quant_prompt},
     ]
-    quant_response = _call_llm(quant_messages, max_tokens=8192)
-    quant_report = quant_response.get("quant_report", [])
+    quant_report = _call_llm_retry_get(quant_messages, "quant_report",
+                                        stage="Stage 2b quant", max_tokens=8192)
 
     # --- Build per-idea context for judge ---
     risk_by_idx = {r.get("index"): r.get("attack", "") for r in risk_report if isinstance(r, dict)}
