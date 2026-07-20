@@ -22,7 +22,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -401,26 +401,35 @@ Return ONLY this exact JSON schema (no markdown, no commentary):
 # LLM call
 # ---------------------------------------------------------------------------
 
-def _call_llm(messages, max_tokens=4096):
+def _call_llm(messages, max_tokens=4096, temperature=0.7, model=None, response_json=True):
     """Call the OpenAI-compatible chat completions endpoint.
 
     Returns the parsed JSON content. Raises on HTTP/parse errors.
     Hook point for test mocking — tests can patch this function.
+
+    Args:
+        messages: list of chat messages
+        max_tokens: max output tokens
+        temperature: sampling temperature (0.0–2.0)
+        model: override model name (defaults to HYPO_LLM_MODEL)
+        response_json: if True, request json_object format and parse JSON
     """
     cfg = _get_llm_config()
+    payload = {
+        "model": model or cfg["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if response_json:
+        payload["response_format"] = {"type": "json_object"}
     body = _post_json(
         f"{cfg['base_url'].rstrip('/')}/chat/completions",
         headers={
             "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type": "application/json",
         },
-        payload={
-            "model": cfg["model"],
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        },
+        payload=payload,
         timeout=60,
     )
     content = body["choices"][0]["message"]["content"].strip()
@@ -429,7 +438,9 @@ def _call_llm(messages, max_tokens=4096):
         content = content.split("\n", 1)[-1]
         if content.endswith("```"):
             content = content[:-3].strip()
-    return json.loads(content)
+    if response_json:
+        return json.loads(content)
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -623,11 +634,493 @@ Remember the INTERFACE CONTRACT:
 
 
 # ---------------------------------------------------------------------------
+# IDEATION V2 — 3-stage multi-agent pipeline
+# ---------------------------------------------------------------------------
+
+_IDEATION_LOG_DIR = BASE_DIR / "ideation_logs"
+
+
+def _build_brainstorm_prompt(knowledge, templates, research_docs):
+    """Build compact context for the brainstorm stage."""
+    # Family aggregates (compact)
+    families = knowledge.get("families", {})
+    family_lines = []
+    for key, fam in sorted(families.items()):
+        n = fam.get("n_trials", 0)
+        best = fam.get("best_val_sharpe", -999)
+        family_lines.append(f"  {key}: {n} trials, best sharpe={best:.2f}")
+
+    # Near-misses
+    near_misses = knowledge.get("near_misses", [])
+    nm_lines = []
+    for nm in near_misses[-15:]:
+        s = nm.get("strategy", "?")
+        sym = nm.get("symbol", "?")
+        p = json.dumps(nm.get("params", {}))
+        nm_lines.append(f"  {s}/{sym} params={p} — {nm.get('failed_gate', '?')}")
+
+    # Recent code errors
+    errors = knowledge.get("errors", [])
+    code_errs = [e for e in errors if e.get("evaluation", {}).get("error_type") == "code"]
+    ce_lines = []
+    for ce in code_errs[-5:]:
+        h = ce.get("hypothesis", {})
+        ce_lines.append(f"  {h.get('description', '?')} — {ce.get('evaluation', {}).get('error', '?')[:120]}")
+
+    # Research docs (compact)
+    research_text = ""
+    if research_docs:
+        chunks = [body for _, body in research_docs]
+        research_text = "\n\n---\n\n".join(chunks)
+
+    # Mandates
+    n_novel = sum(1 for fam in families.values() if fam.get("n_trials", 0) < 3)
+    has_near_misses = len(near_misses) >= 2
+
+    mandates = []
+    if n_novel > 0:
+        mandates.append(
+            f"MANDATE: At least ONE idea must target families with <3 trials "
+            f"(currently {n_novel} such families: "
+            + ", ".join(k for k, f in families.items() if f.get("n_trials", 0) < 3)
+            + ")"
+        )
+    if has_near_misses:
+        mandates.append(
+            "MANDATE: At least ONE idea must RECOMBINE two near-miss directions "
+            "(e.g. apply pattern from one to the symbol/regime of another)"
+        )
+
+    mandates_text = "\n".join(mandates) if mandates else ""
+
+    prompt = f"""You are a creative quantitative researcher brainstorming trading-strategy candidates.
+
+=== FAMILIES ===
+{chr(10).join(family_lines) if family_lines else "(no family data)"}
+
+=== NEAR-MISS ARCHIVE ===
+{chr(10).join(nm_lines) if nm_lines else "(no near-misses)"}
+
+=== RECENT CODE ERRORS ===
+{chr(10).join(ce_lines) if ce_lines else "(no recent code errors)"}
+
+=== RESEARCH ===
+{research_text or "(no research documents)"}
+
+=== MANDATES ===
+{mandates_text}
+
+=== YOUR TASK ===
+Brainstorm 10-15 SHORT raw ideas. Each idea: a trading-strategy seed — creative, diverse,
+not a full proposal, just a direction. Favor novelty and edge-case regimes.
+
+{chr(10).join(templates.keys())}
+
+Return ONLY this JSON:
+{{"ideas": [{{"name": "idea label", "type": "param|code", "family": "strategy|symbol", "one_line_rationale": "why this could work, one sentence"}}]}}"""
+
+    return [
+        {"role": "system", "content": "You output ONLY valid JSON. No markdown, no commentary. Be creative and diverse."},
+        {"role": "user", "content": prompt},
+    ]
+
+
+def _stage_brainstorm(knowledge, templates, research_docs):
+    """Stage 1 — Divergent brainstorming with high temperature.
+
+    Returns list of raw idea dicts: [{name, type, family, one_line_rationale}, ...]
+    Raises on failure (caught by caller for fallback).
+    """
+    model = os.environ.get("HYPO_LLM_MODEL_BRAINSTORM", "deepseek-v4-flash")
+    messages = _build_brainstorm_prompt(knowledge, templates, research_docs)
+    response = _call_llm(messages, max_tokens=4096, temperature=1.0, model=model)
+    ideas = response.get("ideas", [])
+    if not isinstance(ideas, list) or not ideas:
+        raise ValueError("Brainstorm returned empty or invalid ideas list")
+    return ideas
+
+
+def _stage_debate(ideas):
+    """Stage 2 — Adversarial debate: Risk Manager attacks, Quant Researcher defends.
+
+    Returns list of per-idea results: [{index, survive: bool, attack, rebuttal, reason}]
+
+    Two persona calls over the full brainstorm list.
+    """
+    ideas_text = "\n".join(
+        f"{i}: [{idea.get('type','?')}] {idea.get('name','?')} | family={idea.get('family','?')} "
+        f"| rationale: {idea.get('one_line_rationale','?')}"
+        for i, idea in enumerate(ideas)
+    )
+
+    # --- Risk Manager ---
+    risk_prompt = f"""You are a RISK MANAGER evaluating trading-strategy ideas for overfitting and
+implementation risk. Attack each idea below.
+
+For EACH idea, identify its WEAKNESSES:
+- Overfitting smell: is it too obvious, too narrow, data-mined?
+- Deflation cost: more trials in the same family → higher bar (mention family trial count)
+- Alpha decay: if this is a well-known anomaly, post-publication alpha may have already decayed
+- Implementability: can this work on daily OHLCV data with realistic assumptions?
+
+=== IDEAS ===
+{ideas_text}
+
+Return ONLY this JSON:
+{{"risk_report": [
+  {{"index": <int matching idea index>, "attack": "one sentence weakness summary"}}
+]}}"""
+
+    risk_messages = [
+        {"role": "system", "content": "You output ONLY valid JSON. You are a skeptical risk manager."},
+        {"role": "user", "content": risk_prompt},
+    ]
+    risk_response = _call_llm(risk_messages, max_tokens=4096)
+    risk_report = risk_response.get("risk_report", [])
+
+    # --- Quant Researcher ---
+    quant_prompt = f"""You are a QUANTITATIVE RESEARCHER defending trading-strategy ideas.
+For EACH idea below (including the risk manager's attack), provide a DEFENSE:
+
+- Economic rationale: what structural market behavior does this exploit?
+- Related literature: any known academic or industry work that supports this direction?
+- Variation: what adaptation would address the attack?
+
+=== IDEAS ===
+{ideas_text}
+
+=== RISK MANAGER ATTACKS ===
+{json.dumps(risk_report, indent=2)}
+
+Return ONLY this JSON:
+{{"quant_report": [
+  {{"index": <int matching idea index>, "rebuttal": "one sentence defense/support", "variation": "what change would fix the weakness"}}
+]}}"""
+
+    quant_messages = [
+        {"role": "system", "content": "You output ONLY valid JSON. You are a constructive quant researcher."},
+        {"role": "user", "content": quant_prompt},
+    ]
+    quant_response = _call_llm(quant_messages, max_tokens=4096)
+    quant_report = quant_response.get("quant_report", [])
+
+    # --- Merge ---
+    risk_by_idx = {r.get("index"): r.get("attack", "") for r in risk_report if isinstance(r, dict)}
+    quant_by_idx = {q.get("index"): (q.get("rebuttal", ""), q.get("variation", ""))
+                    for q in quant_report if isinstance(q, dict)}
+
+    results = []
+    for i in range(len(ideas)):
+        attack = risk_by_idx.get(i, "")
+        rebuttal, variation = quant_by_idx.get(i, ("", ""))
+
+        # Kill signals in attack: overfit, exhausted, unimplementable
+        attack_lower = attack.lower()
+        kill_signals = [
+            "overfit" in attack_lower,
+            "post-publication" in attack_lower and "decayed" in attack_lower,
+            "unimplementable on daily" in attack_lower,
+        ]
+        survive = not any(kill_signals)
+        reason = f"attack: {attack[:200]} | rebuttal: {rebuttal[:200]}" if attack or rebuttal else "no debate"
+
+        results.append({
+            "index": i,
+            "survive": survive,
+            "attack": attack,
+            "rebuttal": rebuttal,
+            "variation": variation,
+            "reason": reason,
+        })
+
+    return results
+
+
+def _stage_select(surviving_ideas, debate_results, knowledge, templates, research_docs, max_proposals):
+    """Stage 3 — Convergent selection: rank by novelty × plausibility × implementability,
+    output full proposals in the existing format.
+
+    Returns list of full proposal dicts (in existing schema).
+    """
+    if not surviving_ideas:
+        return []
+
+    # Compact family summary for ranking context
+    families = knowledge.get("families", {})
+    family_summary = "\n".join(
+        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', -999):.2f}"
+        for k, f in sorted(families.items())
+    )
+
+    # Research docs compact
+    research_text = ""
+    if research_docs:
+        chunks = [body for _, body in research_docs]
+        research_text = "\n\n---\n\n".join(chunks)
+
+    # Enumerate surviving ideas with debate context
+    items = []
+    for r in debate_results:
+        idx = r["index"]
+        if r["survive"] and idx < len(surviving_ideas):
+            idea = surviving_ideas[idx]
+            items.append({
+                "idx": idx,
+                "idea": idea,
+                "attack": r.get("attack", ""),
+                "rebuttal": r.get("rebuttal", ""),
+                "variation": r.get("variation", ""),
+            })
+
+    items_text = "\n".join(
+        f"{i}: [{item['idea'].get('type','?')}] {item['idea'].get('name','?')} "
+        f"| rationale: {item['idea'].get('one_line_rationale','?')} "
+        f"| attack: {item['attack'][:150]} | rebuttal: {item['rebuttal'][:150]}"
+        for i, item in enumerate(items)
+    )
+
+    avail_strats = "\n".join(
+        f"  {name}: {tmpl['description']} | params: {json.dumps({k: str(v) for k, v in tmpl['param_space'].items()})}"
+        for name, tmpl in templates.items()
+    )
+
+    select_prompt = f"""You are a quantitative researcher finalizing trading-strategy proposals.
+
+From the surviving ideas below, select and rank the top {max_proposals} by:
+  novelty × plausibility × implementability
+
+For each selected idea, produce a FULL proposal in the existing schema.
+
+=== AVAILABLE STRATEGY TEMPLATES (param spaces) ===
+{avail_strats}
+
+=== FAMILY AGGREGATES ===
+{family_summary}
+
+=== RESEARCH ===
+{research_text or "(no research documents)"}
+
+=== SURVIVING IDEAS (after debate) ===
+{items_text}
+
+=== YOUR TASK ===
+Select and rank up to {max_proposals} ideas. For each, output a full proposal:
+- type: "param" or "code"
+- priority: 0.0–1.0
+- source: {{kind: "idea", ref: "<idea name>"}} or {{kind: "paper", ref: "<research file>"}}
+- spec: full type-appropriate spec (for param: strategy/symbol/params; for code: name/description/code/symbol)
+- eval_plan: {{extra_criteria: []}}
+
+Favor NOVEL families (low n_trials) and implementations that survived strong attacks.
+For code-type: include a COMPLETE `def generate_signals(df):` function.
+Interface contract: df has DatetimeIndex, columns Open/High/Low/Close/Volume (capitalized),
+NO 'Date' column, return pd.Series({-1,0,1}) aligned to df.index.
+
+Return ONLY this JSON:
+{_PROPOSAL_JSON_SCHEMA}"""
+
+    select_messages = [
+        {"role": "system", "content": "You output ONLY valid JSON. No markdown."},
+        {"role": "user", "content": select_prompt},
+    ]
+    response = _call_llm(select_messages, max_tokens=4096)
+    return response.get("proposals", [])
+
+
+def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, selection_reasoning, final_proposals):
+    """Save full audit trail to ideation_logs/<UTC timestamp>.json."""
+    _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = _IDEATION_LOG_DIR / f"{timestamp}.json"
+
+    log = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "stage1_brainstorm": {
+            "n_ideas": len(brainstorm_ideas),
+            "ideas": brainstorm_ideas,
+        },
+        "stage2_debate": {
+            "risk_report": risk_report,
+            "quant_report": quant_report,
+        },
+        "stage3_selection": {
+            "reasoning": selection_reasoning,
+            "n_proposed": len(final_proposals),
+        },
+        "final_proposals": final_proposals,
+    }
+
+    _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps(log, indent=2, default=str, ensure_ascii=False))
+
+
+def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals, dry_run):
+    """Execute the 3-stage multi-agent ideation pipeline.
+
+    Any stage failure → fall back to single-call path.
+    """
+    from backlog import Backlog
+
+    brainstorm_ideas = []
+    debate_results = []
+    proposals = []
+
+    # ── Stage 1: Brainstorm ──
+    try:
+        print("🧠 IDEATION_V2 Stage 1: Brainstorm (divergent, high-temp)...")
+        brainstorm_ideas = _stage_brainstorm(knowledge, templates, research_docs)
+        print(f"   📥 {len(brainstorm_ideas)} raw ideas generated")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V2 brainstorm failed: {e} — falling back to single-call path", file=sys.stderr)
+        return None  # signal fallback
+
+    # ── Stage 2: Debate ──
+    try:
+        print("⚔️  IDEATION_V2 Stage 2: Debate (Risk Manager + Quant Researcher)...")
+        debate_results = _stage_debate(brainstorm_ideas)
+        n_survived = sum(1 for r in debate_results if r.get("survive"))
+        print(f"   ✅ {n_survived}/{len(brainstorm_ideas)} ideas survived debate")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V2 debate failed: {e} — falling back to single-call path", file=sys.stderr)
+        return None
+
+    # ── Stage 3: Select ──
+    try:
+        print("🎯 IDEATION_V2 Stage 3: Select (ranking + proposal generation)...")
+        # Build surviving ideas list (keep original ideas for reference)
+        surviving = brainstorm_ideas  # pass all; _stage_select filters by debate survive flag
+        proposals = _stage_select(surviving, debate_results, knowledge, templates, research_docs, max_proposals)
+        print(f"   📝 {len(proposals)} full proposals generated")
+    except Exception as e:
+        print(f"⚠️  IDEATION_V2 select failed: {e} — falling back to single-call path", file=sys.stderr)
+        return None
+
+    # ── Map proposals through validation + preflight (same as v1) ──
+    accepted = []
+    pf_passed = 0
+    pf_fixed = 0
+    pf_dropped = 0
+    pf_skipped = 0
+
+    for i, p in enumerate(proposals):
+        ok, reason = _validate_proposal(p, templates)
+        if not ok:
+            print(f"  ⚠️  Proposal {i+1} dropped: {reason}")
+            continue
+
+        ptype = p["type"]
+
+        if ptype == "code":
+            code = p["spec"].get("code", "")
+            spec_context = f"{p['spec'].get('name', '?')}/{p['spec'].get('symbol', '?')}"
+            valid, error_msg, tb_str = _preflight_validate(code)
+
+            if valid is None:
+                pf_skipped += 1
+                print(f"  ⏭️  Proposal {i+1} ({spec_context}): preflight skipped (runner unavailable)")
+            elif valid:
+                pf_passed += 1
+                print(f"  ✅ Preflight passed for Proposal {i+1} ({spec_context})")
+            else:
+                fixed = False
+                for attempt in range(_MAX_PREFLIGHT_FIX_ATTEMPTS):
+                    print(f"  🔄 Proposal {i+1} ({spec_context}): preflight failed, fix attempt {attempt+1}/{_MAX_PREFLIGHT_FIX_ATTEMPTS}")
+                    fixed_code = _preflight_fix_attempt(code, error_msg, tb_str, spec_context)
+                    if fixed_code is None:
+                        print(f"  ⚠️  Fix attempt {attempt+1}: LLM did not return valid code")
+                        continue
+                    valid2, error_msg2, tb_str2 = _preflight_validate(fixed_code)
+                    if valid2 is None:
+                        pf_skipped += 1
+                        p["spec"]["code"] = fixed_code
+                        fixed = True
+                        pf_fixed += 1
+                        print(f"  ⏭️  Proposal {i+1}: runner unavailable on re-validate, accepting with warning")
+                        break
+                    elif valid2:
+                        p["spec"]["code"] = fixed_code
+                        fixed = True
+                        pf_fixed += 1
+                        print(f"  ✅ Proposal {i+1} ({spec_context}): fixed on attempt {attempt+1}")
+                        break
+                    else:
+                        error_msg = error_msg2
+                        tb_str = tb_str2
+                        print(f"  ❌ Fix attempt {attempt+1} still failing: {error_msg}")
+
+                if not fixed:
+                    pf_dropped += 1
+                    print(f"  🚫 Proposal {i+1} ({spec_context}): DROPPED — preflight failed after {_MAX_PREFLIGHT_FIX_ATTEMPTS} fix attempts")
+                    print(f"     Last error: {error_msg}")
+                    continue
+
+        entry = {
+            "id": p.get("id", ""),
+            "type": ptype,
+            "status": "pending",
+            "priority": float(p["priority"]),
+            "created_at": None,
+            "source": p["source"],
+            "spec": p["spec"],
+            "eval_plan": p.get("eval_plan", {"extra_criteria": []}),
+            "result": None,
+        }
+
+        if dry_run:
+            entry["id"] = f"dry_{i}"
+            accepted.append(entry)
+            spec = entry["spec"]
+            if ptype == "param":
+                desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
+            else:
+                desc = f"{spec.get('name','?')}/{spec.get('symbol','?')}"
+            print(f"  [DRY-RUN] {ptype} | {desc} | priority={entry['priority']:.2f} | src={entry['source']['ref']}")
+        else:
+            ok_add, result_id = backlog.add_entry(entry)
+            if ok_add:
+                accepted.append(entry)
+                entry["id"] = result_id
+                spec = entry["spec"]
+                if ptype == "param":
+                    desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
+                else:
+                    desc = f"{spec.get('name','?')}/{spec.get('symbol','?')}"
+                print(f"  ✅ {ptype} | {desc} | priority={entry['priority']:.2f} | src={entry['source']['ref']}")
+            else:
+                print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
+
+    # ── Observability ──
+    n_survived = sum(1 for r in debate_results if r.get("survive"))
+    risk_report = [{"index": r["index"], "attack": r["attack"]} for r in debate_results]
+    quant_report = [{"index": r["index"], "rebuttal": r["rebuttal"], "variation": r["variation"]}
+                    for r in debate_results]
+    try:
+        _save_ideation_log(brainstorm_ideas, risk_report, quant_report,
+                          f"Selected {len(proposals)} from {n_survived} survivors", proposals)
+    except Exception as e:
+        print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
+
+    # ── Summary ──
+    n_survived = sum(1 for r in debate_results if r.get("survive"))
+    n_accepted = len(accepted)
+    print(f"IDEATION_V2 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={n_accepted}")
+    n_code = sum(1 for p in proposals if p.get("type") == "code")
+    if n_code > 0:
+        print(f"PREFLIGHT passed={pf_passed} fixed={pf_fixed} dropped={pf_dropped} skipped={pf_skipped}")
+    return [e["id"] for e in accepted]
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run(max_proposals=5, dry_run=False):
-    """Execute the full ideation pipeline. Returns list of added entry IDs."""
+    """Execute the full ideation pipeline. Returns list of added entry IDs.
+
+    When IDEATION_V2 env is not "0", uses the 3-stage multi-agent pipeline
+    (Brainstorm → Debate → Select) with fallback to the single-call v1 path
+    on any stage failure.
+    """
     from backlog import Backlog
 
     # ── (a) Gather context ──
@@ -640,7 +1133,20 @@ def run(max_proposals=5, dry_run=False):
     for fname, _ in research_docs:
         print(f"   - {fname}")
 
-    # ── (b) LLM call ──
+    # ── (b) Try IDEATION_V2 pipeline ──
+    use_v2 = os.environ.get("IDEATION_V2", "1") != "0"
+    if use_v2:
+        print("🔄 IDEATION_V2 enabled — attempting 3-stage multi-agent pipeline...")
+        try:
+            v2_result = _run_ideation_v2(knowledge, STRATEGY_TEMPLATES, research_docs, backlog, max_proposals, dry_run)
+            if v2_result is not None:
+                return v2_result
+            # else: fall through to v1
+        except Exception as e:
+            print(f"⚠️  IDEATION_V2 pipeline error: {e} — falling back to single-call path", file=sys.stderr)
+
+    # ── (c) V1 fallback: single-call LLM ──
+    print("📋 Using single-call ideation path (v1 fallback)")
     messages = _build_prompt(knowledge, STRATEGY_TEMPLATES, research_docs, backlog_summary, max_proposals)
     print(f"🧠 Calling LLM ({_get_llm_config()['model']}) for up to {max_proposals} proposals...")
 
