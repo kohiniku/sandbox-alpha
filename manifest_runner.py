@@ -66,14 +66,14 @@ def main():
 
     universe = []
     for ds in manifest.data_sources:
-        if getattr(ds, "type", None) == "ohlcv":
+        if getattr(ds, "source_type", None) == "ohlcv":
             universe.extend(getattr(ds, "universe", []))
 
     print(json.dumps({
         "status": "scaffold",
         "manifest_name": manifest.name,
         "universe": universe,
-        "evaluator_type": manifest.evaluator.type,
+        "evaluator_type": manifest.evaluator.evaluator_type,
         "requested_metrics": list(manifest.evaluator.metrics),
         "note": "manifest execution stub — full execution lands after PR-C/D",
     }))
