@@ -21,9 +21,15 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+# Add repo root to sys.path so `python scripts/fetch_universe.py` works from
+# any cwd. Mirrors the pattern in scripts/characterize_gate_v2.py.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 # -- try/except dual-import pattern for flat-container safety
 try:
@@ -214,8 +220,16 @@ def main():
                     print(f"[{i}/{len(symbols)}] {sym} status=no_new_data rows={len(existing_df)} source={source}", file=sys.stderr)
                     cached += 1
             else:
-                print(f"[{i}/{len(symbols)}] {sym} status=failed rows=0 source=failed", file=sys.stderr)
-                failed += 1
+                # No new data returned by yfinance/Stooq. If we already have
+                # cached rows, treat as "no_new_data" (transient — EOD may not
+                # be posted yet, or requested window is empty). Only mark as
+                # true failure when we have zero cache to fall back on.
+                if len(existing_df) > 0:
+                    print(f"[{i}/{len(symbols)}] {sym} status=no_new_data rows={len(existing_df)} source=cached", file=sys.stderr)
+                    cached += 1
+                else:
+                    print(f"[{i}/{len(symbols)}] {sym} status=failed rows=0 source=failed", file=sys.stderr)
+                    failed += 1
         else:
             # Full fetch
             df = _fetch_yfinance(sym, start_date, end_date)
