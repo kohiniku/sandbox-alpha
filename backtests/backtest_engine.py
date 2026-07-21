@@ -77,7 +77,7 @@ def run_strategy_on_segment(df, strategy_fn, params):
 
 
 def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
-                 metrics_since=None):
+                 metrics_since=None, cv_folds=None, embargo_days=21):
     """
     Run full backtest with optional walk-forward validation.
     data_dir: if set, load cached CSV from this dir instead of calling yfinance.
@@ -154,6 +154,67 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
         "holdout": holdout_metrics,
         "walkforward": {"enabled": True, "train_ratio": 0.6, "val_ratio": 0.2, "holdout_ratio": 0.2},
     }
+    # --- CV folds (opt-in, additive — does NOT modify v1 output) ---
+    if cv_folds is not None:
+        from backtests.splitter import WalkForwardCV
+        cv = WalkForwardCV(
+            n_folds=cv_folds, embargo_days=embargo_days,
+            train_frac=0.6, val_frac=0.2,
+        )
+        folds = cv.split(df)
+
+        # Holdout: identical across folds — compute once
+        holdout_cv_df = folds[0][2]
+        holdout_cv_ret, holdout_cv_sig = run_strategy_on_segment(
+            holdout_cv_df, strategy_fn, params)
+        holdout_cv_net = apply_trading_cost(holdout_cv_ret, holdout_cv_sig)
+        holdout_cv_metrics = compute_split_metrics(
+            holdout_cv_net, holdout_cv_sig, len(holdout_cv_df))
+        holdout_cv_ret_list = [float(v) for v in holdout_cv_net.values]
+        holdout_cv_dates = [d.strftime('%Y-%m-%d') for d in holdout_cv_net.index]
+
+        cv_folds_data = []
+        for k, (train_cv_df, val_cv_df, _) in enumerate(folds):
+            # Train metrics
+            tr_ret, tr_sig = run_strategy_on_segment(
+                train_cv_df, strategy_fn, params)
+            tr_net = apply_trading_cost(tr_ret, tr_sig)
+            train_m = compute_split_metrics(tr_net, tr_sig, len(train_cv_df))
+
+            # Val metrics + raw net daily returns
+            vr_ret, vr_sig = run_strategy_on_segment(
+                val_cv_df, strategy_fn, params)
+            vr_net = apply_trading_cost(vr_ret, vr_sig)
+            val_m = compute_split_metrics(vr_net, vr_sig, len(val_cv_df))
+            val_ret_list = [float(v) for v in vr_net.values]
+            val_date_list = [d.strftime('%Y-%m-%d') for d in vr_net.index]
+
+            cv_folds_data.append({
+                "fold": k,
+                "n_train": len(train_cv_df),
+                "n_val": len(val_ret_list),
+                "train_metrics": train_m,
+                "val_metrics": val_m,
+                "val_daily_returns": val_ret_list,
+                "val_dates": val_date_list,
+            })
+
+        result["cv"] = {
+            "config": {
+                "n_folds": cv_folds,
+                "embargo_days": embargo_days,
+                "train_frac": 0.6,
+                "val_frac": 0.2,
+            },
+            "folds": cv_folds_data,
+            "holdout": {
+                "n_days": len(holdout_cv_ret_list),
+                "metrics": holdout_cv_metrics,
+                "daily_returns": holdout_cv_ret_list,
+                "dates": holdout_cv_dates,
+            },
+        }
+
     # Optional: compute metrics over rows with index >= metrics_since
     if metrics_since is not None:
         since_dt = pd.Timestamp(metrics_since, tz=df.index.tz if hasattr(df.index, 'tz') else None)
@@ -171,6 +232,21 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
 
 
 if __name__ == "__main__":
+
+    def _validate_cv_folds(value):
+        ivalue = int(value)
+        if ivalue < 2 or ivalue > 5:
+            raise argparse.ArgumentTypeError(
+                f"--cv-folds must be in [2, 5], got {ivalue}")
+        return ivalue
+
+    def _validate_embargo_days(value):
+        ivalue = int(value)
+        if ivalue < 0 or ivalue > 60:
+            raise argparse.ArgumentTypeError(
+                f"--embargo-days must be in [0, 60], got {ivalue}")
+        return ivalue
+
     parser = argparse.ArgumentParser(description="Backtest Engine")
     parser.add_argument("--strategy", default=None, help="Strategy name")
     parser.add_argument("--symbol", required=True, help="Ticker symbol")
@@ -194,6 +270,14 @@ if __name__ == "__main__":
         "--metrics-since", default=None,
         help="YYYY-MM-DD date: compute since_metrics over rows with index >= this date"
     )
+    parser.add_argument(
+        "--cv-folds", type=_validate_cv_folds, default=None,
+        help="Number of CV folds [2-5] for walk-forward CV (opt-in)"
+    )
+    parser.add_argument(
+        "--embargo-days", type=_validate_embargo_days, default=21,
+        help="Embargo gap in trading days between train and val [0-60] (default: 21)"
+    )
     args = parser.parse_args()
 
     # --- fetch-only mode: no strategy execution ---
@@ -216,5 +300,7 @@ if __name__ == "__main__":
         walkforward=walkforward,
         data_dir=args.data_dir,
         metrics_since=args.metrics_since,
+        cv_folds=args.cv_folds,
+        embargo_days=args.embargo_days,
     )
     print(json.dumps(result, indent=2, default=str))
