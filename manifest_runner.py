@@ -43,6 +43,28 @@ from data_adapters.insider import load_insider_trades
 from data_adapters.macro import load_macro
 from evaluators.dispatch import evaluate
 
+# Cross-sectional contract validators — dual-import for container flat-layout
+try:
+    from backtests.strategies.cross_sectional._contract import (
+        validate_weights,
+        validate_signals,
+        validate_scores,
+    )
+except ImportError:
+    try:
+        from cross_sectional._contract import (
+            validate_weights,
+            validate_signals,
+            validate_scores,
+        )
+    except ImportError:
+        # Validators are optional — only needed when generate_cross_signal is used.
+        # If the cross_sectional package isn't available (e.g. older container
+        # images), dispatch falls through gracefully.
+        validate_weights = None  # type: ignore[assignment]
+        validate_signals = None  # type: ignore[assignment]
+        validate_scores = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Allowed imports inside user code (sandbox)
@@ -427,6 +449,7 @@ def _run_structured_mode(
     benchmark_warning: Optional[str],
     news_df: Optional[pd.DataFrame] = None,
     sec13f_df: Optional[pd.DataFrame] = None,
+    extras_in: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Execute structured mode: generate_signals/generate_weights entrypoints."""
     
@@ -436,17 +459,82 @@ def _run_structured_mode(
         extras["news_sentiment"] = news_df
     if sec13f_df is not None and not sec13f_df.empty:
         extras["sec_13f"] = sec13f_df
+    # Merge caller-provided extras (e.g. cross_return_type for dispatch routing)
+    if extras_in:
+        extras.update(extras_in)
 
-    # Execute user code
+    # Execute user code — check for all supported entrypoints
     has_signals = callable(sandbox.get("generate_signals"))
     has_weights = callable(sandbox.get("generate_weights"))
+    has_cross_signal = callable(sandbox.get("generate_cross_signal"))
 
-    if not has_signals and not has_weights:
+    if not has_signals and not has_weights and not has_cross_signal:
         return _error_json(
             "code",
-            "User code must define generate_signals(data) or generate_weights(data). "
-            "Neither was found after exec.",
+            "User code must define generate_signals(data), generate_weights(data), "
+            "or generate_cross_signal(data, extras). "
+            "None was found after exec.",
         )
+
+    # ── Cross-sectional dispatch (PR 4b) ────────────────────────────────
+    # Early-return with a placeholder response. Engine wiring (portfolio
+    # construction, cost model, PnL aggregation) lands in PR 4c.
+    if has_cross_signal:
+        try:
+            result = _call_with_extras(
+                sandbox["generate_cross_signal"], all_data, extras
+            )
+        except Exception as e:
+            tb = traceback.format_exc()[-2000:]
+            return _error_json(
+                "code", f"generate_cross_signal raised {type(e).__name__}: {e}", tb
+            )
+
+        if not isinstance(result, pd.DataFrame):
+            return _error_json(
+                "code",
+                f"generate_cross_signal must return DataFrame, got {type(result).__name__}",
+            )
+
+        # Infer universe from the loaded data (exclude special internal keys)
+        universe = sorted(k for k in all_data if not k.startswith("_"))
+
+        # Determine return type from extras, default to "scores"
+        return_type = extras.get("cross_return_type", "scores")
+
+        # Validate against the matching contract
+        if validate_weights is None:
+            return _error_json(
+                "infra",
+                "Cross-sectional validators are not available in this environment. "
+                "The cross_sectional package must be present in the backtest image.",
+            )
+
+        try:
+            if return_type == "weights":
+                validate_weights(result, universe)
+            elif return_type == "signals":
+                validate_signals(result, universe)
+            elif return_type == "scores":
+                validate_scores(result, universe)
+            else:
+                return _error_json(
+                    "code",
+                    f"Unknown cross_return_type '{return_type}'. "
+                    "Must be one of: weights, signals, scores.",
+                )
+        except ValueError as e:
+            return _error_json("cross_contract_violation", str(e))
+
+        # Placeholder — engine (PR 4c) replaces this with real portfolio metrics
+        return json.dumps({
+            "status": "ok_no_engine",
+            "entrypoint": "generate_cross_signal",
+            "return_type": return_type,
+            "shape": list(result.shape),
+            "index_range": [str(result.index[0]), str(result.index[-1])],
+            "sum_per_row_sample": result.sum(axis=1).head(5).tolist(),
+        })
 
     use_weights_fn = has_weights
     weighting_label = "generate_weights" if use_weights_fn else "equal_active_signals"
