@@ -391,6 +391,11 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since=No
     }
     if metrics_since:
         payload["metrics_since"] = metrics_since
+    # Gate v2: conditionally include CV params when SANDBOX_GATE_V2=1
+    if os.environ.get("SANDBOX_GATE_V2", "0") == "1":
+        from loop_constants import CV_FOLDS, EMBARGO_DAYS
+        payload["cv_folds"] = CV_FOLDS
+        payload["embargo_days"] = EMBARGO_DAYS
     body = json.dumps(payload).encode("utf-8")
 
     print(f"  🔬 バックテスト実行中 (sandbox): {strategy} on {symbol}...")
@@ -636,9 +641,61 @@ def _eval_holdout_gate_cv(
     return passed, lcb_holdout_sharpe, reasons
 
 
+def _print_gate_v2_diff(strategy, symbol, v1_verdict, evaluation, gate_v2):
+    """Emit a machine-greppable GATE_V2_DIFF log line."""
+    v2_verdict = gate_v2["verdict"]
+    agree = "1" if v1_verdict == v2_verdict else "0"
+    v1_val = evaluation.get("sharpe_ratio", MISSING_METRIC)
+    v2_lcb = gate_v2["val_lcb_sharpe"]
+    v1_ho = evaluation.get("holdout_sharpe", MISSING_METRIC)
+    v2_lcb_h = gate_v2.get("holdout_lcb_sharpe", MISSING_METRIC)
+    print(f"GATE_V2_DIFF {strategy}/{symbol} v1={v1_verdict} v2={v2_verdict} "
+          f"v1_val_sharpe={v1_val:.2f} v2_lcb={v2_lcb:.2f} "
+          f"v1_holdout_sharpe={v1_ho:.2f} v2_lcb_h={v2_lcb_h} agree={agree}")
+
+
 # ---------------------------------------------------------------------------
 # Public evaluators
 # ---------------------------------------------------------------------------
+
+
+def _compute_gate_v2_cv(result, N_family):
+    """Compute gate v2 verdict from cv block (passive/observational only).
+
+    Returns a gate_v2 dict or None if the flag is off or cv block is absent.
+    """
+    if os.environ.get("SANDBOX_GATE_V2", "0") != "1":
+        return None
+    cv = result.get("cv")
+    if not cv or "folds" not in cv:
+        return None
+    try:
+        import pandas as pd
+        per_fold_returns = [
+            pd.Series(f["val_daily_returns"], index=pd.to_datetime(f["val_dates"]))
+            for f in cv["folds"]
+        ]
+        holdout_returns = pd.Series(
+            cv["holdout"]["daily_returns"],
+            index=pd.to_datetime(cv["holdout"]["dates"])
+        )
+        v2_val_passed, v2_lcb_val, v2_val_reasons = _eval_val_gate_cv(per_fold_returns, N_family)
+        if v2_val_passed:
+            v2_holdout_passed, v2_lcb_holdout, v2_holdout_reasons = _eval_holdout_gate_cv(holdout_returns, v2_lcb_val)
+        else:
+            v2_holdout_passed, v2_lcb_holdout, v2_holdout_reasons = None, None, None
+        v2_verdict = "adopted" if (v2_val_passed and v2_holdout_passed) else "rejected"
+        return {
+            "val_passed": v2_val_passed,
+            "val_lcb_sharpe": round(v2_lcb_val, 4),
+            "val_reasons": v2_val_reasons,
+            "holdout_passed": v2_holdout_passed,
+            "holdout_lcb_sharpe": round(v2_lcb_holdout, 4) if v2_lcb_holdout is not None else None,
+            "holdout_reasons": v2_holdout_reasons,
+            "verdict": v2_verdict,
+        }
+    except Exception:
+        return None
 
 
 def evaluate_result(hypothesis, result, knowledge):
@@ -673,6 +730,9 @@ def evaluate_result(hypothesis, result, knowledge):
     )
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
 
+    # --- Gate v2: passive/observational CV evaluation (only when flag on + cv block present) ---
+    gate_v2 = _compute_gate_v2_cv(result, N_family)
+
     # --- Gate (a): Validation gate ---
     val_pass, reasons = _eval_val_gate(val_sharpe, val_return, val_max_dd,
                                         effective_min_sharpe, N_family, T_val)
@@ -690,6 +750,9 @@ def evaluate_result(hypothesis, result, knowledge):
         }
         if is_metrics:
             evaluation["in_sample"] = is_metrics
+        if gate_v2:
+            evaluation["gate_v2"] = gate_v2
+            _print_gate_v2_diff(strategy, symbol, Verdict.REJECTED, evaluation, gate_v2)
         return "rejected", evaluation
 
     # --- Gate (b): Deflation gate (embedded in (a) via effective_min_sharpe) ---
@@ -717,6 +780,9 @@ def evaluate_result(hypothesis, result, knowledge):
         }
         if is_metrics:
             evaluation["in_sample"] = is_metrics
+        if gate_v2:
+            evaluation["gate_v2"] = gate_v2
+            _print_gate_v2_diff(strategy, symbol, Verdict.REJECTED, evaluation, gate_v2)
         return "rejected", evaluation
 
     # --- Gate (d): Cluster dedup ---
@@ -756,6 +822,9 @@ def evaluate_result(hypothesis, result, knowledge):
             }
             if is_metrics:
                 evaluation["in_sample"] = is_metrics
+            if gate_v2:
+                evaluation["gate_v2"] = gate_v2
+                _print_gate_v2_diff(strategy, symbol, Verdict.REJECTED, evaluation, gate_v2)
             return "rejected", evaluation
     else:
         gate_results["cluster"] = "new"
@@ -776,6 +845,9 @@ def evaluate_result(hypothesis, result, knowledge):
     }
     if is_metrics:
         evaluation["in_sample"] = is_metrics
+    if gate_v2:
+        evaluation["gate_v2"] = gate_v2
+        _print_gate_v2_diff(strategy, symbol, Verdict.ADOPTED, evaluation, gate_v2)
 
     return Verdict.ADOPTED, evaluation
 
@@ -1462,6 +1534,7 @@ def _get_loop_config():
         "runner_url": os.environ.get("SANDBOX_RUNNER_URL"),
         "backlog_path": os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json")),
         "use_llm": os.environ.get("USE_LLM_HYPOTHESIS") == "1",
+        "gate_v2": os.environ.get("SANDBOX_GATE_V2", "0"),
     }
 
 
@@ -1471,13 +1544,15 @@ def run_loop(num_iterations=3):
     """
     config = _get_loop_config()
     use_llm = config["use_llm"]
+    gate_v2_enabled = config["gate_v2"] == "1"
 
     print("=" * 60)
     print("🚀 Autonomous Alpha Discovery Loop 開始")
     print(f"   開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
     print(f"   イテレーション数: {num_iterations}")
     print(f"   LLM仮説生成: {'有効' if use_llm else '無効'}")
-    print(f"CONFIG runner_url={'set' if config['runner_url'] else 'unset'} backlog_path={config['backlog_path']} use_llm={use_llm}")
+    print(f"   Gate v2: {'有効' if gate_v2_enabled else '無効'}")
+    print(f"CONFIG runner_url={'set' if config['runner_url'] else 'unset'} backlog_path={config['backlog_path']} use_llm={use_llm} gate_v2={'1' if gate_v2_enabled else '0'}")
     print("=" * 60)
     
     knowledge = load_knowledge()
