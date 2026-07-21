@@ -156,7 +156,10 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
     }
     # --- CV folds (opt-in, additive — does NOT modify v1 output) ---
     if cv_folds is not None:
-        from backtests.splitter import WalkForwardCV
+        try:  # package import (pytest) / script import (container flat layout)
+            from .splitter import WalkForwardCV
+        except ImportError:
+            from splitter import WalkForwardCV
         cv = WalkForwardCV(
             n_folds=cv_folds, embargo_days=embargo_days,
             train_frac=0.6, val_frac=0.2,

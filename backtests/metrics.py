@@ -9,7 +9,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .splitter import WalkForwardCV  # re-export for gate-v2 CV use
+try:  # package import (pytest) / script import (container flat layout)
+    from .splitter import WalkForwardCV  # re-export for gate-v2 CV use
+except ImportError:
+    from splitter import WalkForwardCV  # noqa: F401
 
 # Trading cost: one-way bps (default 5.0 = 0.05%)
 COST_BPS = 5.0
