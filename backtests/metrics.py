@@ -9,6 +9,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+from .splitter import WalkForwardCV  # re-export for gate-v2 CV use
+
 # Trading cost: one-way bps (default 5.0 = 0.05%)
 COST_BPS = 5.0
 
@@ -34,7 +36,11 @@ def load_cached_data(symbol, data_dir):
 # ---------------------------------------------------------------------------
 
 def split_walkforward(df, train_ratio=0.6, val_ratio=0.2, holdout_ratio=0.2):
-    """Split data into train (in-sample), validation, and holdout segments chronologically."""
+    """Split data into train (in-sample), validation, and holdout segments chronologically.
+
+    Note: WalkForwardCV (imported above) supersedes this single-shot split for
+    gate-v2 use, providing expanding-window CV folds with an embargo gap.
+    """
     n = len(df)
     train_end = int(n * train_ratio)
     val_end = train_end + int(n * val_ratio)
