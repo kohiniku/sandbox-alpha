@@ -17,7 +17,7 @@ Design choices
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -226,3 +226,40 @@ def to_wide(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         returns = panel.xs("Close", level="field", axis=1).pct_change()
     """
     return align_universe(data)
+
+
+# ---------------------------------------------------------------------------
+# align_universe_chunked
+# ---------------------------------------------------------------------------
+
+def align_universe_chunked(
+    data: Dict[str, pd.DataFrame],
+    chunk_size: int = 200,
+) -> "Iterator[pd.DataFrame]":
+    """Yield aligned DataFrames chunk-by-chunk to avoid loading all symbols
+    into a single wide panel at once.
+
+    For a 500-symbol universe, calling :func:`align_universe` directly builds
+    a 500 × 5 = 2500 column DataFrame.  This iterator breaks the symbol list
+    into chunks of *chunk_size* and aligns each independently, yielding one
+    wide panel per chunk.
+
+    Parameters
+    ----------
+    data : dict[str, pd.DataFrame]
+        Output of :func:`load_ohlcv`.
+    chunk_size : int
+        Maximum number of symbols per chunk.
+
+    Yields
+    ------
+    pd.DataFrame
+        Wide-format panel with MultiIndex columns ``(symbol, field)``,
+        same structure as :func:`align_universe` but covering only a
+        subset of symbols.
+    """
+    symbols = sorted(data.keys())
+    for start in range(0, len(symbols), chunk_size):
+        chunk_symbols = symbols[start : start + chunk_size]
+        chunk_data = {s: data[s] for s in chunk_symbols}
+        yield align_universe(chunk_data)
