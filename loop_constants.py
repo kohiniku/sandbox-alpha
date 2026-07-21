@@ -26,3 +26,15 @@ class BacklogStatus:
     DONE_ADOPTED = 'done_adopted'
     DONE_REJECTED = 'done_rejected'
     DONE_ERROR = 'done_error'
+
+
+# --- Gate v2 (CV + bootstrap LCB) ---
+# Frozen defaults from docs/plan-cv-bootstrap.md §3.2.
+# These are the canonical values for walk-forward CV and bootstrap LCB
+# gate functions added in PR #2.  They are not used by any v1 code path.
+
+CV_FOLDS = 3                          # number of expanding-window CV folds
+EMBARGO_DAYS = 21                     # trading-day gap between train and val
+BOOTSTRAP_ALPHA = 0.05                # significance level for LCB (5%)
+BOOTSTRAP_N_RESAMPLE = 2000           # bootstrap resamples (B)
+BLOCK_LEN_MIN = 21                    # floor for block-length heuristic

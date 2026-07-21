@@ -68,6 +68,9 @@ MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
 MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
 
 from loop_constants import MISSING_METRIC, Verdict, BacklogStatus
+from loop_constants import (BOOTSTRAP_ALPHA, BOOTSTRAP_N_RESAMPLE,
+                            CV_FOLDS, EMBARGO_DAYS, BLOCK_LEN_MIN)
+from backtests.bootstrap import BootstrapLCB
 
 
 def compute_effective_min_sharpe(N_family, T_val):
@@ -537,6 +540,100 @@ def _eval_holdout_gate(holdout_sharpe, holdout_return, val_sharpe):
     else:
         reasons.append(f"❌ Holdout Return {holdout_return:.1f}% <= 0")
     return passed, reasons
+
+
+def _eval_val_gate_cv(
+    per_fold_returns: list,
+    N_family: int,
+    *,
+    alpha: float = BOOTSTRAP_ALPHA,
+    n_resample: int = BOOTSTRAP_N_RESAMPLE,
+    block_len: int | None = None,
+):
+    """Gate v2 validation.  Returns (passed: bool, lcb_sharpe: float, reasons: list[str]).
+
+    Computes the bootstrap LCB Sharpe on concatenated fold returns, then
+    applies the same deflation + return + drawdown checks as the v1 gate.
+    """
+    import pandas as pd  # local import — autonomous_loop primarily uses stdlib
+
+    concat = pd.concat(per_fold_returns) if len(per_fold_returns) > 1 else per_fold_returns[0]
+    T_val_cv = sum(len(r) for r in per_fold_returns)
+
+    lcb_sharpe = BootstrapLCB.compute(concat, block_len=block_len,
+                                      n_resample=n_resample, alpha=alpha)
+
+    val_return_pct = ((1 + concat).prod() - 1) * 100
+
+    cumulative = (1 + concat).cumprod()
+    running_max = cumulative.cummax()
+    drawdowns = (cumulative - running_max) / running_max
+    val_max_dd_pct = float(drawdowns.min() * 100)
+
+    effective_threshold = compute_effective_min_sharpe(N_family, T_val_cv)
+
+    passed = (
+        lcb_sharpe >= effective_threshold
+        and val_return_pct > 0
+        and val_max_dd_pct >= MAX_DRAWDOWN_LIMIT
+    )
+    reasons = []
+    if lcb_sharpe >= effective_threshold:
+        reasons.append(
+            f"✅ LCB Sharpe {lcb_sharpe:.2f} >= {effective_threshold:.2f}"
+            f" (deflated, N={N_family}, T_cv={T_val_cv})"
+        )
+    else:
+        reasons.append(
+            f"❌ LCB Sharpe {lcb_sharpe:.2f} < {effective_threshold:.2f}"
+            f" (deflated, N={N_family}, T_cv={T_val_cv})"
+        )
+    if val_return_pct > 0:
+        reasons.append(f"✅ Val Return {val_return_pct:.1f}% > 0%")
+    else:
+        reasons.append(f"❌ Val Return {val_return_pct:.1f}% <= 0%")
+    if val_max_dd_pct >= MAX_DRAWDOWN_LIMIT:
+        reasons.append(f"✅ Val Drawdown {val_max_dd_pct:.1f}% >= {MAX_DRAWDOWN_LIMIT}%")
+    else:
+        reasons.append(f"❌ Val Drawdown {val_max_dd_pct:.1f}% < {MAX_DRAWDOWN_LIMIT}%")
+    return passed, lcb_sharpe, reasons
+
+
+def _eval_holdout_gate_cv(
+    holdout_returns,
+    lcb_val_sharpe: float,
+    *,
+    alpha: float = BOOTSTRAP_ALPHA,
+    n_resample: int = BOOTSTRAP_N_RESAMPLE,
+    block_len: int | None = None,
+):
+    """Gate v2 holdout.  Returns (passed: bool, lcb_holdout_sharpe: float, reasons: list[str]).
+
+    Computes bootstrap LCB on the holdout series and applies a
+    threshold that is half the validation LCB, capped at 0.5.
+    """
+    lcb_holdout_sharpe = BootstrapLCB.compute(holdout_returns, block_len=block_len,
+                                              n_resample=n_resample, alpha=alpha)
+    holdout_return_pct = ((1 + holdout_returns).prod() - 1) * 100
+    threshold = min(0.5, 0.5 * lcb_val_sharpe)
+
+    passed = (lcb_holdout_sharpe >= threshold) and (holdout_return_pct > 0)
+    reasons = []
+    if lcb_holdout_sharpe >= threshold:
+        reasons.append(
+            f"✅ Holdout Sharpe {lcb_holdout_sharpe:.2f} >= {threshold:.2f}"
+            f" (threshold=min(0.5, 0.5*val))"
+        )
+    else:
+        reasons.append(
+            f"❌ Holdout Sharpe {lcb_holdout_sharpe:.2f} < {threshold:.2f}"
+            f" (threshold=min(0.5, 0.5*val))"
+        )
+    if holdout_return_pct > 0:
+        reasons.append(f"✅ Holdout Return {holdout_return_pct:.1f}% > 0")
+    else:
+        reasons.append(f"❌ Holdout Return {holdout_return_pct:.1f}% <= 0")
+    return passed, lcb_holdout_sharpe, reasons
 
 
 # ---------------------------------------------------------------------------
