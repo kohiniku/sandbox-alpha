@@ -232,3 +232,40 @@ class UniverseProvider:
 
         logger.info("Wrote %d constituents to %s", len(deduped), path)
         return path
+
+
+# ---------------------------------------------------------------------------
+# Universe alias expansion (PR 4e)
+# ---------------------------------------------------------------------------
+
+def resolve_universe_alias(alias: str, as_of: str | None = None) -> list[str]:
+    """Expand a universe alias into an explicit symbol list.
+
+    Supported aliases:
+      russell1000            — full R1K constituents (~1000 syms)
+      russell1000_top500     — top 500 by index weight (fallback: alphabetical head)
+      russell1000_top200
+      russell1000_top100
+      russell1000_top50
+
+    Unknown alias raises ValueError.
+    """
+    provider = UniverseProvider("russell1000")
+
+    if alias == "russell1000":
+        return provider.get_symbols(as_of=as_of)
+
+    if alias.startswith("russell1000_top"):
+        try:
+            n = int(alias.split("top")[1])
+        except (IndexError, ValueError):
+            raise ValueError(f"Invalid universe alias: {alias!r}")
+
+        symbols = provider.get_symbols(as_of=as_of)
+
+        # TODO: cap-weighted — when manifest CSV includes a weight column,
+        # sort by it descending before slicing.  For now, use natural order
+        # (alphabetical by Wikipedia scrape).
+        return symbols[:n]
+
+    raise ValueError(f"Unknown universe alias: {alias!r}")

@@ -242,13 +242,36 @@ def _summarise_near_misses(knowledge):
     These are directions that showed signal on validation but FAILED --
     do not re-propose near-identical specs; instead vary symbol, regime
     filter, or horizon. Holdout failures are a warning.
+
+    PR 4e: also reads near_misses_cross for cross-sectional near-misses.
     """
-    near_misses = knowledge.get("near_misses", [])
-    if not near_misses:
+    single = knowledge.get("near_misses", [])
+    cross = knowledge.get("near_misses_cross", [])
+    parts = []
+    if single:
+        parts.append("SINGLE-NAME NEAR-MISSES (last 20):")
+        parts.extend(_render_nm_lines(single[-20:]))
+    if cross:
+        if single:
+            parts.append("")  # blank separator
+        parts.append("CROSS-SECTIONAL NEAR-MISSES (last 20):")
+        parts.extend(_render_nm_lines(cross[-20:]))
+    if not parts:
         return None
 
+    header = (
+        "NEAR-MISS ARCHIVE (signal on validation but FAILED):\n"
+        "Do NOT re-propose near-identical specs (validation-set hill-climbing). "
+        "Instead vary direction: different symbol, regime filter, or horizon. "
+        "Holdout failures = overfit warning."
+    )
+    return header + "\n" + "\n".join(parts)
+
+
+def _render_nm_lines(entries):
+    """Render near-miss entries into text lines — shared formatter."""
     lines = []
-    for nm in near_misses[-20:]:  # last 20 for token budget
+    for nm in entries:
         strategy = nm.get("strategy", "?")
         symbol = nm.get("symbol", "?")
         params = json.dumps(nm.get("params", {}))
@@ -261,14 +284,7 @@ def _summarise_near_misses(knowledge):
             f"  {strategy}/{symbol} params={params} val_sharpe={val_s:.2f}"
             f" (thresh={thresh:.2f}){holdout_str} -- {gate}"
         )
-
-    header = (
-        "NEAR-MISS ARCHIVE (signal on validation but FAILED):\n"
-        "Do NOT re-propose near-identical specs (validation-set hill-climbing). "
-        "Instead vary direction: different symbol, regime filter, or horizon. "
-        "Holdout failures = overfit warning."
-    )
-    return header + "\n" + "\n".join(lines)
+    return lines
 
 
 def _summarise_backlog(backlog):
@@ -368,6 +384,32 @@ _MANIFEST_JSON_SCHEMA = """{
       "execution_mode": "expert",
       "priority": 0.90,
       "source": {"kind": "paper", "ref": "hamilton-regime-switching-1989.md"}
+    },
+    {
+      "name": "xs_momentum_top50_monthly",
+      "// code_b64 decodes to": "def generate_cross_signal(data, extras):\\n    import pandas as pd\\n    closes = pd.DataFrame({s: df['Close'] for s, df in data.items()})\\n    return closes.pct_change(252)  # 12M momentum scores",
+      "code_b64": "ZGVmIGdlbmVyYXRlX2Nyb3NzX3NpZ25hbChkYXRhLCBleHRyYXMpOgogICAgaW1wb3J0IHBhbmRhcyBhcyBwZAogICAgY2xvc2VzID0gcGQuRGF0YUZyYW1lKHtzOiBkZlsnQ2xvc2UnXSBmb3IgcywgZGYgaW4gZGF0YS5pdGVtcygpfSkKICAgIHJldHVybiBjbG9zZXMucGN0X2NoYW5nZSgyNTIpICAjIDEyTSBtb21lbnR1bSBzY29yZXM=",
+      "data_sources": [
+        {"type": "ohlcv", "universe_ref": "russell1000_top500", "start": "2020-01-01"}
+      ],
+      "model_artifacts": [],
+      "compute": {"mode": "inference", "budget_seconds": 90, "gpu": false},
+      "evaluator": {
+        "type": "portfolio",
+        "metrics": ["sharpe", "ir", "turnover", "cvar_95"],
+        "benchmark": "SPY",
+        "extras": {
+          "cross_return_type": "scores",
+          "construction_mode": "top_k",
+          "top_k": 50,
+          "rebalance": "monthly",
+          "cost_bps": 5.0,
+          "long_only": true
+        }
+      },
+      "execution_mode": "structured",
+      "priority": 0.80,
+      "source": {"kind": "paper", "ref": "jegadeesh-titman-1993.md"}
     }
   ]
 }"""
@@ -389,6 +431,17 @@ _EXPERT_MODE_CATALOG = """Expert mode unlocks:
 - Statistical arbitrage / cointegration (statsmodels.tsa.coint,
   scipy.stats.linregress, ridge via sklearn.linear_model)
 - Machine learning (sklearn.ensemble, RandomForest, GradientBoosting)
+- Cross-sectional (panel-first): define generate_cross_signal(data, extras)
+  returning wide DataFrame (index=Date, columns=symbol) of scores /
+  signals / weights. Engine handles portfolio construction, cost model,
+  rebalance schedule. Set evaluator.extras.cross_return_type ∈
+  {"scores", "signals", "weights"} and construction_mode ∈
+  {"top_k", "quintile_ls", "zscore_continuous", "custom_weights"}.
+- Universe alias support: set data_sources[0].universe_ref ∈
+  {"russell1000", "russell1000_top500", "russell1000_top200",
+   "russell1000_top100", "russell1000_top50"} INSTEAD of enumerating
+  hundreds of symbols in the universe field. Ideation expands the
+  alias into a real list before manifest validation.
 
 INSTALLED IN SANDBOX: pandas, numpy, scipy, sklearn (scikit-learn),
 statsmodels, math, statistics, dataclasses, typing, collections,
@@ -402,6 +455,28 @@ CODE HYGIENE (SyntaxError kills the whole proposal at preflight):
 - No unicode operators (%, ¥, etc.) inside numeric literals
 - Test your code mentally by running compile() in your head
 """
+
+
+def _expand_universe_refs(manifest_dict: dict) -> None:
+    """Walk data_sources and expand universe_ref aliases to universe lists.
+
+    If a data source has universe_ref (string), replace with universe
+    (list of symbols) via resolve_universe_alias. If both fields are
+    present, universe_ref wins (LLMs often emit both by accident;
+    universe_ref is more specific about intent).
+
+    Mutates manifest_dict in place. Raises ValueError on unknown alias.
+    """
+    from data_adapters.universe import resolve_universe_alias
+
+    for ds in manifest_dict.get("data_sources", []):
+        if not isinstance(ds, dict):
+            continue
+        ref = ds.pop("universe_ref", None)
+        if ref is None:
+            continue
+        symbols = resolve_universe_alias(ref)
+        ds["universe"] = symbols
 
 
 def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_proposals):
@@ -832,6 +907,14 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
         "EXPERT MODE CATALOG (pandas, numpy, scipy, sklearn, statsmodels); "
         "torch/tensorflow/transformers are NOT installed and will crash at preflight."
     )
+    mandates.append(
+        "- Cross-sectional factor strategies (panel-first, generate_cross_signal "
+        "entrypoint) are FIRST-CLASS ideas. When the thesis is about *relative* "
+        "ranking across many stocks (value tilts, quality tilts, low-vol, "
+        "reversal, cross-sectional momentum), prefer cross-sectional over "
+        "single-name. Reserve single-name for absolute-timing theses (mean "
+        "reversion on one symbol, regime detection on SPY)."
+    )
 
     mandates_text = "\n".join(mandates) if mandates else ""
 
@@ -856,6 +939,11 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
 {mandates_text}
 
 === YOUR TASK ===
+Cross-sectional recipe: define generate_cross_signal(data, extras)
+returning wide DataFrame of factor scores. Set evaluator.extras:
+{{cross_return_type, construction_mode, top_k, rebalance, cost_bps,
+long_only}}.
+
 Brainstorm 10-15 SHORT raw ideas. Each idea: a trading-strategy seed — creative, diverse,
 not a full proposal, just a direction. Favor novelty and edge-case regimes.
 
@@ -1381,12 +1469,43 @@ def _stage_select_v3(surviving_ideas, debate_results, knowledge, templates, rese
     if not surviving_ideas:
         return [], False
 
-    # Compact family summary for ranking context
+    # Compact family summary for ranking context — split single vs cross (PR 4e)
     families = knowledge.get("families", {})
-    family_summary = "\n".join(
+    single_fams = {k: v for k, v in families.items() if v.get("family_type", "single") == "single"}
+    cross_fams  = {k: v for k, v in families.items() if v.get("family_type") == "cross"}
+
+    single_summary = "\n".join(
         f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
-        for k, f in sorted(families.items())
-    )
+        for k, f in sorted(single_fams.items())
+    ) or "  (none yet)"
+
+    cross_summary = "\n".join(
+        f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
+        for k, f in sorted(cross_fams.items())
+    ) or "  (none yet — NOVEL cross-sectional ideas score higher on novelty)"
+
+    # Near-misses split (single vs cross) for select prompt
+    near_misses_single = knowledge.get("near_misses", [])
+    near_misses_cross  = knowledge.get("near_misses_cross", [])
+    nms_text = ""
+    if near_misses_single:
+        nms_lines = []
+        for nm in near_misses_single[-20:]:
+            s = nm.get("strategy", "?")
+            sym = nm.get("symbol", "?")
+            p = json.dumps(nm.get("params", {}))
+            nms_lines.append(f"  {s}/{sym} params={p} — {nm.get('failed_gate', '?')}")
+        nms_text += "\n=== SINGLE-NAME NEAR-MISSES (last 20) ===\n" + "\n".join(nms_lines)
+    if near_misses_cross:
+        nms_lines = []
+        for nm in near_misses_cross[-20:]:
+            s = nm.get("strategy", "?")
+            sym = nm.get("symbol", "?")
+            p = json.dumps(nm.get("params", {}))
+            nms_lines.append(f"  {s}/{sym} params={p} — {nm.get('failed_gate', '?')}")
+        nms_text += "\n=== CROSS-SECTIONAL NEAR-MISSES (last 20) ===\n" + "\n".join(nms_lines)
+    if nms_text:
+        nms_text = "\n=== NEAR-MISS ARCHIVE ===" + nms_text
 
     # Research docs compact
     research_text = ""
@@ -1451,8 +1570,13 @@ and evaluate according to the manifest's declarations.
 === AVAILABLE STRATEGY TEMPLATES (param spaces) ===
 {avail_strats}
 
-=== FAMILY AGGREGATES ===
-{family_summary}
+=== FAMILY AGGREGATES (single-name) ===
+{single_summary}
+
+=== FAMILY AGGREGATES (cross-sectional) ===
+{cross_summary}
+
+{nms_text}
 
 === RESEARCH ===
 {research_text or "(no research documents)"}
@@ -1487,6 +1611,17 @@ If execution_mode == "structured":
         # return: dict[symbol, pd.Series in {-1,0,1}] OR wide DataFrame
     def generate_weights(data):
         # same input, return wide DataFrame of portfolio weights
+    def generate_cross_signal(data, extras):
+        # cross-sectional / panel-first path (PR 4c engine)
+        # data: dict[symbol: str, DataFrame]
+        # extras: dict passed from evaluator.extras — read
+        #   cross_return_type / construction_mode / rebalance / top_k / etc.
+        # RETURN: wide DataFrame (index=Date, columns=universe symbols).
+        #   Cell values interpretation depends on cross_return_type:
+        #     "scores"  — raw factor scores; engine z-scores + top-k selects
+        #     "signals" — values in {-1, 0, 1}; engine equal-weights the actives
+        #     "weights" — explicit portfolio weights per row
+        # Must not contain NaN in the value columns after warmup.
 
 If execution_mode == "expert":
   YOU MUST define EXACTLY:
@@ -1558,6 +1693,11 @@ Return ONLY this JSON (no markdown, no commentary):
             for m_raw in manifests_raw:
                 if not isinstance(m_raw, dict):
                     print(f"  ⚠️  Skipping non-dict manifest entry: {type(m_raw).__name__}")
+                    continue
+                try:
+                    _expand_universe_refs(m_raw)  # PR 4e: expand universe_ref -> universe
+                except ValueError as e:
+                    print(f"  🚫 Manifest '{m_raw.get('name', '?')}' universe_ref expansion failed: {e}")
                     continue
                 try:
                     manifest = StrategyManifest.from_dict(m_raw)
