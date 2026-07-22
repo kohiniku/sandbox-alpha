@@ -22,6 +22,22 @@ sys.path for the engine.
 from . import mean_reversion, momentum, rsi, sma_crossover
 from ._pipeline import attach_returns
 
+# Cross-sectional package — dual-import for container flat-layout compatibility
+try:
+    from .cross_sectional import (
+        CROSS_SECTIONAL_STRATEGIES,
+        validate_weights,
+        validate_signals,
+        validate_scores,
+    )
+except ImportError:
+    from cross_sectional import (  # type: ignore[no-redef]
+        CROSS_SECTIONAL_STRATEGIES,
+        validate_weights,
+        validate_signals,
+        validate_scores,
+    )
+
 _MODULES = (sma_crossover, mean_reversion, momentum, rsi)
 
 
