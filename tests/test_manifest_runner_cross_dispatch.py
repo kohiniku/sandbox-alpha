@@ -128,8 +128,11 @@ class TestCrossDispatch:
 
         result = self._run_cross(_make_sandbox)
         assert call_count[0] == 1, f"Expected 1 call, got {call_count[0]}"
-        assert result["entrypoint"] == "generate_cross_signal"
-        assert result["return_type"] == "scores"  # default
+        # PR 4c: engine produces real metrics, not placeholder
+        assert "in_sample" in result
+        assert "out_of_sample" in result
+        assert "holdout" in result
+        assert "cross_sectional" in result
 
     # ── test: validator routing by return_type ─────────────────────────
 
@@ -146,8 +149,9 @@ class TestCrossDispatch:
             return {"generate_cross_signal": generate_cross_signal}
 
         result = self._run_cross(_make_scores_sbx)
-        assert result["status"] == "ok_no_engine"
-        assert result["return_type"] == "scores"
+        # PR 4c: engine produces real metrics
+        assert "in_sample" in result
+        assert "out_of_sample" in result
 
         # weights — must pass validate_weights
         def _make_weights_sbx(data):
@@ -160,8 +164,7 @@ class TestCrossDispatch:
             return {"generate_cross_signal": generate_cross_signal}
 
         result = self._run_cross(_make_weights_sbx, extras={"cross_return_type": "weights"})
-        assert result["status"] == "ok_no_engine"
-        assert result["return_type"] == "weights"
+        assert "in_sample" in result
 
         # signals — must pass validate_signals
         def _make_signals_sbx(data):
@@ -174,13 +177,11 @@ class TestCrossDispatch:
             return {"generate_cross_signal": generate_cross_signal}
 
         result = self._run_cross(_make_signals_sbx, extras={"cross_return_type": "signals"})
-        assert result["status"] == "ok_no_engine"
-        assert result["return_type"] == "signals"
+        assert "in_sample" in result
 
         # explicit "scores" with extras
         result = self._run_cross(_make_scores_sbx, extras={"cross_return_type": "scores"})
-        assert result["status"] == "ok_no_engine"
-        assert result["return_type"] == "scores"
+        assert "in_sample" in result
 
     # ── test: contract violation → error ───────────────────────────────
 
@@ -203,11 +204,12 @@ class TestCrossDispatch:
 
     # ── test: valid output → placeholder ───────────────────────────────
 
-    def test_dispatch_returns_placeholder_on_valid_output(self):
-        """Engine wiring (PR 4c) replaces this placeholder with real metrics.
+    def test_dispatch_returns_engine_metrics_on_valid_output(self):
+        """PR 4c: Engine wiring produces real portfolio metrics.
 
-        This test verifies that the placeholder shape is correct so PR 4c
-        knows exactly what structure to replace.
+        This test verifies that the cross-sectional dispatch produces a
+        complete metrics dict — not a placeholder — proving the engine
+        wiring is complete.
         """
         def _make_sbx(data):
             def generate_cross_signal(data2, extras=None):
@@ -219,14 +221,17 @@ class TestCrossDispatch:
             return {"generate_cross_signal": generate_cross_signal}
 
         result = self._run_cross(_make_sbx)
-        assert result["status"] == "ok_no_engine"
-        assert result["entrypoint"] == "generate_cross_signal"
-        assert result["return_type"] == "scores"
-        assert isinstance(result["shape"], list) and len(result["shape"]) == 2
-        assert result["shape"][0] > 0
-        assert result["shape"][1] == 2
-        assert isinstance(result["index_range"], list) and len(result["index_range"]) == 2
-        assert isinstance(result["sum_per_row_sample"], list)
+        # Engine produces real metrics
+        assert "in_sample" in result
+        assert "out_of_sample" in result
+        assert "holdout" in result
+        assert "cross_sectional" in result
+        assert "walkforward" in result
+        # in_sample has metric fields
+        assert "sharpe_ratio" in result["in_sample"]
+        assert "max_drawdown" in result["in_sample"]
+        assert "turnover" in result["in_sample"]
+        assert "hit_rate" in result["in_sample"]
 
     # ── test: non-DataFrame return → error ─────────────────────────────
 

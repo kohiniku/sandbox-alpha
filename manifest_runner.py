@@ -476,9 +476,8 @@ def _run_structured_mode(
             "None was found after exec.",
         )
 
-    # ── Cross-sectional dispatch (PR 4b) ────────────────────────────────
-    # Early-return with a placeholder response. Engine wiring (portfolio
-    # construction, cost model, PnL aggregation) lands in PR 4c.
+    # ── Cross-sectional dispatch ──────────────────────────────────────
+    # Contract validation (PR 4b), engine wiring (PR 4c).
     if has_cross_signal:
         try:
             result = _call_with_extras(
@@ -526,15 +525,27 @@ def _run_structured_mode(
         except ValueError as e:
             return _error_json("cross_contract_violation", str(e))
 
-        # Placeholder — engine (PR 4c) replaces this with real portfolio metrics
-        return json.dumps({
-            "status": "ok_no_engine",
-            "entrypoint": "generate_cross_signal",
-            "return_type": return_type,
-            "shape": list(result.shape),
-            "index_range": [str(result.index[0]), str(result.index[-1])],
-            "sum_per_row_sample": result.sum(axis=1).head(5).tolist(),
-        })
+        # ── Cross-sectional engine (PR 4c) ────────────────────────────
+        try:
+            from backtests.cross_sectional.engine import run_cross_sectional_backtest
+        except ImportError:
+            from cross_sectional.engine import run_cross_sectional_backtest  # type: ignore[no-redef]  # flat-container fallback
+
+        try:
+            result_dict = run_cross_sectional_backtest(
+                raw_output=result,
+                return_type=return_type,
+                universe=universe,
+                panel=all_data,
+                config={
+                    **extras,
+                    "train_end": train_end,
+                    "val_end": val_end,
+                },
+            )
+            return json.dumps(result_dict, default=str)
+        except ValueError as e:
+            return _error_json("cross_engine_error", str(e))
 
     use_weights_fn = has_weights
     weighting_label = "generate_weights" if use_weights_fn else "equal_active_signals"
