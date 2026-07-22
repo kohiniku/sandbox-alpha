@@ -185,7 +185,12 @@ REQUIRED_EXPERT_METRICS = frozenset({
 
 
 def _validate_expert_metrics(result: dict) -> Optional[str]:
-    """Validate expert mode return dict. Returns error message or None if valid."""
+    """Validate expert mode return dict. Returns error message or None if valid.
+    
+    Non-finite values (NaN/inf) are NOT treated as errors here — those are
+    legitimate "no edge" outcomes and are flagged separately by
+    _find_nonfinite_metrics for the degenerate-metrics path.
+    """
     if not isinstance(result, dict):
         return f"run() must return dict, got {type(result).__name__}"
     
@@ -197,10 +202,22 @@ def _validate_expert_metrics(result: dict) -> Optional[str]:
         val = result[key]
         if not isinstance(val, (int, float)):
             return f"run() metric '{key}' must be numeric, got {type(val).__name__}"
-        if not np.isfinite(val):
-            return f"run() metric '{key}' is not finite: {val}"
     
     return None
+
+
+def _find_nonfinite_metrics(result: dict) -> list:
+    """Return sorted list of REQUIRED_EXPERT_METRICS keys whose values are
+    numeric but non-finite (NaN/inf).  A strategy that produces zero trades
+    in a segment will naturally yield zero-variance returns → NaN Sharpe.
+    This is not a code bug — it is an honest "no edge" outcome.
+    """
+    nonfinite = []
+    for key in REQUIRED_EXPERT_METRICS:
+        val = result.get(key)
+        if isinstance(val, (int, float)) and not np.isfinite(val):
+            nonfinite.append(key)
+    return sorted(nonfinite)
 
 
 def _check_pathological(result: dict) -> list:
@@ -712,6 +729,37 @@ def _run_expert_mode(
     if error_msg:
         return _error_json("code", error_msg)
 
+    # Degenerate metrics: numeric but non-finite (e.g. NaN Sharpe from
+    # zero-variance returns caused by no trades).  This is NOT a code error —
+    # it is an honest "no edge" outcome.  Report as a success with degenerate
+    # flag so the autonomous loop can short-circuit evaluation without marking
+    # it as an error.
+    nonfinite = _find_nonfinite_metrics(result_dict)
+    if nonfinite:
+        metrics = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
+        extras = {k: v for k, v in result_dict.items() if k not in REQUIRED_EXPERT_METRICS}
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "execution_mode": "expert",
+            "manifest_name": manifest.name,
+            "universe_size": len(close_panel.columns),
+            "n_days": len(close_panel),
+            "metrics": metrics,
+            "degenerate": True,
+            "degenerate_reason": f"metrics not finite: {nonfinite} (likely no trades in a segment)",
+            "config": {
+                "benchmark": manifest.evaluator.benchmark,
+                "entrypoint": "run",
+                "train_end": train_end.isoformat(),
+                "val_end": val_end.isoformat(),
+            },
+        }
+        if extras:
+            result["expert_extras"] = extras
+        if benchmark_warning:
+            result["warning"] = benchmark_warning
+        return json.dumps(result)
+
     # Check for pathological values
     warnings = _check_pathological(result_dict)
     
@@ -846,6 +894,17 @@ def _validate_manifest_synthetic(manifest):
             if missing:
                 return json.dumps({"valid": False, "error_type": "code",
                                    "error": f"run() dict missing required keys: {missing}"})
+            # Type check (non-numeric values like Series) — reuse real-run validation
+            type_error = _validate_expert_metrics(result)
+            if type_error:
+                return json.dumps({"valid": False, "error_type": "code",
+                                   "error": type_error})
+            # Non-finite metrics on synthetic data: warn, don't block.
+            # Synthetic no-trade does not imply real-data no-trade.
+            nf = _find_nonfinite_metrics(result)
+            if nf:
+                warnings = [f"run() metric '{k}' is not finite on synthetic data" for k in nf]
+                return json.dumps({"valid": True, "warnings": warnings})
         else:
             fn = sandbox.get("generate_weights") or sandbox.get("generate_signals")
             if not callable(fn):
