@@ -18,6 +18,7 @@ from autonomous_loop import (
     update_family_aggregates,
     _rebuild_families_from_history,
     _family_key,
+    _derive_family_type,
     STRATEGY_TEMPLATES,
 )
 from llm_hypothesis import _build_prompt, _build_knowledge_summary
@@ -91,7 +92,23 @@ def _make_adopted_entry(strategy, symbol, params, val_sharpe=1.5,
 
 class TestFamilyKey:
     def test_family_key_form(self):
-        assert _family_key("sma_crossover", "AAPL") == "sma_crossover|AAPL"
+        assert _family_key("sma_crossover", "AAPL", "single") == "sma_crossover|AAPL"
+        assert _family_key("manifest:xs_momentum", "universe:abc123", "cross") == "manifest:xs_momentum|universe:abc123"
+
+    def test_family_key_rejects_bad_type(self):
+        with pytest.raises(ValueError):
+            _family_key("sma_crossover", "AAPL", "bogus")
+
+
+class TestDeriveFamilyType:
+    def test_single_strategy(self):
+        assert _derive_family_type({"strategy": "sma_crossover"}) == "single"
+
+    def test_cross_manifest(self):
+        assert _derive_family_type({"strategy": "manifest:xs_momentum"}) == "cross"
+
+    def test_empty_hyp_defaults_to_single(self):
+        assert _derive_family_type({}) == "single"
 
 
 # ============================================================

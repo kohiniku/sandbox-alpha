@@ -213,9 +213,9 @@ class TestManifestHoldoutFail:
         assert data["entries"][0]["status"] == "done_rejected"
         assert data["entries"][0]["result"]["verdict"] == "rejected"
 
-        # near_miss should be recorded
+        # near_miss should be recorded in near_misses_cross (manifest is cross-sectional)
         knowledge = json.loads(kf.read_text())
-        near_misses = knowledge.get("near_misses", [])
+        near_misses = knowledge.get("near_misses_cross", [])
         assert len(near_misses) == 1
         assert near_misses[0]["failed_gate"] == "holdout"
 
@@ -268,7 +268,7 @@ class TestManifestValSharpeFail:
 
         # No near_miss because 0.2 is way below 90% of deflated threshold
         knowledge = json.loads(kf.read_text())
-        near_misses = knowledge.get("near_misses", [])
+        near_misses = knowledge.get("near_misses_cross", [])
         assert len(near_misses) == 0
 
     def test_manifest_near_miss_at_90pct_threshold(self, tmp_path, monkeypatch):
@@ -312,7 +312,7 @@ class TestManifestValSharpeFail:
             run_loop(1)
 
         knowledge = json.loads(kf.read_text())
-        near_misses = knowledge.get("near_misses", [])
+        near_misses = knowledge.get("near_misses_cross", [])
         assert len(near_misses) >= 1
         nm = near_misses[0]
         assert nm["failed_gate"] == "val_sharpe_90pct"
