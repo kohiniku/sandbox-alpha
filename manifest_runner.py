@@ -438,6 +438,7 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
             benchmark_warning=benchmark_warning,
             news_df=news_df,
             sec13f_df=sec13f_df,
+            extras_in=manifest.evaluator.extras or None,
         )
 
 
