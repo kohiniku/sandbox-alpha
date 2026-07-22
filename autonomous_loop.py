@@ -134,6 +134,17 @@ def load_knowledge():
             data["families"] = _rebuild_families_from_history(data)
             # persist the rebuilt families immediately so the migration is idempotent
             KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2, default=str))
+
+        # Migration: stamp family_type on legacy family entries that lack it.
+        for key, fam in data.get("families", {}).items():
+            if "family_type" not in fam:
+                # Derive from key shape; keys of the form "manifest:...|universe:..."
+                # are cross, everything else is single.
+                fam["family_type"] = "cross" if key.startswith("manifest:") else "single"
+
+        # Migration: legacy knowledge only had a single near_misses list; introduce
+        # near_misses_cross alongside without touching the existing data.
+        data.setdefault("near_misses_cross", [])
         return data
     return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
             "superseded": [], "families": {}, "iterations": 0, "errors": []}
@@ -149,7 +160,7 @@ def _rebuild_families_from_history(knowledge):
     )
     for entry in all_entries:
         hyp = entry.get("hypothesis", {})
-        key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""))
+        key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""), _derive_family_type(hyp))
         if not hyp.get("strategy") or not hyp.get("symbol"):
             continue
         families.setdefault(key, {
@@ -158,17 +169,33 @@ def _rebuild_families_from_history(knowledge):
             "best_params": {},
             "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                               "duplicate_cluster": 0, "exhausted_cluster": 0},
-            "last_tried": ""
+            "last_tried": "",
+            "family_type": _derive_family_type(hyp),
         })
-        _apply_entry_to_family(families, key, entry, hyp)
+        _apply_entry_to_family(families, key, entry, hyp, _derive_family_type(hyp))
     return families
 
 
-def _family_key(strategy, symbol):
+def _family_key(strategy: str, symbol: str, family_type: str) -> str:
+    if family_type not in ("single", "cross"):
+        raise ValueError(f"family_type must be 'single' or 'cross', got {family_type!r}")
     return f"{strategy}|{symbol}"
 
 
-def _apply_entry_to_family(families, key, entry, hyp):
+def _derive_family_type(hyp: dict) -> str:
+    """Classify a hypothesis into 'single' or 'cross'.
+
+    'cross' if the strategy name uses the manifest namespace prefix
+    ('manifest:'). Everything else is 'single'. Used to migrate old
+    knowledge entries and to route new records into the correct
+    family_type / near_miss bucket without threading the classification
+    through every caller.
+    """
+    strategy = (hyp or {}).get("strategy", "") or ""
+    return "cross" if strategy.startswith("manifest:") else "single"
+
+
+def _apply_entry_to_family(families, key, entry, hyp, family_type="single"):
     """Incrementally update a single family aggregate record from one evaluation entry."""
     fam = families.setdefault(key, {
         "n_trials": 0,
@@ -176,7 +203,8 @@ def _apply_entry_to_family(families, key, entry, hyp):
         "best_params": {},
         "gate_failures": {"validation": 0, "deflation": 0, "holdout": 0,
                           "duplicate_cluster": 0, "exhausted_cluster": 0},
-        "last_tried": ""
+        "last_tried": "",
+        "family_type": family_type,
     })
     fam["n_trials"] += 1
     ev = entry.get("evaluation", {})
@@ -212,11 +240,11 @@ def _apply_entry_to_family(families, key, entry, hyp):
 def update_family_aggregates(knowledge, record):
     """Update families dict after every evaluation (adopted and rejected both count)."""
     hyp = record.get("hypothesis", {})
-    key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""))
+    key = _family_key(hyp.get("strategy", ""), hyp.get("symbol", ""), _derive_family_type(hyp))
     if not hyp.get("strategy") or not hyp.get("symbol"):
         return
     families = knowledge.setdefault("families", {})
-    _apply_entry_to_family(families, key, record, hyp)
+    _apply_entry_to_family(families, key, record, hyp, _derive_family_type(hyp))
 
 
 def _check_exhausted_cluster(hypothesis, knowledge):
@@ -926,11 +954,13 @@ def _record_near_miss(hypothesis, evaluation, knowledge):
     print(f"NEAR_MISS {nm['strategy']}/{nm['symbol']} val={nm['val_sharpe']:.2f} "
           f"thresh={nm['deflated_threshold']:.2f} holdout={holdout if holdout is not None else 'n/a'} "
           f"gate={nm['failed_gate']}")
-    near_misses = knowledge.setdefault("near_misses", [])
+    ft = _derive_family_type(hypothesis)
+    list_key = "near_misses_cross" if ft == "cross" else "near_misses"
+    near_misses = knowledge.setdefault(list_key, [])
     near_misses.append(nm)
-    # Cap at 30 most recent
+    # Cap at 30 most recent (per list — cross and single are independent)
     if len(near_misses) > 30:
-        knowledge["near_misses"] = near_misses[-30:]
+        knowledge[list_key] = near_misses[-30:]
 
 
 def save_result(hypothesis, result, verdict, evaluation):
@@ -1036,7 +1066,7 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     symbol = hypothesis["symbol"]
 
     # N_family: count from families dict (updated by update_family_aggregates)
-    fam_key = _family_key(strategy, symbol)
+    fam_key = _family_key(strategy, symbol, "cross")
     families = knowledge.get("families", {})
     N_family = families.get(fam_key, {}).get("n_trials", 0)
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)

@@ -96,3 +96,44 @@ def test_metrics_module_imports_in_flat_layout(flat_layout):
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     assert "OK" in result.stdout
+
+
+def test_single_name_subpackage_imports_in_flat_layout(flat_layout):
+    """`python -c \"import strategies._single_name.*\"` must succeed from flat dir."""
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import strategies; "
+         "from strategies._single_name import sma_crossover, mean_reversion, momentum, rsi; "
+         "assert sma_crossover.NAME == 'sma_crossover'; "
+         "print('OK')"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=_isolated_env(),
+        cwd=str(flat_layout),
+    )
+    assert result.returncode == 0, (
+        "strategies._single_name.* failed to import in flat layout:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+def test_panel_adapter_imports_in_flat_layout(flat_layout):
+    """`python -c \"import strategies._panel_adapter\"` must succeed from flat dir."""
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import strategies._panel_adapter; "
+         "assert callable(strategies._panel_adapter.wrap_single_as_cross); "
+         "print('OK')"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=_isolated_env(),
+        cwd=str(flat_layout),
+    )
+    assert result.returncode == 0, (
+        "strategies._panel_adapter failed to import in flat layout:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "OK" in result.stdout

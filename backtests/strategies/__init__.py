@@ -19,7 +19,7 @@ strategy code, gitignored) is unrelated to this package and never on
 sys.path for the engine.
 """
 
-from . import mean_reversion, momentum, rsi, sma_crossover
+from ._single_name import sma_crossover, mean_reversion, momentum, rsi
 from ._pipeline import attach_returns
 
 # Cross-sectional package — dual-import for container flat-layout compatibility
