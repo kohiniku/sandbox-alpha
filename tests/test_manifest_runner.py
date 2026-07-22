@@ -447,9 +447,10 @@ class TestExpertMode:
         manifest = _make_manifest(code=code, universe=symbols, execution_mode="expert")
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
-        assert result["status"] == "error"
-        assert result["error_type"] == "code"
-        assert "not finite" in result["error"].lower()
+        assert result["status"] == "ok"
+        assert result["degenerate"] is True
+        assert "not finite" in result["degenerate_reason"].lower()
+        assert "val_sharpe" in result["degenerate_reason"]
 
     def test_pathological_sharpe_warning(self, tmp_path):
         symbols = ["AAPL", "MSFT"]
