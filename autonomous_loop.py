@@ -731,6 +731,20 @@ def evaluate_result(hypothesis, result, knowledge):
     Multi-gate evaluation with overfitting countermeasures.
     Returns (verdict, evaluation_dict).
     """
+    # Degenerate metrics: numeric but non-finite (NaN/inf) from zero-variance
+    # returns caused by no trades in a segment.  This is an honest "no edge"
+    # outcome, not a code error.  Short-circuit to rejected so it counts as
+    # a normal tested/rejected result rather than an error.
+    if result.get("degenerate"):
+        degenerate_reason = result.get("degenerate_reason", "unknown")
+        strategy = hypothesis.get("strategy", "?")
+        symbol = hypothesis.get("symbol", "?")
+        print(f"DEGENERATE {strategy}/{symbol} reason={degenerate_reason}")
+        return "rejected", {
+            "verdict": Verdict.REJECTED,
+            "reasons": [f"degenerate: {degenerate_reason}"],
+        }
+
     triage = _triage_eval_error(result)
     if triage is not None:
         return triage
@@ -1045,6 +1059,18 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
 
     Returns (verdict, evaluation_dict) — same shape as evaluate_result.
     """
+    # Degenerate metrics: numeric but non-finite (NaN/inf) from zero-variance
+    # returns caused by no trades in a segment.  Short-circuit to rejected.
+    if runner_result.get("degenerate"):
+        degenerate_reason = runner_result.get("degenerate_reason", "unknown")
+        strategy = hypothesis.get("strategy", "?")
+        symbol = hypothesis.get("symbol", "?")
+        print(f"DEGENERATE {strategy}/{symbol} reason={degenerate_reason}")
+        return "rejected", {
+            "verdict": Verdict.REJECTED,
+            "reasons": [f"degenerate: {degenerate_reason}"],
+        }
+
     # Note: runner_result is the FULL parsed runner response (includes metrics + n_days)
     if "metrics" not in runner_result:
         return "error", {
