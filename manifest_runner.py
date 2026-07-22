@@ -52,7 +52,11 @@ try:
     )
 except ImportError:
     try:
-        from cross_sectional._contract import (
+        # Container flat layout: Dockerfile does `COPY backtests/ /backtest/`,
+        # so backtests/strategies/cross_sectional/ lands at /backtest/strategies/
+        # cross_sectional/, NOT at /backtest/cross_sectional/ (which is the
+        # separate PR 4c engine package). The `strategies.` prefix matters.
+        from strategies.cross_sectional._contract import (
             validate_weights,
             validate_signals,
             validate_scores,
