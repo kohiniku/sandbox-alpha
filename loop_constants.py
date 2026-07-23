@@ -28,6 +28,17 @@ class BacklogStatus:
     DONE_ERROR = 'done_error'
 
 
+class FamilyLifecycle:
+    """Strategy family lifecycle states for the review loop."""
+    CANDIDATE = 'candidate'
+    REFINING = 'refining'
+    KILLED = 'killed'
+
+
+# Hard cap on refine attempts per family (used by the upcoming review stage)
+REFINE_CAP = 3
+
+
 # --- Gate v2 (CV + bootstrap LCB) ---
 # Frozen defaults from docs/plan-cv-bootstrap.md §3.2.
 # These are the canonical values for walk-forward CV and bootstrap LCB
