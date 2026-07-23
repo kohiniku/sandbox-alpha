@@ -388,95 +388,39 @@ def _diagnose_single_family(family_key, evidence, runner_url, now_iso):
 
 
 def _diagnose_cross_family(family_key, knowledge, evidence, runner_url, now_iso):
-    """Run diagnosis for a cross-sectional (manifest) family."""
-    # For cross families, use the recorded evaluation as baseline.
-    # We check if the evidence is a rejected entry (which has evaluation)
-    # or a near_miss entry.
+    """Run diagnosis for a cross-sectional (manifest) family.
+
+    Baseline-only: the full manifest spec (code_b64, data_sources) is not
+    persisted in knowledge.json near_misses/rejected entries, so cost-free
+    re-run is unavailable.  Zero HTTP calls.
+    """
+    # Use the recorded evaluation as baseline.
     if "evaluation" in evidence:
         baseline_eval = evidence.get("evaluation", {})
+        source = "recorded_evaluation"
     else:
         # near_miss entry — use its val_sharpe as baseline
         baseline_eval = {"sharpe_ratio": evidence.get("val_sharpe", 0.0)}
+        source = "recorded_near_miss"
 
     baseline_val_sharpe = baseline_eval.get("sharpe_ratio", 0.0)
-
-    # Recover strategy info
-    strategy = evidence.get("strategy", evidence.get("hypothesis", {}).get("strategy", ""))
-    symbol = evidence.get("symbol", evidence.get("hypothesis", {}).get("symbol", ""))
-    params = evidence.get("params", evidence.get("hypothesis", {}).get("params", {}))
-
-    # For cross families, we attempt the cost-free run via /run with cost_bps=0.0
-    # using the strategy/symbol/params we have.  Full manifest re-run is not
-    # possible without the original manifest spec (see PR description).
-    url = f"{runner_url.rstrip('/')}/run"
-
-    cost0_payload = {
-        "strategy": strategy,
-        "symbol": symbol,
-        "params": params,
-        "cost_bps": 0.0,
-    }
-
-    try:
-        cost0_resp = _post_json(url, cost0_payload)
-        cost0_val_sharpe = _parse_cost0_response(cost0_resp)
-        cost0_error = None
-    except Exception as e:
-        # If /run doesn't work for cross (no manifest), try /run_manifest
-        # with reconstructed minimal manifest
-        cost0_val_sharpe = baseline_val_sharpe
-        cost0_error = f"cost-free run failed (cross family, /run may not support manifest): {e}"
-
-    if cost0_error and "backtest_result" in evidence:
-        # Last resort: try to use backtest_result config to run via /run_manifest
-        bt = evidence["backtest_result"]
-        # Extract manifest info if available
-        manifest_name = bt.get("manifest_name") or strategy.replace("manifest:", "")
-        xs_config = bt.get("cross_sectional", {})
-        wf_config = bt.get("walkforward", {})
-
-        manifest_payload = {
-            "name": manifest_name,
-            "code_b64": "",
-            "data_sources": [],
-            "evaluator": {
-                "type": "portfolio",
-                "metrics": ["sharpe"],
-                "extras": {"cost_bps": 0.0},
-            },
-            "execution_mode": params.get("execution_mode", "structured"),
-        }
-        if xs_config:
-            manifest_payload["evaluator"]["extras"]["construction_mode"] = xs_config.get("construction_mode", "top_k")
-            manifest_payload["evaluator"]["extras"]["rebalance"] = xs_config.get("rebalance", "monthly")
-
-        try:
-            manifest_url = f"{runner_url.rstrip('/')}/run_manifest"
-            cost0_resp = _post_json(manifest_url, manifest_payload)
-            # Parse manifest response
-            oos = cost0_resp.get("out_of_sample", {})
-            cost0_val_sharpe = oos.get("sharpe_ratio", cost0_resp.get("metrics", {}).get("val_sharpe", baseline_val_sharpe))
-            cost0_error = None
-        except Exception:
-            pass  # keep cost0_val_sharpe as baseline
-
-    flags = _compute_flags(baseline_val_sharpe, cost0_val_sharpe, None, 0.0)
 
     report = {
         "family_key": family_key,
         "family_type": "cross",
         "diagnosed_at": now_iso,
-        "flags": flags,
+        "diagnosis_scope": "baseline_only",
+        "flags": [],
         "baseline": {
             "val_sharpe": baseline_val_sharpe,
+            "source": source,
         },
-        "cost_free": {
-            "val_sharpe": cost0_val_sharpe,
-        },
+        "cost_free": None,
         "folds_available": False,
+        "warnings": [
+            "manifest spec not persisted in knowledge; cost-free re-run unavailable"
+        ],
     }
-    if cost0_error:
-        report.setdefault("warnings", []).append(cost0_error)
 
     return report, None
 
@@ -523,7 +467,12 @@ def _update_review_state(knowledge, family_key, iso_timestamp):
 # ============================================================================
 
 def _active_flags(flags):
-    """Return comma-separated list of True flag names, or 'none'."""
+    """Return comma-separated list of True flag names, or 'none'.
+
+    Accepts both a dict (single-family) and a list (cross-family baseline-only).
+    """
+    if isinstance(flags, list):
+        return ",".join(flags) if flags else "none"
     active = [k for k, v in flags.items() if v]
     return ",".join(active) if active else "none"
 
@@ -586,9 +535,15 @@ def main():
         diagnosed += 1
         flags_str = _active_flags(report.get("flags", {}))
         base_sharpe = report.get("baseline", {}).get("val_sharpe", 0)
-        cost0_sharpe = report.get("cost_free", {}).get("val_sharpe", 0)
-        print(f"REVIEW_DIAG {family_key} flags={flags_str} "
-              f"base_val_sharpe={base_sharpe:.4f} cost0_val_sharpe={cost0_sharpe:.4f}")
+        cost_free = report.get("cost_free")
+        cost0_sharpe = None
+        if cost_free is not None:
+            cost0_sharpe = cost_free.get("val_sharpe", 0)
+            print(f"REVIEW_DIAG {family_key} flags={flags_str} "
+                  f"base_val_sharpe={base_sharpe:.4f} cost0_val_sharpe={cost0_sharpe:.4f}")
+        else:
+            print(f"REVIEW_DIAG {family_key} flags={flags_str} "
+                  f"base_val_sharpe={base_sharpe:.4f} cost0_val_sharpe=n/a")
 
         # Persist
         report_path = _save_report(report)
@@ -596,7 +551,7 @@ def main():
             "family_key": family_key,
             "flags": flags_str,
             "base_val_sharpe": round(base_sharpe, 4),
-            "cost0_val_sharpe": round(cost0_sharpe, 4),
+            "cost0_val_sharpe": round(cost0_sharpe, 4) if cost0_sharpe is not None else None,
             "report": str(report_path.name),
             "diagnosed_at": report.get("diagnosed_at", ""),
         }

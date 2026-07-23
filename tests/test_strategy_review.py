@@ -481,10 +481,14 @@ class TestHoldoutExclusion:
         report = {
             "family_key": "manifest:test|universe:abc",
             "diagnosed_at": "2026-07-20T00:00:00",
-            "flags": {"cost_bound": True},
-            "baseline": {"val_sharpe": 0.5},
-            "cost_free": {"val_sharpe": 1.0},
+            "diagnosis_scope": "baseline_only",
+            "flags": [],
+            "baseline": {"val_sharpe": 0.5, "source": "recorded_near_miss"},
+            "cost_free": None,
             "folds_available": False,
+            "warnings": [
+                "manifest spec not persisted in knowledge; cost-free re-run unavailable"
+            ],
         }
         report_path = tmp_path / "report.json"
         report_path.write_text(json.dumps(report))
@@ -766,7 +770,109 @@ class TestFamilyEvidence:
 
 
 # ============================================================================
-# 8. Runner response parsing
+# 8. Cross-family diagnosis (baseline-only, zero HTTP)
+# ============================================================================
+
+class TestCrossDiagnosis:
+    def test_cross_diagnosis_makes_zero_http_calls(self, tmp_path, monkeypatch):
+        """Cross-family diagnosis must never call _post_json."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+
+        calls = []
+        def _track(*args, **kwargs):
+            calls.append(1)
+            return {"status": "ok"}
+        monkeypatch.setattr(sr, "_post_json", _track)
+
+        family_key = "manifest:xs_mom|universe:abc"
+        knowledge = _make_knowledge(
+            families={
+                family_key: _make_family(family_key, family_type="cross"),
+            },
+            near_misses_cross=[
+                _make_near_miss(strategy="manifest:xs_mom", symbol="universe:abc",
+                                date="2026-07-15T00:00:00", val_sharpe=0.7,
+                                params={"universe_size": 5}),
+            ],
+        )
+        report, error = sr.diagnose_family(family_key, knowledge, "http://fake:9000")
+        assert error is None
+        assert calls == [], f"Cross diagnosis made {len(calls)} HTTP call(s), expected 0"
+
+    def test_cross_report_shape(self, tmp_path, monkeypatch):
+        """Cross-family report has correct baseline-only shape."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+
+        family_key = "manifest:xs_mom|universe:abc"
+        knowledge = _make_knowledge(
+            families={
+                family_key: _make_family(family_key, family_type="cross"),
+            },
+            near_misses_cross=[
+                _make_near_miss(strategy="manifest:xs_mom", symbol="universe:abc",
+                                date="2026-07-15T00:00:00", val_sharpe=0.7,
+                                params={"universe_size": 5}),
+            ],
+        )
+        report, error = sr.diagnose_family(family_key, knowledge, "http://fake:9000")
+        assert error is None
+        assert report["diagnosis_scope"] == "baseline_only"
+        assert report["flags"] == []
+        assert report["cost_free"] is None
+        assert report["folds_available"] is False
+        assert len(report["warnings"]) >= 1
+        assert "manifest spec not persisted" in report["warnings"][0]
+        assert report["baseline"]["source"] == "recorded_near_miss"
+        assert report["baseline"]["val_sharpe"] == 0.7
+
+    def test_cross_baseline_from_rejected_evaluation(self, tmp_path, monkeypatch):
+        """Cross baseline uses recorded evaluation from rejected entry."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+
+        family_key = "manifest:xs_mom|universe:abc"
+        knowledge = _make_knowledge(
+            families={
+                family_key: _make_family(family_key, family_type="cross"),
+            },
+            rejected=[
+                _make_rejected(strategy="manifest:xs_mom", symbol="universe:abc",
+                               tested_at="2026-07-15T00:00:00", val_sharpe=0.65),
+            ],
+        )
+        report, error = sr.diagnose_family(family_key, knowledge, "http://fake:9000")
+        assert error is None
+        assert report["baseline"]["source"] == "recorded_evaluation"
+        assert report["baseline"]["val_sharpe"] == 0.65
+        assert report["cost_free"] is None
+
+    def test_cross_diagnosis_no_fabricated_cost_free(self):
+        """No test may assert a fabricated cost_free value for cross families."""
+        family_key = "manifest:xs_mom|universe:abc"
+        knowledge = _make_knowledge(
+            families={
+                family_key: _make_family(family_key, family_type="cross"),
+            },
+            near_misses_cross=[
+                _make_near_miss(strategy="manifest:xs_mom", symbol="universe:abc",
+                                date="2026-07-15T00:00:00", val_sharpe=0.7),
+            ],
+        )
+        report, error = sr.diagnose_family(family_key, knowledge, "http://fake:9000")
+        assert error is None
+        # cost_free must be None (not a dict, not a number)
+        assert report["cost_free"] is None
+        # flags must be empty list (not a dict with fabricated flags)
+        assert report["flags"] == []
+
+
+# ============================================================================
+# 9. Runner response parsing
 # ============================================================================
 
 class TestParseRunner:
