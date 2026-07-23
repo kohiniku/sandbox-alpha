@@ -345,8 +345,8 @@ class TestLoopKilledSkip:
                                   "n_trials": 5, "best_val_sharpe": -0.5, "family_type": "single",
                                   "refine_count": 0},
             },
-            "adopted": [], "rejected": [], "superseded": [], "tested_combinations": [],
-            "iterations": 0, "errors": [],
+            "adopted": [], "rejected": [], "superseded": [], "tested": [],
+            "tested_combinations": [], "iterations": 0, "errors": [],
         }
 
         hypothesis = {
@@ -395,8 +395,8 @@ class TestLoopKilledSkip:
                                   "n_trials": 5, "best_val_sharpe": -0.5, "family_type": "single",
                                   "refine_count": 0},
             },
-            "adopted": [], "rejected": [], "superseded": [], "tested_combinations": [],
-            "iterations": 0, "errors": [],
+            "adopted": [], "rejected": [], "superseded": [], "tested": [],
+            "tested_combinations": [], "iterations": 0, "errors": [],
         }
 
         bl_path = tmp_path / "backlog.json"
