@@ -158,7 +158,7 @@ class TestStrategyHarness:
         for key in ["in_sample", "out_of_sample", "holdout"]:
             seg = result[key]
             for m in ["total_return_pct", "sharpe_ratio", "max_drawdown_pct",
-                      "num_trades", "avg_daily_return_pct", "cost_bps", "num_days"]:
+                      "num_trades", "avg_daily_return_pct", "cost_bps", "turnover", "num_days"]:
                 assert m in seg, f"missing {m} in {key}"
 
     def test_benign_numpy_code_valid(self, tmp_path):
