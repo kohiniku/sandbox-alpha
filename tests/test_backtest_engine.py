@@ -128,6 +128,7 @@ class TestCalculateMetrics:
             "num_trades",
             "avg_daily_return_pct",
             "cost_bps",
+            "turnover",
         ]:
             assert key in result
 

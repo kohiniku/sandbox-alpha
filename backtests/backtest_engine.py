@@ -77,12 +77,13 @@ def run_strategy_on_segment(df, strategy_fn, params):
 
 
 def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
-                 metrics_since=None, cv_folds=None, embargo_days=21):
+                 metrics_since=None, cv_folds=None, embargo_days=21, cost_bps=None):
     """
     Run full backtest with optional walk-forward validation.
     data_dir: if set, load cached CSV from this dir instead of calling yfinance.
     metrics_since: if set (YYYY-MM-DD string or datetime), compute since_metrics
                    over rows with index >= that date (full data, no splitting).
+    cost_bps: optional per-run cost override (None → module default COST_BPS).
     """
     if data_dir:
         df = load_cached_data(symbol, data_dir)
@@ -101,8 +102,8 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
         # Full-sample backtest
         print(f"Running {strategy_name} strategy (full sample)...", file=sys.stderr)
         returns, signal = run_strategy_on_segment(df, strategy_fn, params)
-        returns_net = apply_trading_cost(returns, signal)
-        metrics = calculate_metrics(returns_net, signal)
+        returns_net = apply_trading_cost(returns, signal, cost_bps=cost_bps)
+        metrics = calculate_metrics(returns_net, signal, cost_bps=cost_bps)
         metrics["strategy"] = strategy_name
         metrics["params"] = params
         metrics["symbol"] = symbol
@@ -117,8 +118,8 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
                 metrics["since_metrics"] = {"n_days": 0}
             else:
                 since_returns, since_signal = run_strategy_on_segment(since_df, strategy_fn, params)
-                since_returns_net = apply_trading_cost(since_returns, since_signal)
-                since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df))
+                since_returns_net = apply_trading_cost(since_returns, since_signal, cost_bps=cost_bps)
+                since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df), cost_bps=cost_bps)
                 # Rename num_days to n_days for spec compliance
                 since_m["n_days"] = since_m.pop("num_days")
                 metrics["since_metrics"] = since_m
@@ -130,18 +131,18 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
 
     # In-sample (train)
     is_returns, is_signal = run_strategy_on_segment(train_df, strategy_fn, params)
-    is_returns_net = apply_trading_cost(is_returns, is_signal)
-    is_metrics = compute_split_metrics(is_returns_net, is_signal, len(train_df))
+    is_returns_net = apply_trading_cost(is_returns, is_signal, cost_bps=cost_bps)
+    is_metrics = compute_split_metrics(is_returns_net, is_signal, len(train_df), cost_bps=cost_bps)
 
     # Validation (out-of-sample)
     val_returns, val_signal = run_strategy_on_segment(val_df, strategy_fn, params)
-    val_returns_net = apply_trading_cost(val_returns, val_signal)
-    val_metrics = compute_split_metrics(val_returns_net, val_signal, len(val_df))
+    val_returns_net = apply_trading_cost(val_returns, val_signal, cost_bps=cost_bps)
+    val_metrics = compute_split_metrics(val_returns_net, val_signal, len(val_df), cost_bps=cost_bps)
 
     # Holdout
     holdout_returns, holdout_signal = run_strategy_on_segment(holdout_df, strategy_fn, params)
-    holdout_returns_net = apply_trading_cost(holdout_returns, holdout_signal)
-    holdout_metrics = compute_split_metrics(holdout_returns_net, holdout_signal, len(holdout_df))
+    holdout_returns_net = apply_trading_cost(holdout_returns, holdout_signal, cost_bps=cost_bps)
+    holdout_metrics = compute_split_metrics(holdout_returns_net, holdout_signal, len(holdout_df), cost_bps=cost_bps)
 
     result = {
         "strategy": strategy_name,
@@ -170,9 +171,9 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
         holdout_cv_df = folds[0][2]
         holdout_cv_ret, holdout_cv_sig = run_strategy_on_segment(
             holdout_cv_df, strategy_fn, params)
-        holdout_cv_net = apply_trading_cost(holdout_cv_ret, holdout_cv_sig)
+        holdout_cv_net = apply_trading_cost(holdout_cv_ret, holdout_cv_sig, cost_bps=cost_bps)
         holdout_cv_metrics = compute_split_metrics(
-            holdout_cv_net, holdout_cv_sig, len(holdout_cv_df))
+            holdout_cv_net, holdout_cv_sig, len(holdout_cv_df), cost_bps=cost_bps)
         holdout_cv_ret_list = [float(v) for v in holdout_cv_net.values]
         holdout_cv_dates = [d.strftime('%Y-%m-%d') for d in holdout_cv_net.index]
 
@@ -181,14 +182,14 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
             # Train metrics
             tr_ret, tr_sig = run_strategy_on_segment(
                 train_cv_df, strategy_fn, params)
-            tr_net = apply_trading_cost(tr_ret, tr_sig)
-            train_m = compute_split_metrics(tr_net, tr_sig, len(train_cv_df))
+            tr_net = apply_trading_cost(tr_ret, tr_sig, cost_bps=cost_bps)
+            train_m = compute_split_metrics(tr_net, tr_sig, len(train_cv_df), cost_bps=cost_bps)
 
             # Val metrics + raw net daily returns
             vr_ret, vr_sig = run_strategy_on_segment(
                 val_cv_df, strategy_fn, params)
-            vr_net = apply_trading_cost(vr_ret, vr_sig)
-            val_m = compute_split_metrics(vr_net, vr_sig, len(val_cv_df))
+            vr_net = apply_trading_cost(vr_ret, vr_sig, cost_bps=cost_bps)
+            val_m = compute_split_metrics(vr_net, vr_sig, len(val_cv_df), cost_bps=cost_bps)
             val_ret_list = [float(v) for v in vr_net.values]
             val_date_list = [d.strftime('%Y-%m-%d') for d in vr_net.index]
 
@@ -226,8 +227,8 @@ def run_backtest(strategy_name, symbol, params, walkforward=True, data_dir=None,
             result["since_metrics"] = {"n_days": 0}
         else:
             since_returns, since_signal = run_strategy_on_segment(since_df, strategy_fn, params)
-            since_returns_net = apply_trading_cost(since_returns, since_signal)
-            since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df))
+            since_returns_net = apply_trading_cost(since_returns, since_signal, cost_bps=cost_bps)
+            since_m = compute_split_metrics(since_returns_net, since_signal, len(since_df), cost_bps=cost_bps)
             # Rename num_days to n_days for spec compliance
             since_m["n_days"] = since_m.pop("num_days")
             result["since_metrics"] = since_m
@@ -249,6 +250,17 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError(
                 f"--embargo-days must be in [0, 60], got {ivalue}")
         return ivalue
+
+    def _validate_cost_bps(value):
+        fvalue = float(value)
+        # Reject bool-ish (True/False cast to 1.0/0.0), NaN, inf
+        if isinstance(value, bool) or fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+            raise argparse.ArgumentTypeError(
+                f"--cost-bps must be a real number in [0.0, 100.0], got {value!r}")
+        if fvalue < 0.0 or fvalue > 100.0:
+            raise argparse.ArgumentTypeError(
+                f"--cost-bps must be in [0.0, 100.0], got {fvalue}")
+        return fvalue
 
     parser = argparse.ArgumentParser(description="Backtest Engine")
     parser.add_argument("--strategy", default=None, help="Strategy name")
@@ -281,6 +293,10 @@ if __name__ == "__main__":
         "--embargo-days", type=_validate_embargo_days, default=21,
         help="Embargo gap in trading days between train and val [0-60] (default: 21)"
     )
+    parser.add_argument(
+        "--cost-bps", type=_validate_cost_bps, default=None,
+        help="Per-run trading cost override in bps [0.0-100.0] (default: module COST_BPS=5.0)"
+    )
     args = parser.parse_args()
 
     # --- fetch-only mode: no strategy execution ---
@@ -305,5 +321,6 @@ if __name__ == "__main__":
         metrics_since=args.metrics_since,
         cv_folds=args.cv_folds,
         embargo_days=args.embargo_days,
+        cost_bps=args.cost_bps,
     )
     print(json.dumps(result, indent=2, default=str))

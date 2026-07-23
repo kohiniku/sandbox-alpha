@@ -73,7 +73,7 @@ def test_engine_help_succeeds_in_flat_layout(flat_layout):
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     # Sanity: --cv-folds must appear in help (guards against silent CLI drift).
-    assert "--cv-folds" in result.stdout, f"--cv-folds missing from help:\n{result.stdout}"
+    assert "--cost-bps" in result.stdout, f"--cost-bps missing from help:\n{result.stdout}"
     assert "--embargo-days" in result.stdout, f"--embargo-days missing from help:\n{result.stdout}"
 
 

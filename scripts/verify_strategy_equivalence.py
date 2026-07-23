@@ -27,6 +27,10 @@ import pandas as pd
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ENGINE = REPO / "backtests" / "backtest_engine.py"
 
+# Keys introduced after the baseline that should be stripped from normalized
+# output so equivalence diffs don't flag additive-only schema changes.
+STRIP_KEYS = {"turnover"}
+
 DATA_SPECS = {"TRND": (7, 0.0008, 0.012), "CHOP": (13, 0.0000, 0.020)}
 
 MATRIX = [
@@ -66,6 +70,15 @@ def generate_data(data_dir: pathlib.Path) -> None:
         df.to_csv(data_dir / f"{symbol}.csv")
 
 
+def _strip_keys(obj, keys):
+    """Recursively strip keys from dicts."""
+    if isinstance(obj, dict):
+        return {k: _strip_keys(v, keys) for k, v in obj.items() if k not in keys}
+    if isinstance(obj, list):
+        return [_strip_keys(v, keys) for v in obj]
+    return obj
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True, help="Directory for normalized JSON outputs")
@@ -93,7 +106,9 @@ def main() -> int:
                 print(f"FAIL {name}: {proc.stderr[-300:]}")
                 failures += 1
                 continue
-            normalized = json.dumps(json.loads(proc.stdout), indent=1, sort_keys=True)
+            normalized = json.dumps(
+                _strip_keys(json.loads(proc.stdout), STRIP_KEYS),
+                indent=1, sort_keys=True)
             (out / name).write_text(normalized + "\n")
             print(f"ok   {name}")
     return 1 if failures else 0

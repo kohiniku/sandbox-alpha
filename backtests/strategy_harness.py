@@ -286,7 +286,7 @@ def build_synthetic_df(n_days=250, seed=42):
     return df
 
 
-def run_preflight(code_b64_str):
+def run_preflight(code_b64_str, cost_bps=None):
     """Preflight validation: decode → safety → exec → signal contract → backtest on synthetic data.
 
     Returns a JSON-serialisable dict:
@@ -334,8 +334,8 @@ def run_preflight(code_b64_str):
     # Fast backtest pass on synthetic data to catch downstream errors
     try:
         strat_returns, _ = compute_position_returns(df, signals)
-        strat_returns_net = apply_trading_cost(strat_returns, signals.reindex(strat_returns.index))
-        _ = compute_split_metrics(strat_returns_net, signals, len(df))
+        strat_returns_net = apply_trading_cost(strat_returns, signals.reindex(strat_returns.index), cost_bps=cost_bps)
+        _ = compute_split_metrics(strat_returns_net, signals, len(df), cost_bps=cost_bps)
     except Exception as e:
         tb_lines = tb_module.format_exc().splitlines()[-15:]
         return {"valid": False, "error": f"backtest pass failed: {e}", "traceback": "\n".join(tb_lines)}
@@ -344,7 +344,7 @@ def run_preflight(code_b64_str):
     return {"valid": True, "n_signals": n_signals}
 
 
-def run_harness(code_str, symbol, data_dir):
+def run_harness(code_str, symbol, data_dir, cost_bps=None):
     """Full harness pipeline: decode → safety → exec → lookahead → metrics → JSON."""
 
     # (a) decode
@@ -397,8 +397,8 @@ def run_harness(code_str, symbol, data_dir):
 
     def _segment_metrics(seg_df):
         strat_returns, sig = compute_position_returns(seg_df, signals.reindex(seg_df.index))
-        strat_returns_net = apply_trading_cost(strat_returns, sig.reindex(strat_returns.index))
-        return compute_split_metrics(strat_returns_net, sig, len(seg_df))
+        strat_returns_net = apply_trading_cost(strat_returns, sig.reindex(strat_returns.index), cost_bps=cost_bps)
+        return compute_split_metrics(strat_returns_net, sig, len(seg_df), cost_bps=cost_bps)
 
     is_metrics = _segment_metrics(train_df)
     val_metrics = _segment_metrics(val_df)
@@ -432,16 +432,23 @@ if __name__ == "__main__":
                        help="Preflight mode: validate against synthetic OHLCV data")
 
     parser.add_argument("--data-dir", help="Directory for cached CSV files (normal mode)")
+    parser.add_argument("--cost-bps", type=float, default=None,
+                       help="Override trading cost in bps (0.0-100.0, default 5.0)")
     args = parser.parse_args()
 
+    # Validate --cost-bps if provided
+    if args.cost_bps is not None:
+        if args.cost_bps < 0 or args.cost_bps > 100:
+            parser.error(f"--cost-bps must be in [0.0, 100.0], got {args.cost_bps}")
+
     if args.synthetic:
-        result = run_preflight(args.code_b64)
+        result = run_preflight(args.code_b64, cost_bps=args.cost_bps)
         print(json.dumps(result, default=str))
         sys.exit(0)  # validity is in the payload, always exit 0
     else:
         if not args.data_dir:
             parser.error("--data-dir is required in normal mode (without --synthetic)")
-        result = run_harness(args.code_b64, args.symbol, args.data_dir)
+        result = run_harness(args.code_b64, args.symbol, args.data_dir, cost_bps=args.cost_bps)
 
         if "error" in result:
             print(json.dumps({"error": result["error"]}))
