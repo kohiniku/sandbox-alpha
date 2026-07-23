@@ -40,7 +40,7 @@ from llm_hypothesis import _SYMBOL_RE
 # Import STRATEGY_TEMPLATES from autonomous_loop (read-only)
 from autonomous_loop import STRATEGY_TEMPLATES
 
-from loop_constants import MISSING_METRIC
+from loop_constants import MISSING_METRIC, FamilyLifecycle
 
 # Import manifest module (Phase 0 PR-A)
 from manifest import StrategyManifest, ManifestValidationError, VALID_METRICS
@@ -89,6 +89,38 @@ def _get_ideation_config():
         "ideation_v3": os.environ.get("IDEATION_V3", "1") != "0",
         "ideation_v2": os.environ.get("IDEATION_V2", "1") != "0",
     }
+
+
+def _get_killed_families(knowledge) -> dict[str, str]:
+    """Local dupe of autonomous_loop.get_killed_families to avoid import-time side effects."""
+    families = knowledge.get("families", {})
+    return {
+        key: fam.get("kill_reason", "")
+        for key, fam in families.items()
+        if fam.get("lifecycle") == FamilyLifecycle.KILLED
+    }
+
+
+def _build_banned_families_block(knowledge) -> str | None:
+    """Build a 'BANNED FAMILIES' text block from killed families. Capped at 30 lines."""
+    killed = _get_killed_families(knowledge)
+    if not killed:
+        return None
+    lines = [
+        "=== BANNED FAMILIES (KILLED — never propose ideas in these families) ===",
+    ]
+    for key, reason in sorted(killed.items()):
+        reason_text = reason or "no reason given"
+        lines.append(f"  {key}: KILLED ({reason_text})")
+    if len(killed) > 30:
+        lines = lines[:31]  # header + 30 lines
+        lines.append(f"  ... and {len(killed) - 30} more")
+    return "\n".join(lines)
+
+
+def _family_key_local(strategy: str, symbol: str, family_type: str) -> str:
+    """Local dupe of autonomous_loop._family_key to avoid import-time side effects."""
+    return f"{strategy}|{symbol}"
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +528,7 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
     rejects_summary = _summarise_rejects(knowledge)
     near_misses_text = _summarise_near_misses(knowledge)
     code_errors_text = _summarise_code_errors(knowledge)
+    banned_block = _build_banned_families_block(knowledge)
 
     research_text = ""
     if research_docs:
@@ -509,6 +542,9 @@ def _build_prompt(knowledge, templates, research_docs, backlog_summary, max_prop
 
 === FAILURE HISTORY (rejected entries + family aggregates) ===
 {rejects_summary}
+
+=== BANNED FAMILIES (never propose ideas in these — they are KILLED) ===
+{banned_block or "(no banned families)"}
 
 === NEAR-MISS ARCHIVE (signal on validation, failed later) ===
 {near_misses_text or "(no near-misses recorded yet)"}
@@ -850,7 +886,11 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
     for key, fam in sorted(families.items()):
         n = fam.get("n_trials", 0)
         best = fam.get("best_val_sharpe", MISSING_METRIC)
-        family_lines.append(f"  {key}: {n} trials, best sharpe={best:.2f}")
+        killed = " [KILLED]" if fam.get("lifecycle") == FamilyLifecycle.KILLED else ""
+        family_lines.append(f"  {key}: {n} trials, best sharpe={best:.2f}{killed}")
+
+    # Banned families block
+    banned_block = _build_banned_families_block(knowledge)
 
     # Near-misses
     near_misses = knowledge.get("near_misses", [])
@@ -915,6 +955,12 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
         "single-name. Reserve single-name for absolute-timing theses (mean "
         "reversion on one symbol, regime detection on SPY)."
     )
+    if banned_block:
+        mandates.append(
+            "MANDATE: Never propose ideas in BANNED families. "
+            "These families have been killed by operator decision — "
+            "ignore them completely."
+        )
 
     mandates_text = "\n".join(mandates) if mandates else ""
 
@@ -922,6 +968,9 @@ def _build_brainstorm_prompt(knowledge, templates, research_docs):
 
 === FAMILIES ===
 {chr(10).join(family_lines) if family_lines else "(no family data)"}
+
+=== BANNED FAMILIES (KILLED — never propose ideas in these) ===
+{banned_block or "(no banned families)"}
 
 === NEAR-MISS ARCHIVE ===
 {chr(10).join(nm_lines) if nm_lines else "(no near-misses)"}
@@ -1156,6 +1205,7 @@ def _stage_select(surviving_ideas, debate_results, knowledge, templates, researc
     families = knowledge.get("families", {})
     family_summary = "\n".join(
         f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
+        f"{' [KILLED]' if f.get('lifecycle') == FamilyLifecycle.KILLED else ''}"
         for k, f in sorted(families.items())
     )
 
@@ -1314,6 +1364,19 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
         print("🧠 IDEATION_V2 Stage 1: Brainstorm (divergent, high-temp)...")
         brainstorm_ideas = _stage_brainstorm(knowledge, templates, research_docs)
         print(f"   📥 {len(brainstorm_ideas)} raw ideas generated")
+
+        # Post-LLM kill filter: drop ideas in killed families
+        killed_families = _get_killed_families(knowledge)
+        if killed_families and brainstorm_ideas:
+            filtered = []
+            for idea in brainstorm_ideas:
+                fk = idea.get("family", "")
+                if fk and fk in killed_families:
+                    print(f"BANNED_DROP {fk}")
+                    continue
+                filtered.append(idea)
+            brainstorm_ideas = filtered
+            print(f"   📥 After kill filter: {len(brainstorm_ideas)} ideas")
     except Exception as e:
         print(f"⚠️  IDEATION_V2 brainstorm failed: {e} — falling back to single-call path", file=sys.stderr)
         return None  # signal fallback
@@ -1334,6 +1397,26 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
         surviving = brainstorm_ideas  # pass all; _stage_select filters by debate survive flag
         proposals, select_fallback_used = _stage_select(surviving, debate_results, knowledge, templates, research_docs, max_proposals)
         print(f"   📝 {len(proposals)} full proposals generated")
+
+        # Post-LLM kill filter: drop killed-family proposals
+        killed_families = _get_killed_families(knowledge)
+        if killed_families and proposals:
+            filtered = []
+            for p in proposals:
+                ptype = p.get("type")
+                spec = p.get("spec", {})
+                if ptype == "param":
+                    fk = _family_key_local(spec.get("strategy", ""), spec.get("symbol", ""), "single")
+                elif ptype == "code":
+                    fk = _family_key_local("codegen", spec.get("symbol", ""), "single")
+                else:
+                    fk = None
+                if fk and fk in killed_families:
+                    print(f"BANNED_DROP {fk}")
+                    continue
+                filtered.append(p)
+            proposals = filtered
+            print(f"   📝 After kill filter: {len(proposals)} proposals")
     except Exception as e:
         print(f"⚠️  IDEATION_V2 select failed: {e} — falling back to single-call path", file=sys.stderr)
         return None
@@ -1476,11 +1559,13 @@ def _stage_select_v3(surviving_ideas, debate_results, knowledge, templates, rese
 
     single_summary = "\n".join(
         f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
+        f"{' [KILLED]' if f.get('lifecycle') == FamilyLifecycle.KILLED else ''}"
         for k, f in sorted(single_fams.items())
     ) or "  (none yet)"
 
     cross_summary = "\n".join(
         f"  {k}: {f.get('n_trials', 0)} trials, best sharpe={f.get('best_val_sharpe', MISSING_METRIC):.2f}"
+        f"{' [KILLED]' if f.get('lifecycle') == FamilyLifecycle.KILLED else ''}"
         for k, f in sorted(cross_fams.items())
     ) or "  (none yet — NOVEL cross-sectional ideas score higher on novelty)"
 
@@ -2021,6 +2106,19 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         print("🧠 IDEATION_V3 Stage 1: Brainstorm (divergent, high-temp)...")
         brainstorm_ideas = _stage_brainstorm(knowledge, templates, research_docs)
         print(f"   📥 {len(brainstorm_ideas)} raw ideas generated")
+
+        # Post-LLM kill filter: drop ideas in killed families
+        killed_families = _get_killed_families(knowledge)
+        if killed_families and brainstorm_ideas:
+            filtered = []
+            for idea in brainstorm_ideas:
+                fk = idea.get("family", "")
+                if fk and fk in killed_families:
+                    print(f"BANNED_DROP {fk}")
+                    continue
+                filtered.append(idea)
+            brainstorm_ideas = filtered
+            print(f"   📥 After kill filter: {len(brainstorm_ideas)} ideas")
     except Exception as e:
         print(f"⚠️  IDEATION_V3 brainstorm failed: {e} — falling back to v2 ({e})", file=sys.stderr)
         return None
@@ -2043,6 +2141,29 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
             surviving, debate_results, knowledge, templates, research_docs, max_proposals
         )
         print(f"   📝 {len(manifests)} valid manifests generated")
+
+        # Post-LLM kill filter: drop manifests in killed families
+        killed_families = _get_killed_families(knowledge)
+        if killed_families and manifests:
+            import hashlib as _hashlib
+            import json as _json
+            filtered = []
+            for m in manifests:
+                # Compute universe hash from manifest data_sources
+                universe = []
+                for ds in (m.data_sources or []):
+                    if hasattr(ds, "universe") and getattr(ds, "type", "") == "ohlcv" and ds.universe:
+                        universe = ds.universe
+                        break
+                sorted_u = sorted(universe)
+                uh = _hashlib.sha256(_json.dumps(sorted_u, sort_keys=True).encode()).hexdigest()[:8]
+                fk = _family_key_local(f"manifest:{m.name}", f"universe:{uh}", "cross")
+                if fk in killed_families:
+                    print(f"BANNED_DROP {fk}")
+                    continue
+                filtered.append(m)
+            manifests = filtered
+            print(f"   📝 After kill filter: {len(manifests)} manifests")
     except Exception as e:
         print(f"⚠️  IDEATION_V3 select failed: {e} — falling back to v2 pipeline", file=sys.stderr)
         return None
@@ -2219,6 +2340,26 @@ def run(max_proposals=5, dry_run=False):
         return []
 
     print(f"📥 LLM returned {len(proposals)} raw proposals")
+
+    # ── Post-LLM kill filter: drop proposals in killed families ──
+    killed_families = _get_killed_families(knowledge)
+    if killed_families:
+        filtered = []
+        for p in proposals:
+            ptype = p.get("type")
+            spec = p.get("spec", {})
+            if ptype == "param":
+                fk = _family_key_local(spec.get("strategy", ""), spec.get("symbol", ""), "single")
+            elif ptype == "code":
+                fk = _family_key_local("codegen", spec.get("symbol", ""), "single")
+            else:
+                fk = None
+            if fk and fk in killed_families:
+                print(f"BANNED_DROP {fk}")
+                continue
+            filtered.append(p)
+        proposals = filtered
+        print(f"📥 After kill filter: {len(proposals)} proposals")
 
     # ── (c) Validate + Preflight ──
     accepted = []

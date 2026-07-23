@@ -67,7 +67,7 @@ STRATEGY_TEMPLATES = {
 MIN_SHARPE_BASE = 0.5  # absolute floor for deflated threshold
 MAX_DRAWDOWN_LIMIT = -25.0  # max drawdown gate (validation)
 
-from loop_constants import MISSING_METRIC, Verdict, BacklogStatus
+from loop_constants import MISSING_METRIC, Verdict, BacklogStatus, FamilyLifecycle
 from loop_constants import (BOOTSTRAP_ALPHA, BOOTSTRAP_N_RESAMPLE,
                             CV_FOLDS, EMBARGO_DAYS, BLOCK_LEN_MIN)
 from backtests.bootstrap import BootstrapLCB
@@ -145,6 +145,14 @@ def load_knowledge():
         # Migration: legacy knowledge only had a single near_misses list; introduce
         # near_misses_cross alongside without touching the existing data.
         data.setdefault("near_misses_cross", [])
+
+        # Migration: add lifecycle fields to families that lack them.
+        for fam in data.get("families", {}).values():
+            if "lifecycle" not in fam:
+                fam["lifecycle"] = FamilyLifecycle.CANDIDATE
+                fam["refine_count"] = 0
+                fam["kill_reason"] = ""
+
         return data
     return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
             "superseded": [], "families": {}, "iterations": 0, "errors": []}
@@ -171,6 +179,9 @@ def _rebuild_families_from_history(knowledge):
                               "duplicate_cluster": 0, "exhausted_cluster": 0},
             "last_tried": "",
             "family_type": _derive_family_type(hyp),
+            "lifecycle": FamilyLifecycle.CANDIDATE,
+            "refine_count": 0,
+            "kill_reason": "",
         })
         _apply_entry_to_family(families, key, entry, hyp, _derive_family_type(hyp))
     return families
@@ -195,6 +206,16 @@ def _derive_family_type(hyp: dict) -> str:
     return "cross" if strategy.startswith("manifest:") else "single"
 
 
+def get_killed_families(knowledge) -> dict[str, str]:
+    """Return family_key -> kill_reason for families with lifecycle == KILLED."""
+    families = knowledge.get("families", {})
+    return {
+        key: fam.get("kill_reason", "")
+        for key, fam in families.items()
+        if fam.get("lifecycle") == FamilyLifecycle.KILLED
+    }
+
+
 def _apply_entry_to_family(families, key, entry, hyp, family_type="single"):
     """Incrementally update a single family aggregate record from one evaluation entry."""
     fam = families.setdefault(key, {
@@ -205,6 +226,9 @@ def _apply_entry_to_family(families, key, entry, hyp, family_type="single"):
                           "duplicate_cluster": 0, "exhausted_cluster": 0},
         "last_tried": "",
         "family_type": family_type,
+        "lifecycle": FamilyLifecycle.CANDIDATE,
+        "refine_count": 0,
+        "kill_reason": "",
     })
     fam["n_trials"] += 1
     ev = entry.get("evaluation", {})
@@ -1482,6 +1506,24 @@ def _consume_backlog_entry(knowledge):
     # Mark as testing
     bl.mark(entry["id"], BacklogStatus.TESTING)
 
+    # KILLED family guard (defense in depth — ideation-side filter is primary)
+    if etype == "param":
+        bk_family_key = _family_key(spec["strategy"], spec["symbol"], "single")
+    elif etype == "manifest":
+        manifest_name = spec.get("name", "unknown")
+        _, universe_hash, _ = _extract_universe_meta(spec)
+        bk_family_key = _family_key(f"manifest:{manifest_name}", f"universe:{universe_hash}", "cross")
+    elif etype == "code":
+        bk_family_key = _family_key("codegen", spec.get("symbol", "?"), "single")
+    else:
+        bk_family_key = None
+
+    if bk_family_key and bk_family_key in get_killed_families(knowledge):
+        print(f"KILLED_SKIP {bk_family_key}")
+        bl.mark(entry["id"], BacklogStatus.DONE_REJECTED,
+                result={"reason": "family_killed"})
+        return None
+
     runner_url = _get_loop_config()["runner_url"]
 
     # ── Route to per-type handler ──
@@ -1670,6 +1712,14 @@ def run_loop(num_iterations=3):
         else:
             hypothesis = generate_hypothesis(knowledge)
             source_label = "(random)"
+
+        # 1a. KILLED family guard (defense in depth)
+        param_family_key = _family_key(hypothesis["strategy"], hypothesis["symbol"],
+                                       _derive_family_type(hypothesis))
+        if param_family_key in get_killed_families(knowledge):
+            print(f"KILLED_SKIP {param_family_key}")
+            save_knowledge(knowledge)
+            continue
         
         # 2. Exhausted-cluster pre-block check
         exhausted, n_failures, best_fail_sharpe = _check_exhausted_cluster(hypothesis, knowledge)
