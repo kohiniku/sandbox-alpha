@@ -247,10 +247,17 @@ def _parse_baseline_response(response):
     cv_block = response.get("cv", {})
     folds = cv_block.get("folds", [])
     if folds:
+        # Real runner schema keys per-fold metrics as "val_metrics"
+        # (backtest_engine.py cv_folds_data). Skip folds without a sharpe
+        # rather than defaulting to 0.0 — a fabricated 0.0 would poison
+        # the unstable/regime_dependent flags.
         fold_sharpes = []
         for fold in folds:
-            val = fold.get("val", {})
-            fold_sharpes.append(val.get("sharpe_ratio", 0.0))
+            sharpe = fold.get("val_metrics", {}).get("sharpe_ratio")
+            if sharpe is not None:
+                fold_sharpes.append(sharpe)
+        if not fold_sharpes:
+            fold_sharpes = None
 
     return val_sharpe, val_turnover, fold_sharpes
 
