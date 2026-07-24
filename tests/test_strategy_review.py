@@ -768,6 +768,42 @@ class TestFamilyEvidence:
         assert evidence is not None
         assert evidence["params"]["universe_size"] == 5
 
+    def test_diagnose_single_uses_hypothesis_params_from_rejected(self, monkeypatch):
+        """Rejected-shaped evidence nests params under hypothesis — the
+        baseline payload must carry them (regression: empty params → 400)."""
+        evidence = {
+            "hypothesis": {
+                "strategy": "rsi", "symbol": "AMZN",
+                "params": {"rsi_window": 16, "oversold": 35, "overbought": 65},
+            },
+            "tested_at": "2026-07-15T00:00:00",
+        }
+        sent = []
+
+        def fake_post(url, payload, timeout=180):
+            sent.append(payload)
+            return {"out_of_sample": {"sharpe_ratio": 0.4, "turnover": 10.0}}
+
+        monkeypatch.setattr(sr, "_post_json", fake_post)
+        report, err = sr._diagnose_single_family(
+            "rsi|AMZN", evidence, "http://runner:9000", "2026-07-20T00:00:00")
+        assert err is None
+        assert sent[0]["params"] == {"rsi_window": 16, "oversold": 35, "overbought": 65}
+
+    def test_diagnose_single_no_params_is_error_not_400(self, monkeypatch):
+        """Evidence with no recoverable params must fail before any HTTP call."""
+        called = []
+        monkeypatch.setattr(sr, "_post_json",
+                            lambda *a, **k: called.append(1))
+        report, err = sr.diagnose_family("rsi|AMZN", {
+            "families": {"rsi|AMZN": {"family_type": "single"}},
+            "near_misses": [{"strategy": "rsi", "symbol": "AMZN",
+                             "date": "2026-07-15T00:00:00"}],
+        }, "http://runner:9000")
+        assert err is not None
+        assert "params" in err
+        assert not called
+
 
 # ============================================================================
 # 8. Cross-family diagnosis (baseline-only, zero HTTP)
