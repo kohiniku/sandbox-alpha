@@ -877,14 +877,15 @@ class TestCrossDiagnosis:
 
 class TestParseRunner:
     def test_extract_fold_sharpes(self):
-        """Extract fold sharpe ratios from CV response."""
+        """Extract fold sharpe ratios from CV response (real runner schema:
+        per-fold metrics live under "val_metrics", not "val")."""
         cv_response = {
             "out_of_sample": {"sharpe_ratio": 0.5, "turnover": 30.0},
             "cv": {
                 "folds": [
-                    {"val": {"sharpe_ratio": 0.3}},
-                    {"val": {"sharpe_ratio": 0.5}},
-                    {"val": {"sharpe_ratio": 0.7}},
+                    {"fold": 0, "val_metrics": {"sharpe_ratio": 0.3}},
+                    {"fold": 1, "val_metrics": {"sharpe_ratio": 0.5}},
+                    {"fold": 2, "val_metrics": {"sharpe_ratio": 0.7}},
                 ]
             }
         }
@@ -892,6 +893,29 @@ class TestParseRunner:
         assert sharpe == 0.5
         assert turnover == 30.0
         assert folds == [0.3, 0.5, 0.7]
+
+    def test_fold_without_sharpe_is_skipped_not_zeroed(self):
+        """A fold missing sharpe_ratio must be skipped, never treated as 0.0."""
+        cv_response = {
+            "out_of_sample": {"sharpe_ratio": 0.5, "turnover": 30.0},
+            "cv": {
+                "folds": [
+                    {"fold": 0, "val_metrics": {"sharpe_ratio": 0.3}},
+                    {"fold": 1, "val_metrics": {}},
+                ]
+            }
+        }
+        _, _, folds = sr._parse_baseline_response(cv_response)
+        assert folds == [0.3]
+
+    def test_all_folds_missing_sharpe_gives_none(self):
+        """If no fold has a sharpe, fold_sharpes is None (flags skip fold logic)."""
+        cv_response = {
+            "out_of_sample": {"sharpe_ratio": 0.5, "turnover": 30.0},
+            "cv": {"folds": [{"fold": 0, "val_metrics": {}}]},
+        }
+        _, _, folds = sr._parse_baseline_response(cv_response)
+        assert folds is None
 
     def test_extract_no_cv(self):
         """Handle response with no CV block."""
