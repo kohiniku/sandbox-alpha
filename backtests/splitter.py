@@ -34,7 +34,9 @@ class WalkForwardCV:
     Concrete layout for defaults on a 1260-row DataFrame::
 
         T = 1260   R = int(T * 0.8) = 1008
-        holdout = df.iloc[1008:1260]   (252 rows, identical across folds)
+        holdout = df.iloc[1029:1260]   (231 rows, identical across folds)
+
+        Embargo gap [1008:1029] (21 rows) separates the CV region from holdout.
 
         Val region [604:1008] (404 rows), split into 3 slices (134 + 135 + 135):
 
@@ -96,7 +98,14 @@ class WalkForwardCV:
             holdout_cut = T
         R = holdout_cut  # CV region size
 
-        holdout_df = df.iloc[holdout_cut:]
+        holdout_start = R + self.embargo_days
+        if holdout_start >= T:
+            raise ValueError(
+                f"No rows left for holdout after embargo gap: "
+                f"total rows={T}, CV region R={R}, embargo_days={self.embargo_days}, "
+                f"holdout would start at {holdout_start} >= {T}."
+            )
+        holdout_df = df.iloc[holdout_start:]
 
         # Val slices live inside [val_region_start:R]
         val_region_start = int(R * self.train_frac)
