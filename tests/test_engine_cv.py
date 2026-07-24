@@ -215,10 +215,11 @@ def test_cv_holdout_identical_conceptually(csv_dir, base_params):
     h = result["cv"]["holdout"]
     assert len(h["daily_returns"]) == h["n_days"]
     assert len(h["dates"]) == h["n_days"]
-    # For 1260-row data with 60/20/20, holdout = last 20% = ~252 rows
-    # (strategy signal lag drops 1 day, so net returns = 251)
-    assert h["n_days"] >= 249, f"Expected ~251 holdout days, got {h['n_days']}"
-    assert h["n_days"] <= 252, f"Too many holdout days: {h['n_days']}"
+    # For 1260-row data with 60/20/20 + embargo gap, holdout starts at
+    # R + embargo = 1008 + 21 = 1029 → 231 rows.
+    # (strategy signal lag drops 1 day, so net returns = 230)
+    assert h["n_days"] >= 228, f"Expected ~230 holdout days, got {h['n_days']}"
+    assert h["n_days"] <= 231, f"Too many holdout days: {h['n_days']}"
 
 
 # ---------------------------------------------------------------------------
