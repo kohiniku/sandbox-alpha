@@ -698,75 +698,88 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
     """
     families = knowledge.setdefault("families", {})
     family = families.get(family_key, {})
-    verdict = verdict_dict["verdict"]
+    llm_verdict = verdict_dict["verdict"]
     rationale = verdict_dict["rationale"]
     now_iso = datetime.now(timezone.utc).isoformat()
     family_type = family.get("family_type", "single")
 
-    # Append to reviews summary
-    summary = {
-        "family_key": family_key,
-        "verdict": verdict,
-        "rationale": rationale,
-        "at": now_iso,
-    }
-    _append_review_summary(knowledge, summary)
+    # Resolve final outcome first, then record ONE summary with both
+    # llm_verdict (what the judge said) and applied_verdict (what we did).
+    applied_verdict = llm_verdict
+    final_rationale = rationale
 
-    if verdict == "kill":
+    if llm_verdict == "kill":
         n_trials = family.get("n_trials", 0)
         if n_trials < MIN_TRIALS_FOR_KILL:
             # Downgrade: insufficient evidence
-            downgraded_rationale = rationale + " (downgraded: insufficient evidence)"
-            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale}\"")
-            return "downgrade_to_keep"
+            final_rationale = rationale + " (downgraded: insufficient evidence)"
+            applied_verdict = "keep"
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+        else:
+            family["lifecycle"] = FamilyLifecycle.KILLED
+            family["kill_reason"] = "auto: " + rationale
+            print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"{rationale}\"")
 
-        family["lifecycle"] = FamilyLifecycle.KILLED
-        family["kill_reason"] = "auto: " + rationale
-        print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"{rationale}\"")
-
-    elif verdict == "refine":
+    elif llm_verdict == "refine":
         if family_type == "cross":
             # Cross families cannot be refined (no manifest spec persisted)
-            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale} (downgraded: cross refine unavailable)\"")
-            return "downgrade_cross_refine"
+            final_rationale = rationale + " (downgraded: cross refine unavailable)"
+            applied_verdict = "keep"
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+        else:
+            refine_count = family.get("refine_count", 0)
+            if refine_count >= REFINE_CAP:
+                # Auto-kill: refine cap exhausted (ignores MIN_TRIALS_FOR_KILL)
+                family["lifecycle"] = FamilyLifecycle.KILLED
+                family["kill_reason"] = "auto: refine cap exhausted"
+                applied_verdict = "kill"
+                final_rationale = "refine cap exhausted"
+                print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
+            else:
+                # Try to add the refine entry to backlog first —
+                # only increment refine_count if it's not a duplicate.
+                refine_proposal = verdict_dict.get("refine_proposal") or {}
+                params = refine_proposal.get("params", {})
+                change_summary = refine_proposal.get("change_summary", "")
 
-        refine_count = family.get("refine_count", 0)
-        if refine_count >= REFINE_CAP:
-            # Auto-kill: refine cap exhausted (ignores MIN_TRIALS_FOR_KILL)
-            family["lifecycle"] = FamilyLifecycle.KILLED
-            family["kill_reason"] = "auto: refine cap exhausted"
-            print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
-            return "kill_refine_cap"
+                parts = family_key.split("|", 1)
+                strategy = parts[0] if len(parts) >= 1 else ""
+                symbol = parts[1] if len(parts) >= 2 else ""
 
-        # Refine: increment count, set lifecycle, add backlog entry
-        family["refine_count"] = refine_count + 1
-        family["lifecycle"] = FamilyLifecycle.REFINING
+                backlog_entry = _bl_new_entry(
+                    "param",
+                    0.95,
+                    {"kind": "review_refine", "ref": family_key},
+                    {"strategy": strategy, "symbol": symbol, "params": params},
+                    {"extra_criteria": []},
+                )
+                backlog_entry["created_at"] = now_iso
+                accepted, eid = backlog.add_entry(backlog_entry)
 
-        refine_proposal = verdict_dict.get("refine_proposal") or {}
-        params = refine_proposal.get("params", {})
-        change_summary = refine_proposal.get("change_summary", "")
-
-        # Determine strategy/symbol from family_key
-        parts = family_key.split("|", 1)
-        strategy = parts[0] if len(parts) >= 1 else ""
-        symbol = parts[1] if len(parts) >= 2 else ""
-
-        backlog_entry = _bl_new_entry(
-            "param",
-            0.95,
-            {"kind": "review_refine", "ref": family_key},
-            {"strategy": strategy, "symbol": symbol, "params": params},
-            {"extra_criteria": []},
-        )
-        backlog_entry["created_at"] = now_iso
-        accepted, eid = backlog.add_entry(backlog_entry)
-
-        print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+                if accepted:
+                    family["refine_count"] = refine_count + 1
+                    family["lifecycle"] = FamilyLifecycle.REFINING
+                    print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+                else:
+                    final_rationale = rationale + " (refine duplicate — already queued)"
+                    applied_verdict = "keep"
+                    print(f"REVIEW_REFINE_DUPLICATE {family_key}")
+                    print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
 
     else:  # keep
         print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale}\"")
 
-    return verdict
+    # Append ONE summary with both llm_verdict and applied_verdict
+    summary = {
+        "family_key": family_key,
+        "llm_verdict": llm_verdict,
+        "applied_verdict": applied_verdict,
+        "rationale": final_rationale,
+        "at": now_iso,
+    }
+    _append_review_summary(knowledge, summary)
+
+    return applied_verdict
 
 
 # ============================================================================

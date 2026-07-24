@@ -145,7 +145,7 @@ class TestApplyVerdictKill:
         result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
         save_knowledge(knowledge)
 
-        assert result == "downgrade_to_keep"
+        assert result == "keep"
 
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
@@ -293,7 +293,7 @@ class TestApplyVerdictRefine:
         result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
         save_knowledge(knowledge)
 
-        assert result == "kill_refine_cap"
+        assert result == "kill"
 
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
@@ -328,7 +328,7 @@ class TestApplyVerdictRefine:
         result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
         save_knowledge(knowledge)
 
-        assert result == "downgrade_cross_refine"
+        assert result == "keep"
 
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
@@ -394,7 +394,8 @@ class TestApplyVerdictKeep:
         reloaded = load_knowledge()
         assert len(reloaded["reviews"]) == 1
         assert reloaded["reviews"][0]["family_key"] == family_key
-        assert reloaded["reviews"][0]["verdict"] == "keep"
+        assert reloaded["reviews"][0]["llm_verdict"] == "keep"
+        assert reloaded["reviews"][0]["applied_verdict"] == "keep"
         assert reloaded["reviews"][0]["rationale"] == "needs more data"
         assert "at" in reloaded["reviews"][0]
 
@@ -1028,3 +1029,283 @@ class TestReviewSummary:
         assert "refine=0" in output
         assert "keep=1" in output
         assert "failopen=0" in output
+
+
+# ============================================================================
+# 8. Review-feedback fixes: audit trail, refine duplicate, downgrade suffix
+# ============================================================================
+
+class TestAuditTrail:
+    def test_summary_records_applied_verdict_on_kill_downgrade(self, tmp_path, monkeypatch):
+        """When kill is downgraded to keep, summary has llm_verdict=kill, applied_verdict=keep."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, n_trials=2)},
+        )
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        verdict = {"verdict": "kill", "rationale": "should be killed", "refine_proposal": None}
+        result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        assert result == "keep"
+        reloaded = load_knowledge()
+        summary = reloaded["reviews"][0]
+        assert summary["llm_verdict"] == "kill"
+        assert summary["applied_verdict"] == "keep"
+        assert "downgraded: insufficient evidence" in summary["rationale"]
+
+    def test_summary_records_applied_verdict_on_cross_downgrade(self, tmp_path, monkeypatch):
+        """When cross refine is downgraded, summary records llm_verdict=refine, applied_verdict=keep."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "manifest:xs_mom|universe:abc"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, family_type="cross")},
+        )
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        verdict = {
+            "verdict": "refine",
+            "rationale": "try different params",
+            "refine_proposal": {"params": {"universe_size": 10}, "change_summary": "Bigger"},
+        }
+        result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        assert result == "keep"
+        reloaded = load_knowledge()
+        summary = reloaded["reviews"][0]
+        assert summary["llm_verdict"] == "refine"
+        assert summary["applied_verdict"] == "keep"
+        assert "downgraded: cross refine unavailable" in summary["rationale"]
+
+    def test_summary_records_applied_verdict_on_refine_cap(self, tmp_path, monkeypatch):
+        """When refine cap triggers, summary has llm_verdict=refine, applied_verdict=kill."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, refine_count=REFINE_CAP)},
+        )
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        verdict = {
+            "verdict": "refine",
+            "rationale": "try again",
+            "refine_proposal": {
+                "params": {"fast_window": 50, "slow_window": 120},
+                "change_summary": "final attempt",
+            },
+        }
+        result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        assert result == "kill"
+        reloaded = load_knowledge()
+        summary = reloaded["reviews"][0]
+        assert summary["llm_verdict"] == "refine"
+        assert summary["applied_verdict"] == "kill"
+        assert summary["rationale"] == "refine cap exhausted"
+
+
+class TestRefineDuplicate:
+    def test_duplicate_refine_does_not_increment_count(self, tmp_path, monkeypatch):
+        """Duplicate refine entry → refine_count unchanged, applied_verdict=keep."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, refine_count=1)},
+        )
+        save_knowledge(knowledge)
+
+        backlog_path = tmp_path / "backlog.json"
+        backlog = Backlog(str(backlog_path))
+
+        # First refine: should succeed
+        verdict = {
+            "verdict": "refine",
+            "rationale": "cost bound",
+            "refine_proposal": {
+                "params": {"fast_window": 30, "slow_window": 80},
+                "change_summary": "Longer windows",
+            },
+        }
+        result1 = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+        assert result1 == "refine"
+
+        # Second refine with same params: duplicate → should be rejected
+        result2 = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        assert result2 == "keep"
+        reloaded = load_knowledge()
+        fam = reloaded["families"][family_key]
+        # refine_count should NOT have incremented from 2 to 3
+        assert fam["refine_count"] == 2
+        assert fam["lifecycle"] == FamilyLifecycle.REFINING  # unchanged from first
+        # backlog should still have only 1 entry
+        bl2 = Backlog(str(backlog_path))
+        data = bl2.load()
+        assert len(data["entries"]) == 1
+
+    def test_duplicate_refine_prints_review_refine_duplicate(self, tmp_path, monkeypatch, capsys):
+        """Duplicate refine emits REVIEW_REFINE_DUPLICATE line."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key)},
+        )
+        save_knowledge(knowledge)
+
+        backlog_path = tmp_path / "backlog.json"
+        backlog = Backlog(str(backlog_path))
+
+        verdict = {
+            "verdict": "refine",
+            "rationale": "cost bound",
+            "refine_proposal": {
+                "params": {"fast_window": 30, "slow_window": 80},
+                "change_summary": "Longer windows",
+            },
+        }
+        # First: accepted
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+
+        # Second: duplicate
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+
+        captured = capsys.readouterr()
+        assert "REVIEW_REFINE_DUPLICATE sma_crossover|AAPL" in captured.out
+
+    def test_duplicate_refine_records_keep_in_summary(self, tmp_path, monkeypatch):
+        """Duplicate refine records applied_verdict=keep with suffix."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key)},
+        )
+        save_knowledge(knowledge)
+
+        backlog_path = tmp_path / "backlog.json"
+        backlog = Backlog(str(backlog_path))
+
+        verdict = {
+            "verdict": "refine",
+            "rationale": "cost bound",
+            "refine_proposal": {
+                "params": {"fast_window": 30, "slow_window": 80},
+                "change_summary": "Longer windows",
+            },
+        }
+        # First: accepted
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+
+        # Clear reviews for clean check
+        knowledge["reviews"] = []
+        save_knowledge(knowledge)
+
+        # Second: duplicate
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        reloaded = load_knowledge()
+        summary = reloaded["reviews"][0]
+        assert summary["llm_verdict"] == "refine"
+        assert summary["applied_verdict"] == "keep"
+        assert "refine duplicate" in summary["rationale"]
+
+
+class TestDowngradeSuffix:
+    def test_kill_downgrade_print_contains_suffix(self, tmp_path, monkeypatch, capsys):
+        """Kill downgraded to keep prints the suffixed rationale."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, n_trials=2)},
+        )
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        verdict = {"verdict": "kill", "rationale": "bad", "refine_proposal": None}
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+
+        captured = capsys.readouterr()
+        assert "downgraded: insufficient evidence" in captured.out
+
+    def test_downgrade_suffix_in_summary_rationale(self, tmp_path, monkeypatch):
+        """Summary rationale includes the downgrade suffix when kill is downgraded."""
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        family_key = "sma_crossover|AAPL"
+        knowledge = _make_knowledge(
+            families={family_key: _make_family(family_key, n_trials=2)},
+        )
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        verdict = {"verdict": "kill", "rationale": "bad", "refine_proposal": None}
+        sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        reloaded = load_knowledge()
+        summary = reloaded["reviews"][0]
+        assert summary["rationale"] == "bad (downgraded: insufficient evidence)"
