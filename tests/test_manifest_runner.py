@@ -946,3 +946,147 @@ class TestSec13FIntegration:
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Test: structured lookahead (causality) check
+# ---------------------------------------------------------------------------
+
+class TestLookaheadCheck:
+    """Causality (lookahead) check for _run_structured_mode."""
+
+    def test_lookahead_detected_generate_signals(self, tmp_path):
+        """Positive control: a generate_signals that reads future data
+        (shift(-5)) must be REJECTED with status=error, error_type=code,
+        and message containing 'lookahead'."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=250)
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data):
+                signals = {}
+                for sym, df in data.items():
+                    # Deliberate lookahead: use close 5 days in the future
+                    future_close = df["Close"].shift(-5)
+                    sig = (future_close > df["Close"]).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals).fillna(0)
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error", f"Expected error but got {result.get('status')}"
+        assert result["error_type"] == "code"
+        assert "lookahead" in result["error"].lower()
+
+    def test_causal_strategy_passes_generate_signals(self, tmp_path):
+        """Negative control: a causal generate_signals using only rolling
+        windows must NOT be rejected (no false positive)."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=250)
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data):
+                signals = {}
+                for sym, df in data.items():
+                    ma = df["Close"].rolling(20).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals).fillna(0)
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok", f"Unexpected error: {result.get('error', '')}"
+        assert "val_sharpe" in result["metrics"]
+        assert "holdout_sharpe" in result["metrics"]
+
+    def test_causal_weights_passes(self, tmp_path):
+        """generate_weights path: a causal equal-weight strategy must pass
+        the lookahead check."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=250)
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_weights(data):
+                first_df = next(iter(data.values()))
+                n = len(data)
+                w = pd.DataFrame(
+                    1.0 / n,
+                    index=first_df.index,
+                    columns=list(data.keys()),
+                )
+                return w
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok", f"Unexpected error: {result.get('error', '')}"
+        assert result["config"]["weighting"] == "generate_weights"
+        assert "val_sharpe" in result["metrics"]
+
+    def test_lookahead_detected_generate_weights(self, tmp_path):
+        """Positive control: generate_weights with lookahead must be REJECTED."""
+        symbols = ["AAPL", "MSFT", "GOOG"]
+        _setup_data(tmp_path, symbols, n_days=250)
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_weights(data):
+                # Lookahead: peek at the last close of each symbol
+                result = {}
+                for sym, df in data.items():
+                    last_close = df["Close"].iloc[-1]
+                    w = pd.Series(0.0, index=df.index, name=sym)
+                    w.iloc[-10:] = 1.0 / len(data)  # overweight the last 10 days
+                    result[sym] = w
+                return pd.DataFrame(result)
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "error", f"Expected error but got {result.get('status')}"
+        assert result["error_type"] == "code"
+        assert "lookahead" in result["error"].lower()
+
+    def test_short_data_skips_check(self, tmp_path):
+        """Very short data (< 100 CV rows) should skip the lookahead check
+        entirely rather than erroring — a causal strategy must still pass."""
+        symbols = ["AAPL", "MSFT"]
+        _setup_data(tmp_path, symbols, n_days=80)  # CV region ~64 < 100
+
+        code = textwrap.dedent("""\
+            import pandas as pd
+            import numpy as np
+
+            def generate_signals(data):
+                signals = {}
+                for sym, df in data.items():
+                    ma = df["Close"].rolling(5).mean()
+                    sig = (df["Close"] > ma).astype(int) - (df["Close"] < ma).astype(int)
+                    signals[sym] = sig
+                return pd.DataFrame(signals).fillna(0)
+        """)
+
+        manifest = _make_manifest(code=code, universe=symbols)
+        result = json.loads(run_manifest(manifest, str(tmp_path)))
+
+        assert result["status"] == "ok", (
+            f"Short-data run should skip lookahead check, "
+            f"got: {result.get('error', 'ok')}"
+        )

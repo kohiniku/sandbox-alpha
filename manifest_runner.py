@@ -459,6 +459,96 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
         )
 
 
+def _truncate_all_data(
+    all_data: Dict[str, pd.DataFrame], cutoff: pd.Timestamp
+) -> Dict[str, pd.DataFrame]:
+    """Return a copy of all_data with each symbol's DataFrame sliced to rows
+    with index <= cutoff. Non-symbol keys (starting with '_') are passed
+    through unchanged, matching the convention used elsewhere."""
+    result: Dict[str, pd.DataFrame] = {}
+    for key, df in all_data.items():
+        if key.startswith("_"):
+            result[key] = df
+        else:
+            result[key] = df[df.index <= cutoff]
+    return result
+
+
+def _check_structured_lookahead(
+    entrypoint_fn: Any,
+    all_data: Dict[str, pd.DataFrame],
+    extras: Dict[str, Any],
+    cutoff: pd.Timestamp,
+    full_output: pd.DataFrame,
+    is_signals: bool = False,
+) -> Optional[str]:
+    """Run entrypoint on truncated data and compare against the full-data output.
+
+    Returns None if the outputs match (no lookahead detected).
+    Returns a string description of the mismatch if they differ.
+    """
+    truncated_data = _truncate_all_data(all_data, cutoff)
+
+    try:
+        truncated_output = _call_with_extras(entrypoint_fn, truncated_data, extras)
+    except Exception as e:
+        return (
+            f"entrypoint raised on truncated data (cutoff={cutoff}): "
+            f"{type(e).__name__}: {e}"
+        )
+
+    # Normalize truncated output to DataFrame, mirroring _run_structured_mode
+    if is_signals:
+        if isinstance(truncated_output, dict):
+            truncated_df = _dict_signals_to_wide(truncated_output)
+        elif isinstance(truncated_output, pd.DataFrame):
+            truncated_df = truncated_output
+        else:
+            return (
+                f"truncated run returned unexpected type: "
+                f"{type(truncated_output).__name__}"
+            )
+    else:
+        # weights path
+        if isinstance(truncated_output, dict):
+            truncated_df = pd.DataFrame(truncated_output)
+        elif isinstance(truncated_output, pd.DataFrame):
+            truncated_df = truncated_output
+        else:
+            return (
+                f"truncated run returned unexpected type: "
+                f"{type(truncated_output).__name__}"
+            )
+
+    # Restrict both to rows with index <= cutoff
+    full_slice = full_output[full_output.index <= cutoff]
+    truncated_slice = truncated_df[truncated_df.index <= cutoff]
+
+    if full_slice.empty or truncated_slice.empty:
+        return f"empty slice at cutoff={cutoff}"
+
+    # Reindex truncated to full's index/columns, fill missing with 0.0
+    truncated_aligned = truncated_slice.reindex(
+        index=full_slice.index, columns=full_slice.columns, fill_value=0.0
+    )
+
+    # Fill NaN with 0.0 in both before comparison
+    full_vals = full_slice.fillna(0.0).values
+    truncated_vals = truncated_aligned.fillna(0.0).values
+
+    if full_vals.shape != truncated_vals.shape:
+        return (
+            f"shape mismatch at cutoff={cutoff}: "
+            f"full {full_vals.shape} vs truncated {truncated_vals.shape}"
+        )
+
+    if not np.allclose(full_vals, truncated_vals):
+        max_diff = float(np.max(np.abs(full_vals - truncated_vals)))
+        return f"values differ at cutoff={cutoff}, max_abs_diff={max_diff:.6f}"
+
+    return None
+
+
 def _run_structured_mode(
     manifest: StrategyManifest,
     sandbox: Dict[str, Any],
@@ -572,6 +662,9 @@ def _run_structured_mode(
     use_weights_fn = has_weights
     weighting_label = "generate_weights" if use_weights_fn else "equal_active_signals"
 
+    signals_df: pd.DataFrame = pd.DataFrame()
+    weights_df: pd.DataFrame = pd.DataFrame()
+
     try:
         if use_weights_fn:
             raw_weights = _call_with_extras(
@@ -603,6 +696,30 @@ def _run_structured_mode(
     except Exception as e:
         tb = traceback.format_exc()[-2000:]
         return _error_json("code", f"Entrypoint raised {type(e).__name__}: {e}", tb)
+
+    # --- Causality (lookahead) check ---
+    # Use fractions of the CV region (dates up to val_end) to catch strategies
+    # that depend on future data within train or val periods.
+    cv_index = close_panel.index[close_panel.index <= val_end]
+    n_cv = len(cv_index)
+    if n_cv >= 100:
+        fractions = [0.50, 0.70, 0.85]
+        cutoffs = [cv_index[int(n_cv * frac)] for frac in fractions]
+        if use_weights_fn:
+            full_output = weights_df
+            entrypoint_fn = sandbox["generate_weights"]
+            is_signals = False
+        else:
+            full_output = signals_df
+            entrypoint_fn = sandbox["generate_signals"]
+            is_signals = True
+
+        for cutoff in cutoffs:
+            err = _check_structured_lookahead(
+                entrypoint_fn, all_data, extras, cutoff, full_output, is_signals
+            )
+            if err is not None:
+                return _error_json("code", f"lookahead detected: {err}")
 
     # Align weights to asset_returns index/symbols
     symbols = list(close_panel.columns)
