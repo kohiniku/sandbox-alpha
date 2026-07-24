@@ -356,10 +356,14 @@ def diagnose_family(family_key, knowledge, runner_url):
 
 def _diagnose_single_family(family_key, evidence, runner_url, now_iso):
     """Run diagnosis for a single-name (param) family."""
-    # Recover params from evidence
-    params = evidence.get("params", {})
-    strategy = evidence.get("strategy", evidence.get("hypothesis", {}).get("strategy", ""))
-    symbol = evidence.get("symbol", evidence.get("hypothesis", {}).get("symbol", ""))
+    # Recover params from evidence. Near-miss entries carry these at top
+    # level; rejected entries nest them under "hypothesis".
+    hyp = evidence.get("hypothesis", {})
+    params = evidence.get("params") or hyp.get("params", {})
+    strategy = evidence.get("strategy", hyp.get("strategy", ""))
+    symbol = evidence.get("symbol", hyp.get("symbol", ""))
+    if not params:
+        raise ValueError(f"no params recoverable from evidence for {family_key}")
 
     url = f"{runner_url.rstrip('/')}/run"
 
