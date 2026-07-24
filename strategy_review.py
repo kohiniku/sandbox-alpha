@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Strategy Review — Diagnosis Stage (PR-B2).
+Strategy Review — Diagnosis + Verdict stage (PR-B2 + PR-C).
 
 Picks recently-failed strategy families, re-measures them via the
-sandbox runner, computes machine-readable diagnosis flags, and
-persists reports.  NO LLM calls, NO verdicts/refine/kill actions.
+sandbox runner, computes machine-readable diagnosis flags, feeds
+reports to an LLM judge for refine/keep/kill verdicts, and applies
+those verdicts mechanically.
 """
 import argparse
 import json
@@ -15,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from loop_constants import FamilyLifecycle
+from loop_constants import FamilyLifecycle, REFINE_CAP
 
 BASE_DIR = Path(__file__).resolve().parent
 REVIEW_REPORTS_DIR = BASE_DIR / "review_reports"
@@ -23,7 +24,16 @@ KNOWLEDGE_FILE = BASE_DIR / "knowledge.json"
 
 # Import autonomous_loop helpers (import-time mkdir side effect is acceptable,
 # same pattern as the loop itself).
-from autonomous_loop import _family_key, _derive_family_type, load_knowledge, save_knowledge
+from autonomous_loop import _family_key, _derive_family_type, load_knowledge, save_knowledge, get_killed_families
+
+# LLM HTTP helper (stdlib-only, same pattern as strategy_ideation.py)
+from llm_hypothesis import _http_post_json as _llm_post_json
+
+# Backlog for refine entries
+from backlog import Backlog, _new_entry as _bl_new_entry
+
+# Minimum trials before a family can be killed
+MIN_TRIALS_FOR_KILL = 3
 
 REVIEW_REPORTS_DIR.mkdir(exist_ok=True)
 
@@ -478,17 +488,294 @@ def _active_flags(flags):
 
 
 # ============================================================================
+# LLM judge (PR-C)
+# ============================================================================
+
+def _get_review_llm_config():
+    """Read LLM config at call time (not import time)."""
+    model = os.environ.get("REVIEW_LLM_MODEL", "deepseek-v4-pro")
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    base_url = os.environ.get("REVIEW_LLM_BASE_URL", "https://api.deepseek.com/v1")
+    return {"model": model, "api_key": api_key, "base_url": base_url}
+
+
+def _call_review_llm(messages):
+    """Call the LLM for a review verdict. Returns parsed JSON dict.
+
+    Raises on HTTP/parse errors — callers must fail-open.
+    """
+    cfg = _get_review_llm_config()
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": 8192,
+        "response_format": {"type": "json_object"},
+    }
+    body = _llm_post_json(
+        f"{cfg['base_url'].rstrip('/')}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+        timeout=120,
+    )
+    content = body["choices"][0]["message"]["content"].strip()
+    # Strip markdown fences if present
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1]
+        if content.endswith("```"):
+            content = content[:-3].strip()
+    return json.loads(content)
+
+
+def _build_judge_prompt(report, family, knowledge):
+    """Build the LLM messages for judging a family."""
+    family_key = report.get("family_key", "")
+    family_type = family.get("family_type", "single")
+    flags = report.get("flags", {})
+    if isinstance(flags, list):
+        flags_str = ", ".join(flags) if flags else "none"
+    else:
+        active = [k for k, v in flags.items() if v]
+        flags_str = ", ".join(active) if active else "none"
+
+    # Aggregate data
+    n_trials = family.get("n_trials", 0)
+    best_val_sharpe = family.get("best_val_sharpe", 0)
+    gate_failures = family.get("gate_failures", {})
+    refine_count = family.get("refine_count", 0)
+
+    # Val-segment numbers from report (holdout already excluded by PR-B2)
+    baseline = report.get("baseline", {})
+    cost_free = report.get("cost_free")
+    val_sharpe = baseline.get("val_sharpe", 0)
+    val_turnover = baseline.get("val_turnover", 0)
+    fold_sharpes = baseline.get("fold_sharpes")
+    cost0_sharpe = cost_free.get("val_sharpe") if cost_free else None
+
+    # Last 5 near-miss entries for this family
+    near_miss_lines = []
+    family_type_for_lookup = family_type
+    if family_key.startswith("manifest:"):
+        family_type_for_lookup = "cross"
+    near_list = "near_misses_cross" if family_type_for_lookup == "cross" else "near_misses"
+    family_near_misses = []
+    for entry in knowledge.get(near_list, []):
+        strategy = entry.get("strategy", "")
+        symbol = entry.get("symbol", "")
+        ft = _derive_family_type(entry)
+        key = _family_key(strategy, symbol, ft)
+        if key == family_key:
+            family_near_misses.append(entry)
+    if family_near_misses:
+        family_near_misses.sort(key=lambda e: e.get("date", ""), reverse=True)
+        for nm in family_near_misses[:5]:
+            p = nm.get("params", {})
+            vs = nm.get("val_sharpe", "?")
+            hs = nm.get("holdout_sharpe", "?")
+            gate = nm.get("failed_gate", "?")
+            near_miss_lines.append(
+                f"  - params={json.dumps(p)}, val_sharpe={vs}, holdout_sharpe={hs}, failed_gate={gate}"
+            )
+
+    system_prompt = (
+        "You are a quantitative strategy reviewer. Your job is to read a machine-generated "
+        "diagnosis report and decide whether to refine, keep, or kill the strategy family. "
+        "All arithmetic is precomputed — do not recompute. Flags are ground truth. "
+        "Choose exactly one verdict."
+    )
+
+    baseline_block = f"val_sharpe={val_sharpe}"
+    if val_turnover:
+        baseline_block += f", val_turnover={val_turnover}"
+    if fold_sharpes is not None:
+        baseline_block += f", fold_sharpes={fold_sharpes}"
+
+    cost_free_block = f"cost_free.val_sharpe={cost0_sharpe}" if cost0_sharpe is not None else "cost_free: n/a"
+
+    near_miss_block = ""
+    if near_miss_lines:
+        near_miss_block = "Last 5 near-misses for this family:\n" + "\n".join(near_miss_lines)
+    else:
+        near_miss_block = "No near-miss entries for this family."
+
+    user_prompt = f"""Diagnosis report for family: {family_key}
+
+Family aggregates:
+  n_trials={n_trials}, best_val_sharpe={best_val_sharpe}, refine_count={refine_count}, family_type={family_type}
+  gate_failures: validation={gate_failures.get('validation', 0)}, deflation={gate_failures.get('deflation', 0)}, holdout={gate_failures.get('holdout', 0)}
+
+Diagnosis:
+  active_flags: {flags_str}
+  baseline: {baseline_block}
+  {cost_free_block}
+
+{near_miss_block}
+
+Rules:
+- All arithmetic is precomputed — do not recompute anything.
+- Flags are ground truth. If a flag is active, it is real.
+- Choose exactly one verdict: refine, keep, or kill.
+- "refine": the strategy has an addressable flaw (e.g. cost_bound → try longer windows; high_turnover → reduce trade frequency). Provide a refine_proposal with changed params (same strategy/symbol) and a change_summary motivating the change from the flag.
+- "keep": the strategy shows promise but needs more data; or the flags are mild and not actionable.
+- "kill": the strategy is consistently bad, has no signal, or has already been refined multiple times with no improvement.
+- If verdict is refine, refine_proposal is REQUIRED. Otherwise it must be null.
+- refine_proposal.params must be a dict with the same strategy/symbol and changed param values (int/float/str/bool).
+
+Return ONLY this strict JSON:
+{{"verdict": "refine|keep|kill", "rationale": "one sentence explaining why", "refine_proposal": {{"params": {{...}}, "change_summary": "..."}} | null}}"""
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def judge_family(report, family, knowledge):
+    """Call the LLM to get a verdict for one family.
+
+    Returns a verdict dict: {verdict, rationale, refine_proposal}.
+    On ANY failure (HTTP, parse, validation) → fail-open keep.
+    Prints REVIEW_JUDGE_FAILOPEN to stdout on failure.
+    """
+    family_key = report.get("family_key", "unknown")
+    try:
+        messages = _build_judge_prompt(report, family, knowledge)
+        response = _call_review_llm(messages)
+    except Exception as e:
+        print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=exception: {e}")
+        return {"verdict": "keep", "rationale": f"llm_failure: exception: {e}", "refine_proposal": None}
+
+    # Validate response shape
+    if not isinstance(response, dict):
+        print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=not_a_dict")
+        return {"verdict": "keep", "rationale": "llm_failure: not_a_dict", "refine_proposal": None}
+
+    verdict = response.get("verdict", "")
+    if verdict not in ("refine", "keep", "kill"):
+        print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=invalid_verdict: {verdict!r}")
+        return {"verdict": "keep", "rationale": f"llm_failure: invalid_verdict: {verdict!r}", "refine_proposal": None}
+
+    rationale = response.get("rationale", "")
+    refine_proposal = response.get("refine_proposal")
+
+    if verdict == "refine":
+        if refine_proposal is None:
+            print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=missing_refine_proposal")
+            return {"verdict": "keep", "rationale": "llm_failure: missing_refine_proposal", "refine_proposal": None}
+        if not isinstance(refine_proposal, dict):
+            print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=refine_proposal_not_dict")
+            return {"verdict": "keep", "rationale": "llm_failure: refine_proposal_not_dict", "refine_proposal": None}
+        params = refine_proposal.get("params")
+        if not isinstance(params, dict) or len(params) == 0:
+            print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=bad_refine_params")
+            return {"verdict": "keep", "rationale": "llm_failure: bad_refine_params", "refine_proposal": None}
+        for v in params.values():
+            if not isinstance(v, (int, float, str, bool)):
+                print(f"REVIEW_JUDGE_FAILOPEN {family_key} reason=bad_param_type: {type(v).__name__}")
+                return {"verdict": "keep", "rationale": f"llm_failure: bad_param_type: {type(v).__name__}", "refine_proposal": None}
+
+    return {"verdict": verdict, "rationale": rationale, "refine_proposal": refine_proposal}
+
+
+# ============================================================================
+# Verdict application (PR-C) — pure mechanics, no LLM
+# ============================================================================
+
+def apply_verdict(family_key, verdict_dict, knowledge, backlog):
+    """Apply a verdict to the knowledge base and backlog.
+
+    Returns a string summary of what happened.
+    """
+    families = knowledge.setdefault("families", {})
+    family = families.get(family_key, {})
+    verdict = verdict_dict["verdict"]
+    rationale = verdict_dict["rationale"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    family_type = family.get("family_type", "single")
+
+    # Append to reviews summary
+    summary = {
+        "family_key": family_key,
+        "verdict": verdict,
+        "rationale": rationale,
+        "at": now_iso,
+    }
+    _append_review_summary(knowledge, summary)
+
+    if verdict == "kill":
+        n_trials = family.get("n_trials", 0)
+        if n_trials < MIN_TRIALS_FOR_KILL:
+            # Downgrade: insufficient evidence
+            downgraded_rationale = rationale + " (downgraded: insufficient evidence)"
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale}\"")
+            return "downgrade_to_keep"
+
+        family["lifecycle"] = FamilyLifecycle.KILLED
+        family["kill_reason"] = "auto: " + rationale
+        print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"{rationale}\"")
+
+    elif verdict == "refine":
+        if family_type == "cross":
+            # Cross families cannot be refined (no manifest spec persisted)
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale} (downgraded: cross refine unavailable)\"")
+            return "downgrade_cross_refine"
+
+        refine_count = family.get("refine_count", 0)
+        if refine_count >= REFINE_CAP:
+            # Auto-kill: refine cap exhausted (ignores MIN_TRIALS_FOR_KILL)
+            family["lifecycle"] = FamilyLifecycle.KILLED
+            family["kill_reason"] = "auto: refine cap exhausted"
+            print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
+            return "kill_refine_cap"
+
+        # Refine: increment count, set lifecycle, add backlog entry
+        family["refine_count"] = refine_count + 1
+        family["lifecycle"] = FamilyLifecycle.REFINING
+
+        refine_proposal = verdict_dict.get("refine_proposal") or {}
+        params = refine_proposal.get("params", {})
+        change_summary = refine_proposal.get("change_summary", "")
+
+        # Determine strategy/symbol from family_key
+        parts = family_key.split("|", 1)
+        strategy = parts[0] if len(parts) >= 1 else ""
+        symbol = parts[1] if len(parts) >= 2 else ""
+
+        backlog_entry = _bl_new_entry(
+            "param",
+            0.95,
+            {"kind": "review_refine", "ref": family_key},
+            {"strategy": strategy, "symbol": symbol, "params": params},
+            {"extra_criteria": []},
+        )
+        backlog_entry["created_at"] = now_iso
+        accepted, eid = backlog.add_entry(backlog_entry)
+
+        print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+
+    else:  # keep
+        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale}\"")
+
+    return verdict
+
+
+# ============================================================================
 # Main / CLI
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Strategy Review — Diagnosis Stage (PR-B2)")
+    parser = argparse.ArgumentParser(description="Strategy Review — Diagnosis + Verdict stage (PR-C)")
     parser.add_argument("--max-families", type=int, default=None,
                         help="Max families to diagnose (default: REVIEW_MAX_FAMILIES env or 3)")
     parser.add_argument("--family", type=str, default=None,
                         help="Diagnose exactly this family key")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Select and print candidates, no runner calls, no state writes")
+                        help="Select candidates, print what would happen, no LLM calls, no writes")
+    parser.add_argument("--no-judge", action="store_true",
+                        help="Diagnosis only — skip LLM judging (PR-B2 behavior)")
     args = parser.parse_args()
 
     knowledge = load_knowledge()
@@ -508,16 +795,24 @@ def main():
             print(f"  CANDIDATE {c} lifecycle={fam.get('lifecycle', '?')} "
                   f"best_val_sharpe={fam.get('best_val_sharpe', '?')} "
                   f"family_type={fam.get('family_type', '?')}")
-        print("DRY_RUN: no runner calls, no state writes")
+        print("DRY_RUN: no runner calls, no LLM calls, no state writes")
         return
 
     if not runner_url:
         print("ERROR: SANDBOX_RUNNER_URL not set", file=sys.stderr)
         sys.exit(1)
 
+    # Initialize backlog for refine entries
+    backlog_path = os.environ.get("BACKLOG_PATH", str(BASE_DIR / "backlog.json"))
+    backlog = Backlog(backlog_path)
+
     diagnosed = 0
     errors = 0
     skipped = 0
+    kill_count = 0
+    refine_count = 0
+    keep_count = 0
+    failopen_count = 0
 
     for family_key in candidates:
         fam = knowledge.get("families", {}).get(family_key, {})
@@ -545,21 +840,48 @@ def main():
             print(f"REVIEW_DIAG {family_key} flags={flags_str} "
                   f"base_val_sharpe={base_sharpe:.4f} cost0_val_sharpe=n/a")
 
-        # Persist
+        # Persist report
         report_path = _save_report(report)
-        summary = {
-            "family_key": family_key,
-            "flags": flags_str,
-            "base_val_sharpe": round(base_sharpe, 4),
-            "cost0_val_sharpe": round(cost0_sharpe, 4) if cost0_sharpe is not None else None,
-            "report": str(report_path.name),
-            "diagnosed_at": report.get("diagnosed_at", ""),
-        }
-        _append_review_summary(knowledge, summary)
+
+        if args.no_judge:
+            # PR-B2 behavior: diagnosis only
+            summary = {
+                "family_key": family_key,
+                "flags": flags_str,
+                "base_val_sharpe": round(base_sharpe, 4),
+                "cost0_val_sharpe": round(cost0_sharpe, 4) if cost0_sharpe is not None else None,
+                "report": str(report_path.name),
+                "diagnosed_at": report.get("diagnosed_at", ""),
+            }
+            _append_review_summary(knowledge, summary)
+            _update_review_state(knowledge, family_key, now)
+            save_knowledge(knowledge)
+            continue
+
+        # PR-C: judge + apply
+        verdict_dict = judge_family(report, fam, knowledge)
+        result = apply_verdict(family_key, verdict_dict, knowledge, backlog)
+
+        # Tally
+        v = verdict_dict["verdict"]
+        if v == "kill":
+            kill_count += 1
+        elif v == "refine":
+            refine_count += 1
+        elif v == "keep":
+            if "llm_failure" in verdict_dict["rationale"]:
+                failopen_count += 1
+            else:
+                keep_count += 1
+
         _update_review_state(knowledge, family_key, now)
         save_knowledge(knowledge)
 
-    print(f"REVIEW_SUMMARY diagnosed={diagnosed} errors={errors} skipped={skipped}")
+    if args.no_judge:
+        print(f"REVIEW_SUMMARY diagnosed={diagnosed} errors={errors} skipped={skipped}")
+    else:
+        print(f"REVIEW_SUMMARY diagnosed={diagnosed} errors={errors} skipped={skipped} "
+              f"kill={kill_count} refine={refine_count} keep={keep_count} failopen={failopen_count}")
 
 
 if __name__ == "__main__":
