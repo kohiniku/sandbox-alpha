@@ -481,6 +481,31 @@ functools, itertools, json. NOTHING ELSE. Do NOT import torch,
 tensorflow, hmmlearn, jax, transformers — they are not installed
 and your code will crash with ModuleNotFoundError.
 
+EXPERT-MODE RUN CONTRACT:
+run(data, train_end, val_end, benchmark, config) MUST return a dict
+with these EXACT keys (all floats): val_sharpe, val_max_drawdown_pct,
+val_total_return_pct, holdout_sharpe, holdout_max_drawdown_pct,
+holdout_total_return_pct. Optional: additional keys go into
+"expert_extras" in the output.
+
+INDEPENDENT VERIFICATION (PREFERRED): To enable the runner to
+independently recompute your metrics (trusted >> self-reported),
+your run() result dict SHOULD additionally include ONE of:
+  - "returns": a pd.Series of daily portfolio returns indexed by date
+    (spanning train+val+holdout). The runner will slice and recompute
+    val/holdout metrics from this series.
+  - "positions" or "weights": a pd.DataFrame (index=date, cols=symbols)
+    of per-asset portfolio weights. The runner will compute portfolio
+    returns from these weights using the same shift/multiply logic as
+    structured mode.
+If you return "returns" or "positions"/"weights", the runner will:
+  - Compute its own val/holdout metrics from the return series
+  - Use those REcomputed values as the authoritative metrics
+  - Preserve your self-reported values in self_reported_metrics
+  - Flag any large divergence (rtol > 5%) as metrics_mismatch_warning
+This is STRONGLY RECOMMENDED — manifests that provide verifiable
+returns/weights are trusted more than self-reported-only ones.
+
 CODE HYGIENE (SyntaxError kills the whole proposal at preflight):
 - Each import on its own line: `import numpy as np` NOT `import numpy as np, from x import y`
 - No `import X, from Y import Z` — this is INVALID Python
@@ -1719,6 +1744,10 @@ If execution_mode == "expert":
         #   {{"val_sharpe": ..., "val_max_drawdown_pct": ..., "val_total_return_pct": ...,
         #    "holdout_sharpe": ..., "holdout_max_drawdown_pct": ..., "holdout_total_return_pct": ...}}
         # Optional: additional keys go into "expert_extras" in the output.
+        # PREFERRED: also return "returns" (pd.Series of daily portfolio returns)
+        #   or "weights"/"positions" (pd.DataFrame of per-asset weights) for
+        #   independent metric verification by the runner. Manifests with
+        #   verifiable returns/weights are trusted more.
   DO NOT define generate_signals in expert mode — the runner won't call it.
 
 Installed modules for BOTH modes: pandas, numpy, scipy, sklearn, statsmodels,

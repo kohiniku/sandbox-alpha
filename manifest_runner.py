@@ -236,6 +236,27 @@ def _check_pathological(result: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Portfolio return helper (shared by structured and expert modes)
+# ---------------------------------------------------------------------------
+
+def _weights_to_portfolio_return(
+    weights_df: pd.DataFrame,
+    asset_returns: pd.DataFrame,
+) -> pd.Series:
+    """Convert a weights DataFrame to a daily portfolio return series.
+
+    Weights are shifted by 1 day to avoid lookahead, then multiplied by
+    asset returns and summed across assets.  The first row is dropped
+    (no prior-day weights to shift).
+    """
+    aligned = weights_df.reindex(
+        index=asset_returns.index, columns=asset_returns.columns, fill_value=0.0
+    )
+    aligned = aligned.ffill().fillna(0.0)
+    return (aligned.shift(1) * asset_returns).sum(axis=1).iloc[1:]
+
+
+# ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
 
@@ -721,13 +742,13 @@ def _run_structured_mode(
             if err is not None:
                 return _error_json("code", f"lookahead detected: {err}")
 
-    # Align weights to asset_returns index/symbols
+    # Align weights to asset_returns index/symbols and compute portfolio returns
     symbols = list(close_panel.columns)
+    portfolio_ret = _weights_to_portfolio_return(weights_df, asset_returns)
+
+    # Rebuild aligned + shifted weights for evaluate()
     weights_aligned = weights_df.reindex(index=asset_returns.index, columns=symbols, fill_value=0.0)
     weights_aligned = weights_aligned.ffill().fillna(0.0)
-
-    # Portfolio return: (weights.shift(1) * asset_returns).sum(axis=1), drop first
-    portfolio_ret = (weights_aligned.shift(1) * asset_returns).sum(axis=1).iloc[1:]
     weights_for_eval = weights_aligned.shift(1).iloc[1:]
 
     if len(portfolio_ret) < 2:
@@ -816,8 +837,16 @@ def _run_expert_mode(
     benchmark_series: Optional[pd.Series],
     benchmark_warning: Optional[str],
 ) -> str:
-    """Execute expert mode: run() entrypoint returns metrics dict directly."""
-    
+    """Execute expert mode: run() entrypoint returns metrics dict directly.
+
+    Includes a mandatory causality (lookahead) check and optional
+    independent metric verification via returned returns/positions.
+    """
+    import math as _math
+
+    # Keys that may contain non-JSON-serializable pandas objects
+    _SERIALIZABLE_EXCLUDE = frozenset({"returns", "weights", "positions"})
+
     # Check for run() entrypoint
     if not callable(sandbox.get("run")):
         return _error_json(
@@ -829,7 +858,7 @@ def _run_expert_mode(
     # Prepare config dict
     config = manifest.evaluator.extras if manifest.evaluator.extras else {}
 
-    # Call run()
+    # Call run() with full data
     try:
         result_dict = sandbox["run"](
             data=all_data,
@@ -847,24 +876,27 @@ def _run_expert_mode(
     if error_msg:
         return _error_json("code", error_msg)
 
-    # Degenerate metrics: numeric but non-finite (e.g. NaN Sharpe from
-    # zero-variance returns caused by no trades).  This is NOT a code error —
-    # it is an honest "no edge" outcome.  Report as a success with degenerate
-    # flag so the autonomous loop can short-circuit evaluation without marking
-    # it as an error.
-    nonfinite = _find_nonfinite_metrics(result_dict)
-    if nonfinite:
-        metrics = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
-        extras = {k: v for k, v in result_dict.items() if k not in REQUIRED_EXPERT_METRICS}
-        result: Dict[str, Any] = {
+    # --- Degenerate metrics check (MUST run BEFORE causality check — NaN
+    # metrics can't be meaningfully compared for lookahead) ---
+    nonfinite_dg = _find_nonfinite_metrics(result_dict)
+    if nonfinite_dg:
+        metrics_dg = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
+        extras_dg = {
+            k: v
+            for k, v in result_dict.items()
+            if k not in REQUIRED_EXPERT_METRICS
+            and k not in _SERIALIZABLE_EXCLUDE
+        }
+        out_early: Dict[str, Any] = {
             "status": "ok",
             "execution_mode": "expert",
             "manifest_name": manifest.name,
             "universe_size": len(close_panel.columns),
             "n_days": len(close_panel),
-            "metrics": metrics,
+            "metrics": metrics_dg,
             "degenerate": True,
-            "degenerate_reason": f"metrics not finite: {nonfinite} (likely no trades in a segment)",
+            "degenerate_reason": f"metrics not finite: {nonfinite_dg} (likely no trades in a segment)",
+            "verification": "causality_check_only",
             "config": {
                 "benchmark": manifest.evaluator.benchmark,
                 "entrypoint": "run",
@@ -872,26 +904,235 @@ def _run_expert_mode(
                 "val_end": val_end.isoformat(),
             },
         }
-        if extras:
-            result["expert_extras"] = extras
+        if extras_dg:
+            out_early["expert_extras"] = extras_dg
         if benchmark_warning:
-            result["warning"] = benchmark_warning
-        return json.dumps(result)
+            out_early["warning"] = benchmark_warning
+        return json.dumps(out_early)
 
-    # Check for pathological values
-    warnings = _check_pathological(result_dict)
-    
-    # Separate required vs extra metrics
-    metrics = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
-    extras = {k: v for k, v in result_dict.items() if k not in REQUIRED_EXPERT_METRICS}
+    # --- Causality (lookahead) check ---
+    # Only if there IS holdout data (val_end is not the last date).
+    # Find the last available date from OHLCV data.
+    ohlcv_keys = [k for k in all_data if not k.startswith("_")]
+    last_date = None
+    for k in ohlcv_keys:
+        df = all_data[k]
+        if last_date is None or df.index.max() > last_date:
+            last_date = df.index.max()
 
-    result: Dict[str, Any] = {
+    has_holdout = last_date is not None and val_end < last_date
+
+    if has_holdout:
+        truncated_data = _truncate_all_data(all_data, val_end)
+        truncated_benchmark = (
+            benchmark_series[benchmark_series.index <= val_end]
+            if benchmark_series is not None
+            else None
+        )
+        try:
+            truncated_result = sandbox["run"](
+                data=truncated_data,
+                train_end=train_end,
+                val_end=val_end,
+                benchmark=truncated_benchmark,
+                config=config,
+            )
+        except Exception as e:
+            return _error_json(
+                "code",
+                f"lookahead detected: val metrics depend on data beyond val_end "
+                f"(holdout visible to run()) — truncated call raised {type(e).__name__}: {e}",
+            )
+
+        # Validate truncated result too
+        truncated_error = _validate_expert_metrics(truncated_result)
+        if truncated_error:
+            return _error_json(
+                "code",
+                f"lookahead detected: truncated run() returned invalid metrics: {truncated_error}",
+            )
+
+        # Compare the three val metrics (these describe the period up to val_end,
+        # so an honest implementation must produce identical values regardless
+        # of whether holdout rows exist past val_end).
+        lookahead_keys = [
+            "val_sharpe",
+            "val_max_drawdown_pct",
+            "val_total_return_pct",
+        ]
+        for key in lookahead_keys:
+            full_val = result_dict[key]
+            truncated_val = truncated_result[key]
+            if not _math.isclose(full_val, truncated_val, rel_tol=1e-6):
+                return _error_json(
+                    "code",
+                    f"lookahead detected: val metrics depend on data beyond val_end "
+                    f"(holdout visible to run()): {key} differs — "
+                    f"full={full_val:.8f}, truncated={truncated_val:.8f}",
+                )
+
+    # Check for pathological values (on the self-reported metrics)
+    pathological_warnings = _check_pathological(result_dict)
+
+    # --- Independent verification (optional) ---
+    recomputed_metrics = None
+    mismatch_warning = None
+    verification = "causality_check_only"
+
+    portfolio_ret_series: Optional[pd.Series] = None
+
+    if "returns" in result_dict:
+        raw = result_dict["returns"]
+        if isinstance(raw, pd.Series):
+            portfolio_ret_series = raw
+        else:
+            portfolio_ret_series = pd.Series(raw)
+    elif "positions" in result_dict or "weights" in result_dict:
+        raw = result_dict.get("weights", result_dict.get("positions"))
+        # Try to convert to DataFrame
+        if isinstance(raw, pd.DataFrame):
+            weights_df = raw
+        elif isinstance(raw, dict):
+            weights_df = pd.DataFrame(raw)
+        else:
+            weights_df = None
+
+        if weights_df is not None and not weights_df.empty:
+            # Compute asset returns from OHLCV data
+            ohlcv_close = {}
+            for k in ohlcv_keys:
+                df = all_data[k]
+                ohlcv_close[k] = df["Close"]
+            close_df = pd.DataFrame(ohlcv_close)
+            asset_rets = close_df.pct_change()
+            try:
+                portfolio_ret_series = _weights_to_portfolio_return(
+                    weights_df, asset_rets
+                )
+            except Exception:
+                portfolio_ret_series = None
+
+    if portfolio_ret_series is not None and len(portfolio_ret_series) >= 2:
+        verification = "independent_recompute"
+
+        # Slice into val/holdout (same as _run_structured_mode)
+        val_returns = portfolio_ret_series[train_end < portfolio_ret_series.index]
+        val_returns = val_returns[val_returns.index <= val_end]
+        holdout_returns = portfolio_ret_series[portfolio_ret_series.index > val_end]
+
+        if len(val_returns) >= 2 and len(holdout_returns) >= 2:
+            # Build per-asset returns aligned to val_returns / holdout_returns
+            ohlcv_close = {}
+            for k in ohlcv_keys:
+                df = all_data[k]
+                ohlcv_close[k] = df["Close"]
+            close_df = pd.DataFrame(ohlcv_close)
+            asset_rets = close_df.pct_change()
+            returns_df = asset_rets.reindex(portfolio_ret_series.index)
+
+            try:
+                val_metrics = evaluate(
+                    spec=manifest.evaluator,
+                    returns=returns_df.reindex(val_returns.index),
+                    weights=None,
+                    benchmark=(
+                        benchmark_series.reindex(val_returns.index)
+                        if benchmark_series is not None
+                        else None
+                    ),
+                    config=manifest.evaluator.extras if manifest.evaluator.extras else None,
+                )
+                holdout_metrics = evaluate(
+                    spec=manifest.evaluator,
+                    returns=returns_df.reindex(holdout_returns.index),
+                    weights=None,
+                    benchmark=(
+                        benchmark_series.reindex(holdout_returns.index)
+                        if benchmark_series is not None
+                        else None
+                    ),
+                    config=manifest.evaluator.extras if manifest.evaluator.extras else None,
+                )
+            except Exception:
+                val_metrics = {}
+                holdout_metrics = {}
+
+            # Build recomputed metrics dict with val_/holdout_ prefix
+            recomputed: Dict[str, Any] = {}
+            for k, v in val_metrics.items():
+                recomputed[f"val_{k}"] = v
+            for k, v in holdout_metrics.items():
+                recomputed[f"holdout_{k}"] = v
+
+            # Fill convenience metrics if missing
+            if "val_sharpe" not in recomputed:
+                recomputed["val_sharpe"] = np.nan
+            if "val_max_drawdown_pct" not in recomputed:
+                recomputed["val_max_drawdown_pct"] = np.nan
+            if "val_total_return_pct" not in recomputed:
+                recomputed["val_total_return_pct"] = (
+                    float((1 + val_returns).prod() - 1) * 100
+                    if len(val_returns) > 0
+                    else np.nan
+                )
+            if "holdout_sharpe" not in recomputed:
+                recomputed["holdout_sharpe"] = np.nan
+            if "holdout_max_drawdown_pct" not in recomputed:
+                recomputed["holdout_max_drawdown_pct"] = np.nan
+            if "holdout_total_return_pct" not in recomputed:
+                recomputed["holdout_total_return_pct"] = (
+                    float((1 + holdout_returns).prod() - 1) * 100
+                    if len(holdout_returns) > 0
+                    else np.nan
+                )
+
+            # Determine mismatches (tol=5% relative)
+            mismatches = []
+            for key in REQUIRED_EXPERT_METRICS:
+                if key in recomputed and key in result_dict:
+                    sr = result_dict[key]
+                    rv = recomputed[key]
+                    try:
+                        if not _math.isclose(sr, rv, rel_tol=0.05):
+                            mismatches.append(
+                                f"{key}: self_reported={sr:.6f}, recomputed={rv:.6f}"
+                            )
+                    except (TypeError, ValueError):
+                        # Non-numeric, can't compare
+                        pass
+
+            recomputed_metrics = recomputed
+            if mismatches:
+                mismatch_warning = (
+                    "metrics mismatch between self-reported and independently recomputed: "
+                    + "; ".join(mismatches)
+                )
+
+    # --- Build result ---
+    # When recomputed_metrics is available, it is authoritative
+    if recomputed_metrics is not None:
+        metrics = recomputed_metrics
+    else:
+        metrics = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
+
+    # Keep original self-reported values for transparency
+    self_reported = {k: result_dict[k] for k in REQUIRED_EXPERT_METRICS}
+    # Exclude non-serializable special keys from extras (defined at top of function)
+    extras = {
+        k: v
+        for k, v in result_dict.items()
+        if k not in REQUIRED_EXPERT_METRICS and k not in _SERIALIZABLE_EXCLUDE
+    }
+
+    out: Dict[str, Any] = {
         "status": "ok",
         "execution_mode": "expert",
         "manifest_name": manifest.name,
         "universe_size": len(close_panel.columns),
         "n_days": len(close_panel),
         "metrics": metrics,
+        "verification": verification,
+        "self_reported_metrics": self_reported,
         "config": {
             "benchmark": manifest.evaluator.benchmark,
             "entrypoint": "run",
@@ -900,13 +1141,15 @@ def _run_expert_mode(
         },
     }
     if extras:
-        result["expert_extras"] = extras
+        out["expert_extras"] = extras
     if benchmark_warning:
-        result["warning"] = benchmark_warning
-    if warnings:
-        result["pathological_warnings"] = warnings
+        out["warning"] = benchmark_warning
+    if pathological_warnings:
+        out["pathological_warnings"] = pathological_warnings
+    if mismatch_warning:
+        out["metrics_mismatch_warning"] = mismatch_warning
 
-    return json.dumps(result)
+    return json.dumps(out)
 
 
 # ---------------------------------------------------------------------------

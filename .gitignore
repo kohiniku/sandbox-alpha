@@ -34,3 +34,4 @@ ideation_logs/
 # Docker
 Dockerfile.bak
 backlog.json
+review_reports/
