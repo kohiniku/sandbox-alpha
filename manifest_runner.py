@@ -1034,6 +1034,20 @@ def _run_expert_mode(
     # Keys that may contain non-JSON-serializable pandas objects
     _SERIALIZABLE_EXCLUDE = frozenset({"returns", "weights", "positions"})
 
+    def _is_json_serializable(value: Any) -> bool:
+        """Check if a value can be serialized to JSON without error."""
+        if isinstance(value, (pd.Series, pd.DataFrame, pd.Index, np.ndarray)):
+            return False
+        if isinstance(value, dict):
+            return all(_is_json_serializable(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return all(_is_json_serializable(v) for v in value)
+        try:
+            json.dumps(value)
+            return True
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     # Check for run() entrypoint
     if not callable(sandbox.get("run")):
         return _error_json(
@@ -1073,6 +1087,7 @@ def _run_expert_mode(
             for k, v in result_dict.items()
             if k not in REQUIRED_EXPERT_METRICS
             and k not in _SERIALIZABLE_EXCLUDE
+            and _is_json_serializable(v)
         }
         out_early: Dict[str, Any] = {
             "status": "ok",
@@ -1208,14 +1223,13 @@ def _run_expert_mode(
         holdout_returns = portfolio_ret_series[portfolio_ret_series.index > val_end]
 
         if len(val_returns) >= 2 and len(holdout_returns) >= 2:
-            # Build per-asset returns aligned to val_returns / holdout_returns
-            ohlcv_close = {}
-            for k in ohlcv_keys:
-                df = all_data[k]
-                ohlcv_close[k] = df["Close"]
-            close_df = pd.DataFrame(ohlcv_close)
-            asset_rets = close_df.pct_change()
-            returns_df = asset_rets.reindex(portfolio_ret_series.index)
+            # Build a single-column returns DataFrame from the user's actual
+            # portfolio return series.  The previous code built returns_df from
+            # ALL OHLCV symbols and passed weights=None to evaluate(), which
+            # computed the equal-weight average across all assets — wrong for
+            # single-signal/pairs strategies whose "returns" series already IS
+            # the portfolio return.
+            returns_df = portfolio_ret_series.to_frame(name="portfolio")
 
             try:
                 val_metrics = evaluate(
@@ -1308,7 +1322,9 @@ def _run_expert_mode(
     extras = {
         k: v
         for k, v in result_dict.items()
-        if k not in REQUIRED_EXPERT_METRICS and k not in _SERIALIZABLE_EXCLUDE
+        if k not in REQUIRED_EXPERT_METRICS
+        and k not in _SERIALIZABLE_EXCLUDE
+        and _is_json_serializable(v)
     }
 
     out: Dict[str, Any] = {
