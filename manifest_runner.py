@@ -350,74 +350,82 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
         return _error_json("infra", "No OHLCV data sources declared in manifest")
 
     # --- Step 2: Execute user code ---
-    try:
-        code_bytes = base64.b64decode(manifest.code_b64)
-        code_str = code_bytes.decode("utf-8")
-    except Exception as e:
-        return _error_json("code", f"Failed to decode code_b64: {e}")
+    # DSL path: logic_spec replaces code_b64 — skip code decode+exec entirely.
+    # Indicators are trailing-only by construction, so lookahead is structurally
+    # impossible; the causality check is skipped for DSL strategies (not an oversight).
+    use_dsl = manifest.logic_spec is not None
 
-    # Build sandbox namespace
-    allowlist = _STRUCTURED_MODULES if manifest.execution_mode == "structured" else _EXPERT_MODULES
-    
-    sandbox: Dict[str, Any] = {
-        "pd": pd,
-        "np": np,
-        "pandas": pd,
-        "numpy": np,
-        "data": all_data,
-        "__builtins__": {
-            "len": len,
-            "range": range,
-            "enumerate": enumerate,
-            "zip": zip,
-            "map": map,
-            "filter": filter,
-            "sum": sum,
-            "min": min,
-            "max": max,
-            "abs": abs,
-            "int": int,
-            "float": float,
-            "str": str,
-            "list": list,
-            "dict": dict,
-            "set": set,
-            "tuple": tuple,
-            "bool": bool,
-            "type": type,
-            "isinstance": isinstance,
-            "print": lambda *a, **kw: None,  # silence
-            "sorted": sorted,
-            "reversed": reversed,
-            "any": any,
-            "all": all,
-            "round": round,
-            "iter": iter,
-            "next": next,
-            "hasattr": hasattr,
-            "getattr": getattr,
-            "setattr": setattr,
-            "callable": callable,
-            "NotImplementedError": NotImplementedError,
-            "ValueError": ValueError,
-            "TypeError": TypeError,
-            "KeyError": KeyError,
-            "IndexError": IndexError,
-            "RuntimeError": RuntimeError,
-            "AttributeError": AttributeError,
-            "Exception": Exception,
-            "True": True,
-            "False": False,
-            "None": None,
-            "__import__": lambda name, *a, **k: _safe_import(name, allowlist, *a, **k),
-        },
-    }
+    sandbox: Dict[str, Any] = {}
 
-    try:
-        exec(code_str, sandbox)  # noqa: S102
-    except Exception as e:
-        tb = traceback.format_exc()[-2000:]
-        return _error_json("code", f"User code raised {type(e).__name__}: {e}", tb)
+    if not use_dsl:
+        try:
+            code_bytes = base64.b64decode(manifest.code_b64)
+            code_str = code_bytes.decode("utf-8")
+        except Exception as e:
+            return _error_json("code", f"Failed to decode code_b64: {e}")
+
+        # Build sandbox namespace
+        allowlist = _STRUCTURED_MODULES if manifest.execution_mode == "structured" else _EXPERT_MODULES
+
+        sandbox = {
+            "pd": pd,
+            "np": np,
+            "pandas": pd,
+            "numpy": np,
+            "data": all_data,
+            "__builtins__": {
+                "len": len,
+                "range": range,
+                "enumerate": enumerate,
+                "zip": zip,
+                "map": map,
+                "filter": filter,
+                "sum": sum,
+                "min": min,
+                "max": max,
+                "abs": abs,
+                "int": int,
+                "float": float,
+                "str": str,
+                "list": list,
+                "dict": dict,
+                "set": set,
+                "tuple": tuple,
+                "bool": bool,
+                "type": type,
+                "isinstance": isinstance,
+                "print": lambda *a, **kw: None,  # silence
+                "sorted": sorted,
+                "reversed": reversed,
+                "any": any,
+                "all": all,
+                "round": round,
+                "iter": iter,
+                "next": next,
+                "hasattr": hasattr,
+                "getattr": getattr,
+                "setattr": setattr,
+                "callable": callable,
+                "NotImplementedError": NotImplementedError,
+                "ValueError": ValueError,
+                "TypeError": TypeError,
+                "KeyError": KeyError,
+                "IndexError": IndexError,
+                "RuntimeError": RuntimeError,
+                "AttributeError": AttributeError,
+                "Exception": Exception,
+                "True": True,
+                "False": False,
+                "None": None,
+                "__import__": lambda name, *a, **k: _safe_import(name, allowlist, *a, **k),
+            },
+        }
+
+        try:
+            exec(code_str, sandbox)  # noqa: S102
+        except Exception as e:
+            tb = traceback.format_exc()[-2000:]
+            return _error_json("code", f"User code raised {type(e).__name__}: {e}", tb)
 
     # --- Step 3: Align and compute returns ---
     # Filter out special internal keys (_news_sentiment etc.) for OHLCV alignment
@@ -452,6 +460,19 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
             )
 
     # --- Step 6: Route by execution_mode ---
+    if use_dsl:
+        return _run_dsl_mode(
+            manifest=manifest,
+            all_data=all_data,
+            close_panel=close_panel,
+            asset_returns=asset_returns,
+            train_end=train_end,
+            val_end=val_end,
+            benchmark_series=benchmark_series,
+            benchmark_warning=benchmark_warning,
+            extras_in=manifest.evaluator.extras or None,
+        )
+
     if manifest.execution_mode == "expert":
         return _run_expert_mode(
             manifest=manifest,
@@ -817,6 +838,172 @@ def _run_structured_mode(
         "config": {
             "benchmark": manifest.evaluator.benchmark,
             "weighting": weighting_label,
+            "train_end": train_end.isoformat(),
+            "val_end": val_end.isoformat(),
+        },
+    }
+    if benchmark_warning:
+        result["warning"] = benchmark_warning
+
+    return json.dumps(result)
+
+
+def _run_dsl_mode(
+    manifest: StrategyManifest,
+    all_data: Dict[str, pd.DataFrame],
+    close_panel: pd.DataFrame,
+    asset_returns: pd.DataFrame,
+    train_end: pd.Timestamp,
+    val_end: pd.Timestamp,
+    benchmark_series: Optional[pd.Series],
+    benchmark_warning: Optional[str],
+    extras_in: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Execute a DSL-based (logic_spec) manifest.
+
+    Calls the trusted strategy_dsl interpreter — no user code exec(),
+    no lookahead check (indicators are trailing-only by construction).
+    The output follows the same shape as _run_structured_mode so the
+    downstream evaluate path is identical.
+    """
+    from strategy_dsl import run_dsl_strategy, DslExecutionError
+
+    logic_spec = manifest.logic_spec
+    if logic_spec is None:
+        return _error_json("code", "logic_spec is None — should not reach _run_dsl_mode")
+
+    kind = logic_spec.get("kind", "unknown")
+
+    try:
+        output_df = run_dsl_strategy(logic_spec, all_data)
+    except DslExecutionError as e:
+        tb = traceback.format_exc()[-2000:]
+        return _error_json("code", f"DSL execution error: {e}", tb)
+    except Exception as e:
+        tb = traceback.format_exc()[-2000:]
+        return _error_json("code", f"DSL raised {type(e).__name__}: {e}", tb)
+
+    # ── Cross-sectional path ─────────────────────────────────────────
+    if kind == "cross_sectional_rank":
+        universe = sorted(k for k in all_data if not k.startswith("_"))
+
+        if validate_scores is None:
+            return _error_json(
+                "infra",
+                "Cross-sectional validators are not available in this environment.",
+            )
+
+        try:
+            validate_scores(output_df, universe)
+        except ValueError as e:
+            return _error_json("cross_contract_violation", str(e))
+
+        try:
+            from backtests.cross_sectional.engine import run_cross_sectional_backtest
+        except ImportError:
+            from cross_sectional.engine import run_cross_sectional_backtest  # type: ignore[no-redef]
+
+        try:
+            result_dict = run_cross_sectional_backtest(
+                raw_output=output_df,
+                return_type="scores",
+                universe=universe,
+                panel=all_data,
+                config={
+                    **(extras_in or {}),
+                    "cross_return_type": "scores",
+                    "train_end": train_end,
+                    "val_end": val_end,
+                },
+            )
+            return json.dumps(result_dict, default=str)
+        except ValueError as e:
+            return _error_json("cross_engine_error", str(e))
+
+    # ── Single-asset path ────────────────────────────────────────────
+    # output_df is a signals DataFrame (values in {-1, 0, 1})
+    signals_df = output_df
+    weights_df = _signals_to_weights(signals_df)
+
+    symbols = list(close_panel.columns)
+    portfolio_ret = _weights_to_portfolio_return(weights_df, asset_returns)
+
+    weights_aligned = weights_df.reindex(
+        index=asset_returns.index, columns=symbols, fill_value=0.0
+    )
+    weights_aligned = weights_aligned.ffill().fillna(0.0)
+    weights_for_eval = weights_aligned.shift(1).iloc[1:]
+
+    if len(portfolio_ret) < 2:
+        return _error_json(
+            "code", "Portfolio return series has fewer than 2 rows after alignment"
+        )
+
+    val_returns = portfolio_ret[train_end < portfolio_ret.index]
+    val_returns = val_returns[val_returns.index <= val_end]
+    holdout_returns = portfolio_ret[portfolio_ret.index > val_end]
+
+    val_weights = weights_for_eval.reindex(val_returns.index)
+    holdout_weights = weights_for_eval.reindex(holdout_returns.index)
+
+    returns_df = asset_returns.reindex(portfolio_ret.index)
+
+    try:
+        val_metrics = evaluate(
+            spec=manifest.evaluator,
+            returns=returns_df.reindex(val_returns.index),
+            weights=val_weights,
+            benchmark=(
+                benchmark_series.reindex(val_returns.index)
+                if benchmark_series is not None
+                else None
+            ),
+            config=manifest.evaluator.extras if manifest.evaluator.extras else None,
+        )
+        holdout_metrics = evaluate(
+            spec=manifest.evaluator,
+            returns=returns_df.reindex(holdout_returns.index),
+            weights=holdout_weights,
+            benchmark=(
+                benchmark_series.reindex(holdout_returns.index)
+                if benchmark_series is not None
+                else None
+            ),
+            config=manifest.evaluator.extras if manifest.evaluator.extras else None,
+        )
+    except Exception as e:
+        tb = traceback.format_exc()[-2000:]
+        return _error_json("infra", f"Evaluator failed: {e}", tb)
+
+    metrics = {}
+    for k, v in val_metrics.items():
+        metrics[f"val_{k}"] = v
+    for k, v in holdout_metrics.items():
+        metrics[f"holdout_{k}"] = v
+
+    if "val_sharpe" not in metrics:
+        metrics["val_sharpe"] = np.nan
+    if "val_max_drawdown_pct" not in metrics:
+        metrics["val_max_drawdown_pct"] = np.nan
+    if "val_total_return_pct" not in metrics:
+        metrics["val_total_return_pct"] = float((1 + val_returns).prod() - 1) * 100
+    if "holdout_sharpe" not in metrics:
+        metrics["holdout_sharpe"] = np.nan
+    if "holdout_max_drawdown_pct" not in metrics:
+        metrics["holdout_max_drawdown_pct"] = np.nan
+    if "holdout_total_return_pct" not in metrics:
+        metrics["holdout_total_return_pct"] = float((1 + holdout_returns).prod() - 1) * 100
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "execution_mode": "structured",
+        "manifest_name": manifest.name,
+        "universe_size": len(symbols),
+        "n_days": len(portfolio_ret),
+        "metrics": metrics,
+        "config": {
+            "benchmark": manifest.evaluator.benchmark,
+            "weighting": "dsl_trusted",
             "train_end": train_end.isoformat(),
             "val_end": val_end.isoformat(),
         },

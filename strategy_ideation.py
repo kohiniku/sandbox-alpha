@@ -1709,12 +1709,59 @@ FIELDS:
 - execution_mode: "structured" or "expert"
 - priority: 0.0–1.0 (higher = more promising)
 - source: {{kind, ref}} — paper citation or idea reference
+- logic_spec: PREFERRED ALTERNATIVE to code_b64 for structured-mode. When present,
+  code_b64 must be omitted entirely (they are mutually exclusive). See DSL section below.
+
+═══════════════════════════════════════════════════════════════════════
+STRATEGY DSL (logic_spec) — PREFERRED for structured-mode manifests
+═══════════════════════════════════════════════════════════════════════
+
+For any strategy expressible as indicator threshold rules or cross-sectional
+ranking, use logic_spec INSTEAD of code_b64. A logic_spec manifest is executed
+by a trusted interpreter (not LLM code) — lookahead is structurally impossible,
+no causality check is needed, and reviewers can read the JSON to understand the
+full strategy. This is the PREFERRED way to author structured-mode manifests.
+
+SINGLE-ASSET RULE (kind: "single_asset_rule"):
+{{
+  "kind": "single_asset_rule",
+  "indicators": {{
+    "rsi14": {{"type": "rsi", "window": 14}},
+    "sma20": {{"type": "sma", "window": 20}},
+    "bb_pct": {{"type": "bollinger_pct_b", "window": 20}}
+  }},
+  "entry_rule": {{"op": "lt", "left": {{"indicator": "rsi14"}}, "right": {{"const": 30}}}},
+  "exit_rule": {{"op": "gt", "left": {{"indicator": "rsi14"}}, "right": {{"const": 70}}}},
+  "position_sizing": "long_only_binary"
+}}
+
+Indicator types: sma, ema, rsi, bollinger_pct_b, rolling_zscore, rolling_vol, macd.
+Rule ops: gt, lt, gte, lte, and, or, not, crosses_above, crosses_below.
+Leaf values: {{"indicator": "<name>"}} or {{"const": <number>}}.
+Position sizing: long_only_binary, long_short_binary.
+
+CROSS-SECTIONAL RANK (kind: "cross_sectional_rank"):
+{{
+  "kind": "cross_sectional_rank",
+  "indicators": {{"mom60": {{"type": "sma", "window": 60}}}},
+  "rank_by": "mom60",
+  "direction": "top",
+  "n_select": 10,
+  "weighting": "equal"
+}}
+
+IMPORTANT: When a strategy CAN be expressed via logic_spec, you MUST use it
+instead of code_b64 for structured-mode manifests. Only use code_b64 or
+execution_mode="expert" when the strategy genuinely cannot be expressed via
+logic_spec — e.g. it needs a trained ML model, a Kalman filter, cointegration
+test, regime-switching, or non-threshold-based logic. In that case, the idea's
+one_line_rationale field MUST explicitly state WHY DSL doesn't suffice.
 
 ═══════════════════════════════════════════════════════════════════════
 ENTRYPOINT CONTRACT — READ CAREFULLY. Wrong entrypoint = manifest DIES.
 ═══════════════════════════════════════════════════════════════════════
 
-If execution_mode == "structured":
+If execution_mode == "structured" AND code_b64 is used (NOT logic_spec):
   YOU MUST define ONE of:
     def generate_signals(data):
         # data: dict[symbol: str, DataFrame] with cols Open/High/Low/Close/Volume

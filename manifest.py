@@ -496,6 +496,7 @@ class StrategyManifest:
     """
     name: str = ""
     code_b64: str = ""
+    logic_spec: Optional[Dict[str, Any]] = None
     data_sources: List[DataSource] = field(default_factory=list)
     model_artifacts: List[ModelArtifact] = field(default_factory=list)
     compute: ComputeSpec = field(default_factory=ComputeSpec)
@@ -516,6 +517,7 @@ class StrategyManifest:
         return cls(
             name=d.get("name", ""),
             code_b64=d.get("code_b64", ""),
+            logic_spec=d.get("logic_spec"),
             data_sources=data_sources,
             model_artifacts=model_artifacts,
             compute=compute,
@@ -525,7 +527,7 @@ class StrategyManifest:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dict."""
-        return {
+        result = {
             "name": self.name,
             "code_b64": self.code_b64,
             "data_sources": [ds.to_dict() for ds in self.data_sources],
@@ -534,6 +536,9 @@ class StrategyManifest:
             "evaluator": self.evaluator.to_dict(),
             "execution_mode": self.execution_mode,
         }
+        if self.logic_spec is not None:
+            result["logic_spec"] = self.logic_spec
+        return result
 
     def validate(self) -> List[str]:
         """
@@ -546,19 +551,48 @@ class StrategyManifest:
         if not self.name or not isinstance(self.name, str):
             violations.append("name must be a non-empty string")
 
-        # 2. code_b64
-        if not self.code_b64 or not isinstance(self.code_b64, str):
-            violations.append("code_b64 must be a non-empty string")
+        # 2. code_b64 / logic_spec mutual exclusion
+        has_code = bool(self.code_b64 and isinstance(self.code_b64, str))
+        has_logic = self.logic_spec is not None
+
+        if self.execution_mode == "expert":
+            if has_logic:
+                violations.append("logic_spec is not allowed in expert mode")
+            if not has_code:
+                violations.append("code_b64 must be a non-empty string in expert mode")
+            elif has_code:
+                try:
+                    decoded = base64.b64decode(self.code_b64)
+                    if len(decoded) > MAX_CODE_BYTES:
+                        violations.append(
+                            f"code_b64 decoded size {len(decoded)} bytes "
+                            f"exceeds max {MAX_CODE_BYTES}"
+                        )
+                except Exception as e:
+                    violations.append(f"code_b64 is not valid base64: {e}")
         else:
-            try:
-                decoded = base64.b64decode(self.code_b64)
-                if len(decoded) > MAX_CODE_BYTES:
-                    violations.append(
-                        f"code_b64 decoded size {len(decoded)} bytes "
-                        f"exceeds max {MAX_CODE_BYTES}"
-                    )
-            except Exception as e:
-                violations.append(f"code_b64 is not valid base64: {e}")
+            # structured mode
+            if has_code and has_logic:
+                violations.append(
+                    "code_b64 and logic_spec are mutually exclusive — "
+                    "provide one or the other, not both"
+                )
+            if not has_code and not has_logic:
+                violations.append(
+                    "either code_b64 or logic_spec must be provided in structured mode"
+                )
+            if has_code:
+                try:
+                    decoded = base64.b64decode(self.code_b64)
+                    if len(decoded) > MAX_CODE_BYTES:
+                        violations.append(
+                            f"code_b64 decoded size {len(decoded)} bytes "
+                            f"exceeds max {MAX_CODE_BYTES}"
+                        )
+                except Exception as e:
+                    violations.append(f"code_b64 is not valid base64: {e}")
+            if has_logic:
+                violations.extend(_validate_logic_spec(self.logic_spec))
 
         # 3. data_sources
         for i, ds in enumerate(self.data_sources):
@@ -966,3 +1000,103 @@ def _validate_macro_source(source: "MacroSource", index: int) -> List[str]:
         )
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# logic_spec structural validation
+# ---------------------------------------------------------------------------
+
+VALID_LOGIC_SPEC_KINDS = frozenset({"single_asset_rule", "cross_sectional_rank"})
+VALID_INDICATOR_TYPES_SPEC = frozenset({
+    "sma", "ema", "rsi", "bollinger_pct_b",
+    "rolling_zscore", "rolling_vol", "macd",
+})
+VALID_POSITION_SIZING_SPEC = frozenset({
+    "long_only_binary", "long_short_binary",
+})
+VALID_DIRECTIONS = frozenset({"top", "bottom"})
+VALID_WEIGHTINGS = frozenset({"equal", "score_weighted"})
+
+
+def _validate_logic_spec(spec: Any) -> List[str]:
+    """Structural validation of logic_spec — checks top-level required keys
+    have correct types.  Does NOT recurse into the rule-node tree (that is
+    the interpreter's job at execution time).
+    """
+    v: List[str] = []
+    if not isinstance(spec, dict):
+        v.append("logic_spec must be a dict")
+        return v
+
+    kind = spec.get("kind")
+    if kind not in VALID_LOGIC_SPEC_KINDS:
+        v.append(
+            f"logic_spec.kind must be one of {sorted(VALID_LOGIC_SPEC_KINDS)}, "
+            f"got {kind!r}"
+        )
+
+    indicators = spec.get("indicators")
+    if not isinstance(indicators, dict) or len(indicators) == 0:
+        v.append("logic_spec.indicators must be a non-empty dict")
+    else:
+        for name, ind_spec in indicators.items():
+            if not isinstance(ind_spec, dict):
+                v.append(
+                    f"logic_spec.indicators['{name}'] must be a dict, "
+                    f"got {type(ind_spec).__name__}"
+                )
+                continue
+            ind_type = ind_spec.get("type")
+            if ind_type not in VALID_INDICATOR_TYPES_SPEC:
+                v.append(
+                    f"logic_spec.indicators['{name}'].type must be one of "
+                    f"{sorted(VALID_INDICATOR_TYPES_SPEC)}, got {ind_type!r}"
+                )
+            window = ind_spec.get("window")
+            if window is not None and not isinstance(window, int):
+                v.append(
+                    f"logic_spec.indicators['{name}'].window must be an int, "
+                    f"got {type(window).__name__}"
+                )
+
+    if kind == "single_asset_rule":
+        if spec.get("entry_rule") is not None and not isinstance(spec.get("entry_rule"), dict):
+            v.append("logic_spec.entry_rule must be a dict or null")
+        if spec.get("exit_rule") is not None and not isinstance(spec.get("exit_rule"), dict):
+            v.append("logic_spec.exit_rule must be a dict or null")
+        sizing = spec.get("position_sizing", "long_only_binary")
+        if sizing not in VALID_POSITION_SIZING_SPEC:
+            v.append(
+                f"logic_spec.position_sizing must be one of "
+                f"{sorted(VALID_POSITION_SIZING_SPEC)}, got {sizing!r}"
+            )
+    elif kind == "cross_sectional_rank":
+        rank_by = spec.get("rank_by")
+        if not isinstance(rank_by, str) or rank_by not in indicators:
+            v.append(
+                f"logic_spec.rank_by '{rank_by}' must be a key in logic_spec.indicators"
+            )
+        direction = spec.get("direction", "top")
+        if direction not in VALID_DIRECTIONS:
+            v.append(
+                f"logic_spec.direction must be one of {sorted(VALID_DIRECTIONS)}, "
+                f"got {direction!r}"
+            )
+        n_select = spec.get("n_select")
+        pct_select = spec.get("pct_select")
+        if n_select is not None and pct_select is not None:
+            v.append("logic_spec: use 'n_select' OR 'pct_select', not both")
+        if n_select is None and pct_select is None:
+            v.append("logic_spec: 'n_select' or 'pct_select' is required")
+        if n_select is not None and not isinstance(n_select, int):
+            v.append(f"logic_spec.n_select must be an int, got {type(n_select).__name__}")
+        if pct_select is not None and not isinstance(pct_select, (int, float)):
+            v.append(f"logic_spec.pct_select must be a float, got {type(pct_select).__name__}")
+        weighting = spec.get("weighting", "equal")
+        if weighting not in VALID_WEIGHTINGS:
+            v.append(
+                f"logic_spec.weighting must be one of {sorted(VALID_WEIGHTINGS)}, "
+                f"got {weighting!r}"
+            )
+
+    return v
