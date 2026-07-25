@@ -278,7 +278,6 @@ def _eval_rule(
 VALID_POSITION_SIZING = frozenset({
     "long_only_binary",
     "long_short_binary",
-    "proportional_to_zscore",
 })
 
 
@@ -292,7 +291,6 @@ def _apply_position_sizing(
     Returns a Series of position values:
       - long_only_binary:   1 when entry=True, 0 when exit=True
       - long_short_binary:  1 when entry=True, -1 when exit=True, 0 otherwise
-      - proportional_to_zscore:  entry * zscore (zscore from values dict)
     """
     if sizing == "long_only_binary":
         position = pd.Series(0.0, index=entry.index)
@@ -305,11 +303,6 @@ def _apply_position_sizing(
         # exit_sig in long_short means "go short"
         position[exit_sig] = -1.0
         return position
-    elif sizing == "proportional_to_zscore":
-        # Requires zscore indicator to be present in values
-        raise NotImplementedError(
-            "proportional_to_zscore requires indicator values passed separately"
-        )
     else:
         raise DslExecutionError(
             f"Unknown position_sizing '{sizing}'. "

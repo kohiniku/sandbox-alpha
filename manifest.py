@@ -1012,7 +1012,7 @@ VALID_INDICATOR_TYPES_SPEC = frozenset({
     "rolling_zscore", "rolling_vol", "macd",
 })
 VALID_POSITION_SIZING_SPEC = frozenset({
-    "long_only_binary", "long_short_binary", "proportional_to_zscore",
+    "long_only_binary", "long_short_binary",
 })
 VALID_DIRECTIONS = frozenset({"top", "bottom"})
 VALID_WEIGHTINGS = frozenset({"equal", "score_weighted"})

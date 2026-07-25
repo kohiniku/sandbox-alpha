@@ -1738,7 +1738,7 @@ SINGLE-ASSET RULE (kind: "single_asset_rule"):
 Indicator types: sma, ema, rsi, bollinger_pct_b, rolling_zscore, rolling_vol, macd.
 Rule ops: gt, lt, gte, lte, and, or, not, crosses_above, crosses_below.
 Leaf values: {{"indicator": "<name>"}} or {{"const": <number>}}.
-Position sizing: long_only_binary, long_short_binary, proportional_to_zscore.
+Position sizing: long_only_binary, long_short_binary.
 
 CROSS-SECTIONAL RANK (kind: "cross_sectional_rank"):
 {{
