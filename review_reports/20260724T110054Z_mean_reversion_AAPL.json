@@ -1,0 +1,25 @@
+{
+  "family_key": "mean_reversion|AAPL",
+  "family_type": "single",
+  "diagnosed_at": "2026-07-24T11:00:54.050143+00:00",
+  "flags": {
+    "cost_bound": false,
+    "no_signal": false,
+    "unstable": false,
+    "regime_dependent": false,
+    "high_turnover": false
+  },
+  "baseline": {
+    "val_sharpe": 0.608,
+    "val_turnover": 10.1205,
+    "fold_sharpes": [
+      0.22,
+      1.158,
+      0.545
+    ]
+  },
+  "cost_free": {
+    "val_sharpe": 0.638
+  },
+  "folds_available": true
+}

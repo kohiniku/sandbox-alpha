@@ -1,0 +1,25 @@
+{
+  "family_key": "rsi|AMD",
+  "family_type": "single",
+  "diagnosed_at": "2026-07-24T19:03:01.413863+00:00",
+  "flags": {
+    "cost_bound": false,
+    "no_signal": false,
+    "unstable": false,
+    "regime_dependent": true,
+    "high_turnover": false
+  },
+  "baseline": {
+    "val_sharpe": 2.01,
+    "val_turnover": 37.296,
+    "fold_sharpes": [
+      -0.655,
+      0.122,
+      0.735
+    ]
+  },
+  "cost_free": {
+    "val_sharpe": 2.068
+  },
+  "folds_available": true
+}

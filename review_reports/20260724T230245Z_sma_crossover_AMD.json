@@ -1,0 +1,25 @@
+{
+  "family_key": "sma_crossover|AMD",
+  "family_type": "single",
+  "diagnosed_at": "2026-07-24T23:02:45.056707+00:00",
+  "flags": {
+    "cost_bound": false,
+    "no_signal": false,
+    "unstable": true,
+    "regime_dependent": true,
+    "high_turnover": false
+  },
+  "baseline": {
+    "val_sharpe": 1.144,
+    "val_turnover": 5.04,
+    "fold_sharpes": [
+      -0.833,
+      0.005,
+      1.68
+    ]
+  },
+  "cost_free": {
+    "val_sharpe": 1.15
+  },
+  "folds_available": true
+}

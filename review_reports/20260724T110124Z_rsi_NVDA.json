@@ -1,0 +1,25 @@
+{
+  "family_key": "rsi|NVDA",
+  "family_type": "single",
+  "diagnosed_at": "2026-07-24T11:01:23.184434+00:00",
+  "flags": {
+    "cost_bound": false,
+    "no_signal": false,
+    "unstable": true,
+    "regime_dependent": true,
+    "high_turnover": false
+  },
+  "baseline": {
+    "val_sharpe": 0.827,
+    "val_turnover": 34.4096,
+    "fold_sharpes": [
+      -3.046,
+      1.141,
+      -0.974
+    ]
+  },
+  "cost_free": {
+    "val_sharpe": 0.893
+  },
+  "folds_available": true
+}
