@@ -64,6 +64,10 @@ def _get_llm_config():
         "api_key": os.environ.get(
             os.environ.get("HYPO_LLM_API_KEY_ENV", "DEEPSEEK_API_KEY"), ""
         ),
+        # Default preserved at 60s for backward compatibility; override when a
+        # provider/model needs longer (e.g. large-context brainstorm prompts
+        # against a slower endpoint) via HYPO_LLM_TIMEOUT.
+        "timeout": int(os.environ.get("HYPO_LLM_TIMEOUT", "60")),
     }
 
 
@@ -664,7 +668,7 @@ def _call_llm(messages, max_tokens=4096, temperature=0.7, model=None, response_j
             "Content-Type": "application/json",
         },
         payload=payload,
-        timeout=60,
+        timeout=cfg["timeout"],
     )
     content = body["choices"][0]["message"]["content"].strip()
     # Strip markdown fences
