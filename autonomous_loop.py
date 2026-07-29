@@ -464,7 +464,7 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since=No
             status = resp.status
 
         if status != 200:
-            return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}", "error_type": "infra"}
+            return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}", "error_type": _classify_http_status(status)}
 
         result = json.loads(response_body)
         # Runner-reported error (strategy code failure) → tag as code
@@ -478,7 +478,7 @@ def _run_backtest_sandbox(runner_url, strategy, symbol, params, metrics_since=No
             error_body = e.read().decode("utf-8")[:500]
         except Exception:
             pass
-        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
+        return {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": _classify_http_status(e.code)}
     except urllib.error.URLError as e:
         return {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
     except json.JSONDecodeError as e:
@@ -1272,6 +1272,18 @@ def _extract_universe_meta(manifest_spec):
     return universe, universe_hash, len(universe)
 
 
+def _classify_http_status(status):
+    """Return 'code' for 4xx client errors, 'infra' for everything else non-200.
+
+    4xx errors (400, 404, 422, …) are deterministic client/contract errors —
+    retrying them will never succeed.  5xx, network, and timeout errors are
+    transient infrastructure problems that may resolve on retry.
+    """
+    if 400 <= status < 500:
+        return "code"
+    return "infra"
+
+
 def _classify_runner_response(status, response_body):
     """Parse and classify a sandbox runner HTTP response.
 
@@ -1283,7 +1295,7 @@ def _classify_runner_response(status, response_body):
     """
     if status != 200:
         return {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
-                "error_type": "infra"}, False
+                "error_type": _classify_http_status(status)}, False
 
     parsed = json.loads(response_body)
     if not isinstance(parsed, dict):
@@ -1330,7 +1342,7 @@ def _http_post_for_result(url, body, timeout):
         except Exception:
             pass
         return {"error": f"Sandbox runner HTTP {e.code}: {error_body}",
-                "error_type": "infra"}, False
+                "error_type": _classify_http_status(e.code)}, False
     except urllib.error.URLError as e:
         return {"error": f"Sandbox runner connection error: {e.reason}",
                 "error_type": "infra"}, False
@@ -1447,7 +1459,7 @@ def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
             status = resp.status
         if status != 200:
             result = {"error": f"Sandbox runner returned HTTP {status}: {response_body[:500]}",
-                      "error_type": "infra"}
+                      "error_type": _classify_http_status(status)}
         else:
             result = json.loads(response_body)
             if isinstance(result, dict) and "error" in result:
@@ -1460,7 +1472,7 @@ def _consume_code_entry(entry, spec, knowledge, runner_url, bl):
             error_body = e.read().decode("utf-8")[:500]
         except Exception:
             pass
-        result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": "infra"}
+        result = {"error": f"Sandbox runner HTTP {e.code}: {error_body}", "error_type": _classify_http_status(e.code)}
     except urllib.error.URLError as e:
         result = {"error": f"Sandbox runner connection error: {e.reason}", "error_type": "infra"}
     except json.JSONDecodeError as e:
