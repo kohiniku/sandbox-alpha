@@ -516,6 +516,257 @@ def _truncate_all_data(
     return result
 
 
+def _mask_day_all_assets(
+    all_data: Dict[str, pd.DataFrame],
+    day: pd.Timestamp,
+) -> Dict[str, pd.DataFrame]:
+    """Return a copy of all_data with the given day's OHLCV row replaced by
+    the previous day's values (forward-fill) for every asset.
+
+    This makes day *t*'s return zero across all assets while keeping the
+    data structurally valid (no NaNs that would crash user code).  Used by
+    the same-day cross-asset lookahead check (#65).
+    """
+    result: Dict[str, pd.DataFrame] = {}
+    for key, df in all_data.items():
+        if key.startswith("_"):
+            result[key] = df
+            continue
+        masked = df.copy()
+        if day in masked.index:
+            day_loc = masked.index.get_loc(day)
+            if day_loc > 0:
+                masked.iloc[day_loc] = masked.iloc[day_loc - 1]
+            else:
+                masked.iloc[day_loc] = np.nan
+        result[key] = masked
+    return result
+
+
+def _check_sameday_cross_asset_lookahead(
+    run_fn: Any,
+    all_data: Dict[str, pd.DataFrame],
+    train_end: pd.Timestamp,
+    val_end: pd.Timestamp,
+    benchmark_series: Optional[pd.Series],
+    config: dict,
+    original_result: dict,
+    n_samples: int = 5,
+) -> Optional[str]:
+    """Detect same-day cross-asset lookahead in expert-mode strategies (#65).
+
+    The existing cross-day check truncates data at *val_end* and compares
+    val metrics.  That catches strategies reading **future** rows but cannot
+    catch strategies that use **today's own** multi-asset return vector to
+    decide which asset's same-day return to credit (e.g. GMM regime
+    switching applied row-wise).
+
+    Approach
+    --------
+    For a deterministic sample of val-period days:
+
+    1. Mask that day's OHLCV row across **all** assets (forward-fill the
+       previous day so the return becomes zero).
+    2. Re-run ``run()`` from scratch.
+    3. **If the strategy returns weights/positions**: compare the weight
+       vector for the masked day.  A change means the decision depended on
+       that day's cross-asset data → same-day lookahead.
+    4. **If the strategy returns only a returns series**: check whether
+       masking day *t* affects returns for days *t+2 … t+K*.  A properly
+       lagged strategy (signal[t] = f(data ≤ t−1)) will have trailing-window
+       ripple effects on future days.  A row-independent strategy (each
+       day's decision uses only that day's data) will show **no** future
+       ripple — the signature of same-day cross-asset lookahead.
+
+    Returns ``None`` when no lookahead is detected, or a human-readable
+    description string when it is.
+    """
+    import math as _math
+
+    ohlcv_keys = [k for k in all_data if not k.startswith("_")]
+    if len(ohlcv_keys) < 2:
+        return None  # single-asset: no cross-asset dimension
+
+    # --- Extract original outputs ------------------------------------------
+    original_returns: Optional[pd.Series] = None
+    if "returns" in original_result:
+        raw = original_result["returns"]
+        original_returns = raw if isinstance(raw, pd.Series) else pd.Series(raw)
+
+    original_weights: Optional[pd.DataFrame] = None
+    for wkey in ("weights", "positions"):
+        if wkey in original_result:
+            raw = original_result[wkey]
+            if isinstance(raw, pd.DataFrame):
+                original_weights = raw
+            elif isinstance(raw, dict):
+                original_weights = pd.DataFrame(raw)
+            break
+
+    if original_returns is None and original_weights is None:
+        return None  # nothing to compare
+
+    # --- Choose sample days from the val period ----------------------------
+    ref_index = (
+        original_returns.index if original_returns is not None
+        else original_weights.index
+    )
+    val_days = ref_index[(ref_index > train_end) & (ref_index <= val_end)]
+    if len(val_days) == 0:
+        return None
+
+    n_samples = min(n_samples, len(val_days))
+    rng = np.random.default_rng(42)
+    sample_idx = sorted(rng.choice(len(val_days), size=n_samples, replace=False))
+    sample_days = [val_days[i] for i in sample_idx]
+
+    # --- Per-day masking check ---------------------------------------------
+    row_independent_hits = 0  # count of days showing the row-independent pattern
+
+    for day in sample_days:
+        masked_data = _mask_day_all_assets(all_data, day)
+
+        try:
+            masked_result = run_fn(
+                data=masked_data,
+                train_end=train_end,
+                val_end=val_end,
+                benchmark=benchmark_series,
+                config=config,
+            )
+        except Exception:
+            continue  # masked run crashed — inconclusive, skip this day
+
+        # ---- Primary: compare weights for the masked day ------------------
+        # When the strategy returns weights/positions, this is the definitive
+        # check — a same-day lookahead strategy's weight for day t will change
+        # when day t's cross-asset data is masked.
+        weights_checked = False
+        if original_weights is not None:
+            masked_w_raw = masked_result.get("weights", masked_result.get("positions"))
+            if masked_w_raw is not None:
+                masked_w = (
+                    masked_w_raw if isinstance(masked_w_raw, pd.DataFrame)
+                    else pd.DataFrame(masked_w_raw)
+                )
+                if day in original_weights.index and day in masked_w.index:
+                    weights_checked = True
+                    cols = original_weights.columns
+                    orig_w = original_weights.loc[day].reindex(cols).fillna(0).values
+                    mask_w = masked_w.reindex(columns=cols).loc[day].fillna(0).values
+                    if not np.allclose(orig_w, mask_w, atol=1e-8):
+                        return (
+                            f"same-day cross-asset lookahead detected: weights for "
+                            f"{day.date()} change when that day's OHLCV is masked "
+                            f"(original={np.round(orig_w, 4)}, "
+                            f"masked={np.round(mask_w, 4)})"
+                        )
+
+        # ---- Secondary: row-independence heuristic on returns -------------
+        # Fallback for strategies that return only a returns series (no
+        # weights).  A same-day lookahead strategy is row-independent:
+        # masking day t changes day t's return but has zero effect on any
+        # other day.  A properly lagged strategy with trailing windows will
+        # show ripple effects on future days.
+        #
+        # IMPORTANT: row-independence alone is not sufficient — a simple
+        # equal-weight portfolio (rets.mean(axis=1)) is also row-independent
+        # but perfectly legitimate.  We additionally check whether the
+        # portfolio return *selects* from individual asset returns (i.e.
+        # port_ret[t] ≈ asset_i_ret[t] for some i on most days), which is
+        # the signature of GMM-style same-day cross-asset leakage.
+        if not weights_checked and original_returns is not None:
+            masked_r_raw = masked_result.get("returns")
+            if masked_r_raw is not None:
+                masked_r = (
+                    masked_r_raw if isinstance(masked_r_raw, pd.Series)
+                    else pd.Series(masked_r_raw)
+                )
+
+                # Day t's return must have changed (otherwise masking had no
+                # effect and the check is vacuous).
+                if day not in original_returns.index or day not in masked_r.index:
+                    continue
+                orig_t = float(original_returns.loc[day])
+                mask_t = float(masked_r.loc[day])
+                day_changed = not _math.isclose(orig_t, mask_t, abs_tol=1e-10)
+
+                # Compare returns for days t+2 onwards (skip t+1 to allow a
+                # one-day lag).  A properly lagged strategy with trailing
+                # windows will show ripple effects; a row-independent strategy
+                # will not.
+                day_loc = masked_r.index.get_loc(day)
+                if day_loc + 2 < len(masked_r):
+                    check_start = masked_r.index[day_loc + 2]
+                    future_mask = masked_r.index >= check_start
+                    orig_future = original_returns.reindex(
+                        masked_r.index[future_mask]
+                    ).fillna(0)
+                    mask_future = masked_r[future_mask].fillna(0)
+
+                    if len(orig_future) >= 5:
+                        future_unchanged = np.allclose(
+                            orig_future.values, mask_future.values, atol=1e-8
+                        )
+                        if day_changed and future_unchanged:
+                            row_independent_hits += 1
+
+    # If the majority of sampled days show the row-independent pattern,
+    # apply a second filter: check whether the portfolio return *selects*
+    # from individual asset returns (GMM-style) vs. being a fixed linear
+    # combination (equal-weight, legitimate).
+    if row_independent_hits >= max(1, n_samples // 2 + 1):
+        # Build per-asset return series from OHLCV data.
+        asset_ret_series = {}
+        for k in ohlcv_keys:
+            df = all_data[k]
+            if "Close" in df.columns:
+                asset_ret_series[k] = df["Close"].pct_change()
+        if asset_ret_series and original_returns is not None:
+            asset_ret_df = pd.DataFrame(asset_ret_series)
+            common_idx = original_returns.index.intersection(asset_ret_df.index)
+            if len(common_idx) >= 10:
+                port_vals = original_returns.reindex(common_idx).values
+                asset_vals = asset_ret_df.reindex(common_idx).values  # (T, N)
+                # For each day, check if port_ret ≈ any single asset's return.
+                # Use a tolerance relative to the cross-asset spread.
+                n_select = 0
+                selected_assets = set()  # track WHICH asset is selected each day
+                for t in range(len(common_idx)):
+                    p = port_vals[t]
+                    diffs = np.abs(asset_vals[t] - p)
+                    best = int(np.argmin(diffs))
+                    # "Selects" if the portfolio return matches one asset
+                    # much more closely than the others (or exactly).
+                    if np.min(diffs) < 1e-8:
+                        n_select += 1
+                        selected_assets.add(best)
+                    elif len(diffs) >= 2:
+                        sorted_d = np.sort(diffs)
+                        # Closest match is <10% of the spread between the two
+                        # closest assets → effectively selecting one asset.
+                        if sorted_d[1] > 1e-10 and sorted_d[0] / sorted_d[1] < 0.1:
+                            n_select += 1
+                            selected_assets.add(best)
+                select_frac = n_select / len(common_idx)
+                # Two conditions must BOTH hold for same-day lookahead:
+                # 1. Portfolio return selects from individual assets (>50% of days)
+                # 2. The selected asset VARIES across days (a fixed single-asset
+                #    allocation like "always long AAA" is legitimate)
+                if select_frac < 0.5 or len(selected_assets) < 2:
+                    return None
+
+        return (
+            f"same-day cross-asset lookahead detected: masking individual days "
+            f"changes that day's return but has zero effect on future days "
+            f"({row_independent_hits}/{n_samples} sampled days show the "
+            f"row-independent pattern characteristic of same-day cross-asset "
+            f"leakage, e.g. GMM regime switching applied row-wise)"
+        )
+
+    return None
+
+
 def _check_structured_lookahead(
     entrypoint_fn: Any,
     all_data: Dict[str, pd.DataFrame],
@@ -1172,6 +1423,23 @@ def _run_expert_mode(
                     f"(holdout visible to run()): {key} differs — "
                     f"full={full_val:.8f}, truncated={truncated_val:.8f}",
                 )
+
+    # --- Same-day cross-asset lookahead check (#65) ---
+    # The cross-day check above truncates at val_end; it cannot catch
+    # strategies that use today's own multi-asset return vector to decide
+    # which asset's same-day return to credit (e.g. GMM regime switching
+    # applied row-wise).  Per-day masking catches that pattern.
+    sameday_err = _check_sameday_cross_asset_lookahead(
+        run_fn=sandbox["run"],
+        all_data=all_data,
+        train_end=train_end,
+        val_end=val_end,
+        benchmark_series=benchmark_series,
+        config=config,
+        original_result=result_dict,
+    )
+    if sameday_err is not None:
+        return _error_json("code", sameday_err)
 
     # Check for pathological values (on the self-reported metrics)
     pathological_warnings = _check_pathological(result_dict)
