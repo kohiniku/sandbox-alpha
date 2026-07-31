@@ -121,6 +121,32 @@ def _params_within_cluster(p1, p2, templates):
     return True
 
 
+def _update_param_clusters(fam, params, templates):
+    """Incrementally update param_clusters and distinct_clusters count.
+    
+    Uses greedy clustering: if the new params are within cluster distance
+    of any existing cluster representative, don't add a new cluster.
+    Otherwise, add this params as a new cluster representative.
+    
+    Args:
+        fam: family dict to update (must have 'param_clusters' list field)
+        params: new parameter dict to cluster
+        templates: STRATEGY_TEMPLATES for cluster distance check
+    """
+    clusters = fam.setdefault("param_clusters", [])
+    
+    # Check if this params is within cluster distance of any existing representative
+    for existing_params in clusters:
+        if _params_within_cluster(params, existing_params, templates):
+            # Within existing cluster, don't add new representative
+            fam["distinct_clusters"] = len(clusters)
+            return
+    
+    # New distinct cluster
+    clusters.append(params)
+    fam["distinct_clusters"] = len(clusters)
+
+
 def load_knowledge():
     """過去の戦略テスト結果を読み込む"""
     if KNOWLEDGE_FILE.exists():
@@ -152,6 +178,15 @@ def load_knowledge():
                 fam["lifecycle"] = FamilyLifecycle.CANDIDATE
                 fam["refine_count"] = 0
                 fam["kill_reason"] = ""
+            
+            # Migration: add param_clusters and distinct_clusters for issue #66 fix
+            if "param_clusters" not in fam:
+                fam["param_clusters"] = []
+                fam["distinct_clusters"] = 0
+                # Rebuild clusters from best_params if available
+                if fam.get("best_params"):
+                    fam["param_clusters"].append(fam["best_params"])
+                    fam["distinct_clusters"] = 1
 
         return data
     return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
@@ -229,13 +264,21 @@ def _apply_entry_to_family(families, key, entry, hyp, family_type="single"):
         "lifecycle": FamilyLifecycle.CANDIDATE,
         "refine_count": 0,
         "kill_reason": "",
+        "param_clusters": [],
+        "distinct_clusters": 0,
     })
     fam["n_trials"] += 1
+    
+    # Track parameter clusters for deflation calculation
+    params = hyp.get("params", {})
+    if params:
+        _update_param_clusters(fam, params, STRATEGY_TEMPLATES)
+    
     ev = entry.get("evaluation", {})
     val_sharpe = ev.get("sharpe_ratio", MISSING_METRIC)
     if val_sharpe > fam["best_val_sharpe"]:
         fam["best_val_sharpe"] = val_sharpe
-        fam["best_params"] = hyp.get("params", {})
+        fam["best_params"] = params
     tested_at = entry.get("tested_at", "")
     if tested_at > fam["last_tried"]:
         fam["last_tried"] = tested_at
@@ -789,11 +832,13 @@ def evaluate_result(hypothesis, result, knowledge):
     strategy = hypothesis["strategy"]
     symbol = hypothesis["symbol"]
 
-    # Count N_family: tested_combinations with same (strategy, symbol)
-    N_family = sum(
-        1 for tc in knowledge.get("tested_combinations", [])
-        if tc.get("strategy") == strategy and tc.get("symbol") == symbol
-    )
+    # Count N_family: use distinct parameter clusters instead of raw trial count
+    # This prevents the review loop from inflating the deflation bar when refining
+    # parameters within the same cluster (issue #66)
+    fam_key = _family_key(strategy, symbol, _derive_family_type(hypothesis))
+    families = knowledge.get("families", {})
+    N_family = families.get(fam_key, {}).get("distinct_clusters", 
+                                              families.get(fam_key, {}).get("n_trials", 0))
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
 
     # --- Gate v2: passive/observational CV evaluation (only when flag on + cv block present) ---
@@ -1116,9 +1161,11 @@ def _evaluate_manifest_result(runner_result, hypothesis, knowledge):
     symbol = hypothesis["symbol"]
 
     # N_family: count from families dict (updated by update_family_aggregates)
+    # Use distinct_clusters to avoid inflating the bar for correlated refinements (issue #66)
     fam_key = _family_key(strategy, symbol, "cross")
     families = knowledge.get("families", {})
-    N_family = families.get(fam_key, {}).get("n_trials", 0)
+    N_family = families.get(fam_key, {}).get("distinct_clusters",
+                                              families.get(fam_key, {}).get("n_trials", 0))
     effective_min_sharpe = compute_effective_min_sharpe(N_family, T_val)
 
     # --- Gate (a): Validation gate ---
