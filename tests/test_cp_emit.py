@@ -9,9 +9,12 @@ These tests verify:
 import json
 import os
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def test_emit_run_started_success():
@@ -160,7 +163,7 @@ def test_integration_script_completes_despite_cp_emit_failure(script_name, tmp_p
     test_script.write_text(f"""
 import sys
 import os
-sys.path.insert(0, '/opt/data/sandbox-alpha')
+sys.path.insert(0, {_REPO_ROOT!r})
 
 # Set env vars so cp_emit tries to call
 os.environ['SANDBOX_CP_INGEST_URL'] = 'http://fake:9999/ingest'
