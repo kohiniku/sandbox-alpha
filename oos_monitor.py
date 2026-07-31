@@ -201,6 +201,15 @@ def run_oos_monitor(knowledge=None, today=None):
 
 
 if __name__ == "__main__":
-    knowledge = load_knowledge()
-    checked, negative, skipped = run_oos_monitor(knowledge)
-    sys.exit(0)
+    import cp_emit
+    _cp_run_id = cp_emit.emit_run_started("d690a1508eaf", "oos_monitor.py")
+    try:
+        knowledge = load_knowledge()
+        checked, negative, skipped = run_oos_monitor(knowledge)
+        cp_emit.emit_run_finished(_cp_run_id, "ok")
+        sys.exit(0)
+    except BaseException as _cp_exc:
+        cp_emit.emit_run_finished(
+            _cp_run_id, "error", error=f"{type(_cp_exc).__name__}: {_cp_exc}"
+        )
+        raise
