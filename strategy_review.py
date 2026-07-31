@@ -791,6 +791,19 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
 # ============================================================================
 
 def main():
+    import cp_emit
+    _cp_run_id = cp_emit.emit_run_started("0f04408b45f4", "strategy_review.py")
+    try:
+        _main_inner()
+        cp_emit.emit_run_finished(_cp_run_id, "ok")
+    except BaseException as _cp_exc:
+        cp_emit.emit_run_finished(
+            _cp_run_id, "error", error=f"{type(_cp_exc).__name__}: {_cp_exc}"
+        )
+        raise
+
+
+def _main_inner():
     parser = argparse.ArgumentParser(description="Strategy Review — Diagnosis + Verdict stage (PR-C)")
     parser.add_argument("--max-families", type=int, default=None,
                         help="Max families to diagnose (default: REVIEW_MAX_FAMILIES env or 3)")

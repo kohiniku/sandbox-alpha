@@ -2558,19 +2558,49 @@ def run(max_proposals=5, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Strategy Ideation — LLM-driven proposal generation"
-    )
-    parser.add_argument(
-        "--max-proposals", type=int, default=_MAX_PROPOSALS_DEFAULT,
-        help=f"Max proposals to request (default: {_MAX_PROPOSALS_DEFAULT})"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Validate and print but do not write to backlog"
-    )
-    args = parser.parse_args()
-    run(max_proposals=args.max_proposals, dry_run=args.dry_run)
+    import cp_emit
+    _cp_run_id = cp_emit.emit_run_started("69d74ba128df", "strategy_ideation.py")
+    _cp_resolved_model = None
+    _cp_resolved_provider = None
+    _cp_resolved_base_url = None
+    try:
+        try:
+            _llm_cfg = _get_llm_config()
+            _cp_resolved_model = _llm_cfg.get("model")
+            _cp_resolved_base_url = _llm_cfg.get("base_url")
+            _cp_resolved_provider = (
+                _cp_resolved_base_url if _cp_resolved_base_url else None
+            )
+        except Exception:
+            pass
+        parser = argparse.ArgumentParser(
+            description="Strategy Ideation — LLM-driven proposal generation"
+        )
+        parser.add_argument(
+            "--max-proposals", type=int, default=_MAX_PROPOSALS_DEFAULT,
+            help=f"Max proposals to request (default: {_MAX_PROPOSALS_DEFAULT})"
+        )
+        parser.add_argument(
+            "--dry-run", action="store_true",
+            help="Validate and print but do not write to backlog"
+        )
+        args = parser.parse_args()
+        run(max_proposals=args.max_proposals, dry_run=args.dry_run)
+        cp_emit.emit_run_finished(
+            _cp_run_id, "ok",
+            resolved_model=_cp_resolved_model,
+            resolved_provider=_cp_resolved_provider,
+            resolved_base_url=_cp_resolved_base_url,
+        )
+    except BaseException as _cp_exc:
+        cp_emit.emit_run_finished(
+            _cp_run_id, "error",
+            resolved_model=_cp_resolved_model,
+            resolved_provider=_cp_resolved_provider,
+            resolved_base_url=_cp_resolved_base_url,
+            error=f"{type(_cp_exc).__name__}: {_cp_exc}",
+        )
+        raise
 
 
 if __name__ == "__main__":

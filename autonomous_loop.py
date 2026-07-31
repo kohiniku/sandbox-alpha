@@ -1906,9 +1906,18 @@ def run_revalidation(knowledge):
 
 
 if __name__ == "__main__":
-    if "--revalidate" in sys.argv:
-        knowledge = load_knowledge()
-        run_revalidation(knowledge)
-    else:
-        iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-        run_loop(iterations)
+    import cp_emit
+    _cp_run_id = cp_emit.emit_run_started("9d6c833bd3c5", "autonomous_loop.py")
+    try:
+        if "--revalidate" in sys.argv:
+            knowledge = load_knowledge()
+            run_revalidation(knowledge)
+        else:
+            iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+            run_loop(iterations)
+        cp_emit.emit_run_finished(_cp_run_id, "ok")
+    except BaseException as _cp_exc:
+        cp_emit.emit_run_finished(
+            _cp_run_id, "error", error=f"{type(_cp_exc).__name__}: {_cp_exc}"
+        )
+        raise
