@@ -126,8 +126,9 @@ CRITICAL: Prefer hypotheses that respond to WHY previous ones failed:
 - Validation/drawdown failures → try lower-risk parameter regions (longer windows, smaller thresholds).
 - EXHAUSTED families → do NOT propose params near those already-attempted ranges.
 
-Return ONLY this strict JSON (no other text):
-{{"strategy": "<name>", "symbol": "<TICKER>", "params": {{...}}, "rationale": "one sentence explaining why this addresses past failures or explores new ground"}}"""
+Return ONLY this strict JSON (no other text). Write the rationale in Japanese (日本語);
+the strategy name, ticker, JSON keys, and param names stay in English:
+{{"strategy": "<name>", "symbol": "<TICKER>", "params": {{...}}, "rationale": "過去の失敗への対応か新領域の探索かを日本語で一文"}}"""
 
     return [
         {"role": "system", "content": system_prompt},

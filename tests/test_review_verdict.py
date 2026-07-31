@@ -122,7 +122,7 @@ class TestApplyVerdictKill:
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
         assert fam["lifecycle"] == FamilyLifecycle.KILLED
-        assert fam["kill_reason"] == "auto: no signal, consistently bad"
+        assert fam["kill_reason"] == "自動判定: no signal, consistently bad"
 
     def test_kill_downgraded_insufficient_evidence(self, tmp_path, monkeypatch):
         """Kill verdict with n_trials < 3 → keep (downgraded)."""
@@ -176,7 +176,7 @@ class TestApplyVerdictKill:
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
         assert fam["lifecycle"] == FamilyLifecycle.KILLED
-        assert "auto: enough evidence" in fam["kill_reason"]
+        assert "自動判定: enough evidence" in fam["kill_reason"]
 
 
 # ============================================================================
@@ -298,7 +298,7 @@ class TestApplyVerdictRefine:
         reloaded = load_knowledge()
         fam = reloaded["families"][family_key]
         assert fam["lifecycle"] == FamilyLifecycle.KILLED
-        assert fam["kill_reason"] == "auto: refine cap exhausted"
+        assert fam["kill_reason"] == "自動判定: refine回数上限に到達"
 
     def test_cross_refine_downgraded_to_keep(self, tmp_path, monkeypatch):
         """Cross family refine → keep (downgraded)."""
@@ -1062,7 +1062,7 @@ class TestAuditTrail:
         summary = reloaded["reviews"][0]
         assert summary["llm_verdict"] == "kill"
         assert summary["applied_verdict"] == "keep"
-        assert "downgraded: insufficient evidence" in summary["rationale"]
+        assert "格下げ: 試行数不足で証拠不十分" in summary["rationale"]
 
     def test_summary_records_applied_verdict_on_cross_downgrade(self, tmp_path, monkeypatch):
         """When cross refine is downgraded, summary records llm_verdict=refine, applied_verdict=keep."""
@@ -1094,7 +1094,7 @@ class TestAuditTrail:
         summary = reloaded["reviews"][0]
         assert summary["llm_verdict"] == "refine"
         assert summary["applied_verdict"] == "keep"
-        assert "downgraded: cross refine unavailable" in summary["rationale"]
+        assert "格下げ: crossファミリーはrefine不可" in summary["rationale"]
 
     def test_summary_records_applied_verdict_on_refine_cap(self, tmp_path, monkeypatch):
         """When refine cap triggers, summary has llm_verdict=refine, applied_verdict=kill."""
@@ -1129,7 +1129,7 @@ class TestAuditTrail:
         summary = reloaded["reviews"][0]
         assert summary["llm_verdict"] == "refine"
         assert summary["applied_verdict"] == "kill"
-        assert summary["rationale"] == "refine cap exhausted"
+        assert summary["rationale"] == "refine回数上限に到達"
 
 
 class TestRefineDuplicate:
@@ -1258,7 +1258,7 @@ class TestRefineDuplicate:
         summary = reloaded["reviews"][0]
         assert summary["llm_verdict"] == "refine"
         assert summary["applied_verdict"] == "keep"
-        assert "refine duplicate" in summary["rationale"]
+        assert "refine重複" in summary["rationale"]
 
 
 class TestDowngradeSuffix:
@@ -1283,7 +1283,7 @@ class TestDowngradeSuffix:
         sr.apply_verdict(family_key, verdict, knowledge, backlog)
 
         captured = capsys.readouterr()
-        assert "downgraded: insufficient evidence" in captured.out
+        assert "格下げ: 試行数不足で証拠不十分" in captured.out
 
     def test_downgrade_suffix_in_summary_rationale(self, tmp_path, monkeypatch):
         """Summary rationale includes the downgrade suffix when kill is downgraded."""
@@ -1308,4 +1308,4 @@ class TestDowngradeSuffix:
 
         reloaded = load_knowledge()
         summary = reloaded["reviews"][0]
-        assert summary["rationale"] == "bad (downgraded: insufficient evidence)"
+        assert summary["rationale"] == "bad (格下げ: 試行数不足で証拠不十分)"

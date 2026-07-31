@@ -595,7 +595,9 @@ def _build_judge_prompt(report, family, knowledge):
         "You are a quantitative strategy reviewer. Your job is to read a machine-generated "
         "diagnosis report and decide whether to refine, keep, or kill the strategy family. "
         "All arithmetic is precomputed — do not recompute. Flags are ground truth. "
-        "Choose exactly one verdict."
+        "Choose exactly one verdict. "
+        "Write all free-text fields (rationale, change_summary) in natural technical Japanese; "
+        "keep the verdict token, JSON keys, and parameter names in English."
     )
 
     baseline_block = f"val_sharpe={val_sharpe}"
@@ -635,8 +637,10 @@ Rules:
 - If verdict is refine, refine_proposal is REQUIRED. Otherwise it must be null.
 - refine_proposal.params must be a dict with the same strategy/symbol and changed param values (int/float/str/bool).
 
+- rationale and change_summary must be written in Japanese (日本語). The verdict token, JSON keys, and param names stay in English.
+
 Return ONLY this strict JSON:
-{{"verdict": "refine|keep|kill", "rationale": "one sentence explaining why", "refine_proposal": {{"params": {{...}}, "change_summary": "..."}} | null}}"""
+{{"verdict": "refine|keep|kill", "rationale": "判断理由を日本語で一文", "refine_proposal": {{"params": {{...}}, "change_summary": "変更内容と狙いを日本語で"}} | null}}"""
 
     return [
         {"role": "system", "content": system_prompt},
@@ -716,18 +720,18 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
         n_trials = family.get("n_trials", 0)
         if n_trials < MIN_TRIALS_FOR_KILL:
             # Downgrade: insufficient evidence
-            final_rationale = rationale + " (downgraded: insufficient evidence)"
+            final_rationale = rationale + " (格下げ: 試行数不足で証拠不十分)"
             applied_verdict = "keep"
             print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         else:
             family["lifecycle"] = FamilyLifecycle.KILLED
-            family["kill_reason"] = "auto: " + rationale
+            family["kill_reason"] = "自動判定: " + rationale
             print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"{rationale}\"")
 
     elif llm_verdict == "refine":
         if family_type == "cross":
             # Cross families cannot be refined (no manifest spec persisted)
-            final_rationale = rationale + " (downgraded: cross refine unavailable)"
+            final_rationale = rationale + " (格下げ: crossファミリーはrefine不可)"
             applied_verdict = "keep"
             print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         else:
@@ -735,9 +739,9 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
             if refine_count >= REFINE_CAP:
                 # Auto-kill: refine cap exhausted (ignores MIN_TRIALS_FOR_KILL)
                 family["lifecycle"] = FamilyLifecycle.KILLED
-                family["kill_reason"] = "auto: refine cap exhausted"
+                family["kill_reason"] = "自動判定: refine回数上限に到達"
                 applied_verdict = "kill"
-                final_rationale = "refine cap exhausted"
+                final_rationale = "refine回数上限に到達"
                 print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
             else:
                 # Try to add the refine entry to backlog first —
@@ -765,7 +769,7 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
                     family["lifecycle"] = FamilyLifecycle.REFINING
                     print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
                 else:
-                    final_rationale = rationale + " (refine duplicate — already queued)"
+                    final_rationale = rationale + " (refine重複 — 既にキュー済み)"
                     applied_verdict = "keep"
                     print(f"REVIEW_REFINE_DUPLICATE {family_key}")
                     print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")

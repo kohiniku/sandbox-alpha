@@ -1620,22 +1620,22 @@ def _consume_backlog_entry(knowledge):
     if verdict == Verdict.ADOPTED:
         val_sharpe = evaluation.get("sharpe_ratio", 0)
         holdout_sharpe = evaluation.get("holdout_sharpe", 0)
-        summary = f"val Sharpe {val_sharpe:.2f} / holdout Sharpe {holdout_sharpe:.2f}"
+        summary = f"検証Sharpe {val_sharpe:.2f} / ホールドアウトSharpe {holdout_sharpe:.2f}"
     else:
         gate_results = evaluation.get("gate_results", {})
         if evaluation.get("error"):
-            summary = f"failed gate: {evaluation['error'][:100]}"
+            summary = f"ゲート不通過: {evaluation['error'][:100]}"
         elif not gate_results.get("validation", True):
-            summary = f"failed gate: validation (Sharpe {evaluation.get('sharpe_ratio', MISSING_METRIC):.2f})"
+            summary = f"ゲート不通過: 検証 (Sharpe {evaluation.get('sharpe_ratio', MISSING_METRIC):.2f})"
         elif not gate_results.get("holdout", True):
-            summary = f"failed gate: holdout (Sharpe {evaluation.get('holdout_sharpe', MISSING_METRIC):.2f})"
+            summary = f"ゲート不通過: ホールドアウト (Sharpe {evaluation.get('holdout_sharpe', MISSING_METRIC):.2f})"
         else:
             reasons = evaluation.get("reasons", [])
             extra_fail = [r for r in reasons if "Extra criterion failed" in r]
             if extra_fail:
-                summary = extra_fail[0].replace("❌ Extra criterion failed: ", "")
+                summary = extra_fail[0].replace("❌ Extra criterion failed: ", "追加基準不通過: ")
             else:
-                summary = f"failed gate: cluster dedup or other"
+                summary = f"ゲート不通過: クラスタ重複または他要因"
 
     # ── Route error verdicts for backlog entries ──
     if verdict == Verdict.ERROR:
@@ -1649,7 +1649,7 @@ def _consume_backlog_entry(knowledge):
             bl.mark(entry["id"], "pending", {
                 "verdict": verdict,
                 "error": error_text,
-                "summary": f"infra error (attempt {attempts}/3): {error_text}",
+                "summary": f"インフラエラー (試行 {attempts}/3): {error_text}",
                 "finished_at": datetime.now().isoformat(),
                 "attempts": attempts,
             })
@@ -1657,7 +1657,7 @@ def _consume_backlog_entry(knowledge):
             bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
                 "verdict": verdict,
                 "error": evaluation.get("error", "")[:200],
-                "summary": f"infra error after {attempts} attempts: {evaluation.get('error', '')[:200]}",
+                "summary": f"インフラエラー ({attempts}回試行後): {evaluation.get('error', '')[:200]}",
                 "finished_at": datetime.now().isoformat(),
                 "attempts": attempts,
             })
@@ -1665,7 +1665,7 @@ def _consume_backlog_entry(knowledge):
         bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
             "verdict": verdict,
             "error": evaluation.get("error", "")[:200],
-            "summary": f"code error: {evaluation.get('error', '')[:200]}",
+            "summary": f"コードエラー: {evaluation.get('error', '')[:200]}",
             "finished_at": datetime.now().isoformat(),
         })
     else:
