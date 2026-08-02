@@ -907,6 +907,50 @@ Remember the INTERFACE CONTRACT:
 _IDEATION_LOG_DIR = BASE_DIR / "ideation_logs"
 
 
+def _checkpoint_path():
+    """Return path to the current run's checkpoint file."""
+    return _IDEATION_LOG_DIR / "checkpoint.json"
+
+
+def _save_checkpoint(stage, data):
+    """Incrementally persist pipeline progress after each stage.
+
+    Writes a JSON checkpoint file that accumulates completed stages.
+    If a run is killed mid-pipeline, this file shows how far it got.
+    On a fresh run (stage == 'brainstorm'), the checkpoint is reset.
+    """
+    _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    cp = _checkpoint_path()
+
+    # On first stage of a new run, start fresh
+    if stage == "brainstorm":
+        checkpoint = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "completed_stages": [stage],
+            stage: data,
+        }
+    else:
+        # Load existing checkpoint and append
+        try:
+            checkpoint = json.loads(cp.read_text()) if cp.exists() else {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "completed_stages": [],
+            }
+        except (json.JSONDecodeError, OSError):
+            checkpoint = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "completed_stages": [],
+            }
+        checkpoint["stage"] = stage
+        checkpoint["last_updated_utc"] = datetime.now(timezone.utc).isoformat()
+        if stage not in checkpoint["completed_stages"]:
+            checkpoint["completed_stages"].append(stage)
+        checkpoint[stage] = data
+
+    cp.write_text(json.dumps(checkpoint, indent=2, default=str, ensure_ascii=False))
+
+
 def _build_brainstorm_prompt(knowledge, templates, research_docs):
     """Build compact context for the brainstorm stage."""
     # Family aggregates (compact)
@@ -2199,6 +2243,9 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
                 filtered.append(idea)
             brainstorm_ideas = filtered
             print(f"   📥 After kill filter: {len(brainstorm_ideas)} ideas")
+
+        # Checkpoint: brainstorm complete
+        _save_checkpoint("brainstorm", {"n_ideas": len(brainstorm_ideas), "ideas": brainstorm_ideas})
     except Exception as e:
         print(f"⚠️  IDEATION_V3 brainstorm failed: {e} — falling back to v2 ({e})", file=sys.stderr)
         return None
@@ -2209,6 +2256,9 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         debate_results, judge_report = _stage_debate(brainstorm_ideas)
         n_survived = sum(1 for r in debate_results if r.get("survive"))
         print(f"   ✅ {n_survived}/{len(brainstorm_ideas)} ideas survived debate")
+
+        # Checkpoint: debate complete
+        _save_checkpoint("debate", {"n_survived": n_survived, "n_total": len(brainstorm_ideas)})
     except Exception as e:
         print(f"⚠️  IDEATION_V3 debate failed: {e} — falling back to v2 ({e})", file=sys.stderr)
         return None
@@ -2221,6 +2271,9 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
             surviving, debate_results, knowledge, templates, research_docs, max_proposals
         )
         print(f"   📝 {len(manifests)} valid manifests generated")
+
+        # Checkpoint: select complete
+        _save_checkpoint("select", {"n_manifests": len(manifests)})
 
         # Post-LLM kill filter: drop manifests in killed families
         killed_families = _get_killed_families(knowledge)
@@ -2339,6 +2392,12 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
                               manifest_dicts, fallback_used=select_fallback_used)
     except Exception as e:
         print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
+
+    # Checkpoint: pipeline complete
+    try:
+        _save_checkpoint("complete", {"n_accepted": len(accepted), "n_manifests": len(manifests)})
+    except Exception as e:
+        print(f"⚠️  Failed to save final checkpoint: {e}", file=sys.stderr)
 
     # ── Summary ──
     n_accepted = len(accepted)
