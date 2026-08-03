@@ -24,7 +24,7 @@ KNOWLEDGE_FILE = BASE_DIR / "knowledge.json"
 
 # Import autonomous_loop helpers (import-time mkdir side effect is acceptable,
 # same pattern as the loop itself).
-from autonomous_loop import _family_key, _derive_family_type, load_knowledge, save_knowledge, get_killed_families
+from autonomous_loop import _family_key, _derive_family_type, load_knowledge, save_knowledge, get_killed_families, STRATEGY_TEMPLATES
 
 # LLM HTTP helper (stdlib-only, same pattern as strategy_ideation.py)
 from llm_hypothesis import _http_post_json as _llm_post_json
@@ -499,6 +499,74 @@ def _active_flags(flags):
 
 
 # ============================================================================
+# Param schema validation (issue #72)
+# ============================================================================
+
+def _format_strategy_schema_block(strategy_name):
+    """Build a human-readable param schema block for the judge prompt.
+
+    Returns a string like:
+        Valid params for momentum: {lookback: int(5..59), hold_period: int(1..19)}
+    Returns empty string if strategy is not in STRATEGY_TEMPLATES.
+    """
+    if strategy_name not in STRATEGY_TEMPLATES:
+        return ""
+    tmpl = STRATEGY_TEMPLATES[strategy_name]
+    param_space = tmpl.get("param_space", {})
+    parts = []
+    for pname, pspace in param_space.items():
+        if isinstance(pspace, range):
+            parts.append(f"{pname}: int({pspace.start}..{pspace.stop - 1})")
+        elif isinstance(pspace, list):
+            parts.append(f"{pname}: one_of{pspace}")
+    return f"Valid params for {strategy_name}: {{{', '.join(parts)}}}"
+
+
+def _validate_refine_params(strategy, params):
+    """Validate refine params against STRATEGY_TEMPLATES.
+
+    Returns (True, None) if valid or if strategy is unknown (skip validation).
+    Returns (False, error_string) if params don't match the schema.
+    """
+    if strategy not in STRATEGY_TEMPLATES:
+        # Unknown strategy — skip validation, let it through
+        return True, None
+
+    param_space = STRATEGY_TEMPLATES[strategy]["param_space"]
+    expected_keys = set(param_space.keys())
+    actual_keys = set(params.keys())
+
+    # Check for meta-keys that should never be in params
+    meta_keys = {"symbol", "strategy"}
+    found_meta = actual_keys & meta_keys
+    if found_meta:
+        return False, f"Meta-keys not allowed in params: {found_meta}"
+
+    # Check key set matches exactly
+    if actual_keys != expected_keys:
+        extra = actual_keys - expected_keys
+        missing = expected_keys - actual_keys
+        parts = []
+        if extra:
+            parts.append(f"unexpected keys: {extra}")
+        if missing:
+            parts.append(f"missing keys: {missing}")
+        return False, f"Param key mismatch — expected {expected_keys}, got {actual_keys} ({'; '.join(parts)})"
+
+    # Check value ranges/types
+    for pname, pval in params.items():
+        pspace = param_space[pname]
+        if isinstance(pspace, range):
+            if not isinstance(pval, int) or pval not in pspace:
+                return False, f"'{pname}'={pval} out of range {pspace.start}..{pspace.stop - 1}"
+        elif isinstance(pspace, list):
+            if pval not in pspace:
+                return False, f"'{pname}'={pval} not in {pspace}"
+
+    return True, None
+
+
+# ============================================================================
 # LLM judge (PR-C)
 # ============================================================================
 
@@ -614,6 +682,14 @@ def _build_judge_prompt(report, family, knowledge):
     else:
         near_miss_block = "No near-miss entries for this family."
 
+    # Issue #72: include valid param schema so the LLM knows what names to use
+    strategy_name = family_key.split("|", 1)[0] if "|" in family_key else ""
+    schema_block = _format_strategy_schema_block(strategy_name)
+    if schema_block:
+        schema_section = f"\n=== PARAM SCHEMA (refine_proposal.params MUST use exactly these keys and value ranges) ===\n{schema_block}\n"
+    else:
+        schema_section = ""
+
     user_prompt = f"""Diagnosis report for family: {family_key}
 
 Family aggregates:
@@ -626,7 +702,7 @@ Diagnosis:
   {cost_free_block}
 
 {near_miss_block}
-
+{schema_section}
 Rules:
 - All arithmetic is precomputed — do not recompute anything.
 - Flags are ground truth. If a flag is active, it is real.
@@ -754,25 +830,33 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
                 strategy = parts[0] if len(parts) >= 1 else ""
                 symbol = parts[1] if len(parts) >= 2 else ""
 
-                backlog_entry = _bl_new_entry(
-                    "param",
-                    0.95,
-                    {"kind": "review_refine", "ref": family_key},
-                    {"strategy": strategy, "symbol": symbol, "params": params},
-                    {"extra_criteria": []},
-                )
-                backlog_entry["created_at"] = now_iso
-                accepted, eid = backlog.add_entry(backlog_entry)
-
-                if accepted:
-                    family["refine_count"] = refine_count + 1
-                    family["lifecycle"] = FamilyLifecycle.REFINING
-                    print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
-                else:
-                    final_rationale = rationale + " (refine重複 — 既にキュー済み)"
+                # Issue #72: validate params against schema before adding to backlog
+                valid, err_msg = _validate_refine_params(strategy, params)
+                if not valid:
+                    final_rationale = rationale + f" (格下げ: refine提案のパラメータ不正: {err_msg})"
                     applied_verdict = "keep"
-                    print(f"REVIEW_REFINE_DUPLICATE {family_key}")
+                    print(f"REVIEW_REFINE_INVALID_PARAMS {family_key} error=\"{err_msg}\"")
                     print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+                else:
+                    backlog_entry = _bl_new_entry(
+                        "param",
+                        0.95,
+                        {"kind": "review_refine", "ref": family_key},
+                        {"strategy": strategy, "symbol": symbol, "params": params},
+                        {"extra_criteria": []},
+                    )
+                    backlog_entry["created_at"] = now_iso
+                    accepted, eid = backlog.add_entry(backlog_entry)
+
+                    if accepted:
+                        family["refine_count"] = refine_count + 1
+                        family["lifecycle"] = FamilyLifecycle.REFINING
+                        print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+                    else:
+                        final_rationale = rationale + " (refine重複 — 既にキュー済み)"
+                        applied_verdict = "keep"
+                        print(f"REVIEW_REFINE_DUPLICATE {family_key}")
+                        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
 
     else:  # keep
         print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{rationale}\"")
