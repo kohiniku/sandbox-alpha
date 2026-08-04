@@ -27,13 +27,25 @@ from loop_constants import MISSING_METRIC
 _STRATEGY_NAMES = {"sma_crossover", "mean_reversion", "momentum", "rsi"}
 
 
+# HTTP statuses that mean "provider is throttling/overloaded right now, try
+# again shortly" -- distinct from genuinely terminal errors (400 bad request,
+# 401/404 misconfiguration) which retrying can never fix.
+_RETRYABLE_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
+
+
 def _http_post_json(url, headers, payload, timeout, retries=2):
-    """POST with timeout retries.
+    """POST with timeout AND rate-limit retries.
 
     DeepSeek pro often takes 30-90s for reasoning-heavy prompts; a single
-    30s timeout throws away 7/10 iterations to random fallback. Retry the
-    request with the same params on timeout (not on HTTP 4xx/5xx — those
-    are terminal). Each retry has the same timeout ceiling.
+    30s timeout throws away 7/10 iterations to random fallback. Retry on
+    timeout with the same params.
+
+    Also retry on HTTP 403/429/5xx with exponential backoff (1s, 2s, 4s, ...)
+    -- these providers throttle bursts of requests (observed: a tight loop of
+    8 back-to-back calls tripping Alibaba token-plan's burst/concurrency
+    limit, returned as 403 rather than 429). Genuinely terminal 4xx (400, 401,
+    404, ...) still raise immediately -- retrying a bad request or bad
+    credentials just wastes the retry budget.
     """
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
@@ -43,6 +55,12 @@ def _http_post_json(url, headers, payload, timeout, retries=2):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in _RETRYABLE_HTTP_STATUSES and attempt < retries:
+                last_err = f"attempt {attempt + 1}/{retries + 1}: HTTP {e.code}"
+                time.sleep(2 ** attempt)
+                continue
+            raise
         except (TimeoutError, urllib.error.URLError) as e:
             # URLError wraps socket timeouts too
             reason = getattr(e, "reason", e)

@@ -4,6 +4,7 @@ No real HTTP requests; no API key required.
 """
 import json
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -11,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from llm_hypothesis import generate, _validate_response, _SYMBOL_RE
+from llm_hypothesis import generate, _validate_response, _SYMBOL_RE, _http_post_json
 
 # Minimal templates matching autonomous_loop.py STRATEGY_TEMPLATES
 TEMPLATES = {
@@ -150,6 +151,71 @@ def test_invalid_symbol_rejected():
     }
     with pytest.raises(ValueError, match="Invalid symbol"):
         _validate_response(parsed, TEMPLATES)
+
+
+# ---------------------------------------------------------------------------
+# _http_post_json retry-on-throttling tests (Issue: 2026-08-03 403 incident —
+# a burst of back-to-back calls tripped Alibaba token-plan's rate limit and
+# every attempt failed immediately with no retry).
+# ---------------------------------------------------------------------------
+
+def _http_error(code):
+    return urllib.error.HTTPError(
+        url="https://example.test/chat/completions", code=code, msg="err",
+        hdrs=None, fp=None,
+    )
+
+
+def _fake_ok_response(body: dict):
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(body).encode("utf-8")
+    resp.__enter__ = lambda self: resp
+    resp.__exit__ = lambda self, *a: None
+    return resp
+
+
+@patch("llm_hypothesis.time.sleep")
+@patch("llm_hypothesis.urllib.request.urlopen")
+def test_http_post_json_retries_on_403_then_succeeds(mock_urlopen, mock_sleep):
+    mock_urlopen.side_effect = [_http_error(403), _fake_ok_response({"ok": True})]
+    result = _http_post_json("https://example.test", {}, {}, timeout=5)
+    assert result == {"ok": True}
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once_with(1)  # 2**0
+
+
+@patch("llm_hypothesis.time.sleep")
+@patch("llm_hypothesis.urllib.request.urlopen")
+def test_http_post_json_retries_on_429_with_backoff(mock_urlopen, mock_sleep):
+    mock_urlopen.side_effect = [
+        _http_error(429), _http_error(429), _fake_ok_response({"ok": True}),
+    ]
+    result = _http_post_json("https://example.test", {}, {}, timeout=5, retries=2)
+    assert result == {"ok": True}
+    assert mock_sleep.call_args_list == [((1,),), ((2,),)]  # 2**0, 2**1
+
+
+@patch("llm_hypothesis.time.sleep")
+@patch("llm_hypothesis.urllib.request.urlopen")
+def test_http_post_json_does_not_retry_terminal_4xx(mock_urlopen, mock_sleep):
+    """400/401/404 mean 'this request is broken', not 'try again' — retrying
+    wastes the retry budget on an error that will never succeed."""
+    mock_urlopen.side_effect = _http_error(401)
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _http_post_json("https://example.test", {}, {}, timeout=5)
+    assert exc_info.value.code == 401
+    assert mock_urlopen.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@patch("llm_hypothesis.time.sleep")
+@patch("llm_hypothesis.urllib.request.urlopen")
+def test_http_post_json_exhausts_retries_and_raises(mock_urlopen, mock_sleep):
+    mock_urlopen.side_effect = [_http_error(403), _http_error(403), _http_error(403)]
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _http_post_json("https://example.test", {}, {}, timeout=5, retries=2)
+    assert exc_info.value.code == 403
+    assert mock_urlopen.call_count == 3
 
 
 # ---------------------------------------------------------------------------
