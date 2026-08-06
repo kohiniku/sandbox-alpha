@@ -235,6 +235,107 @@ class TestCandidateSelection:
         candidates = sr.select_candidates(knowledge, "2026-07-20T00:00:00", max_families=3)
         assert len(candidates) == 1
 
+    def test_never_diagnosed_stale_family_is_eligible(self):
+        """Regression #77: a family never diagnosed whose evidence all
+        predates the global last_review_at watermark must still be selectable.
+
+        The old gate required newest_failure > last_review_at; because the
+        watermark advances every review run, families with stale evidence
+        that were never reviewed became permanently invisible to the loop.
+        """
+        knowledge = _make_knowledge(
+            families={
+                "rsi|META": _make_family("rsi|META", best_val_sharpe=1.769),
+            },
+            rejected=[
+                _make_rejected(strategy="rsi", symbol="META",
+                               tested_at="2026-07-10T00:00:00"),
+            ],
+            # Watermark advanced past the family's evidence (other families
+            # were diagnosed later); family is not in the reviewed dict.
+            review_state={"last_review_at": "2026-07-20T00:00:00"},
+        )
+        candidates = sr.select_candidates(knowledge, "2026-07-25T00:00:00", max_families=3)
+        assert "rsi|META" in candidates
+
+    def test_new_evidence_not_blocked_by_global_watermark(self):
+        """Regression #77 (secondary): a family with evidence newer than its
+        own last diagnosis must be eligible even when the global
+        last_review_at watermark has advanced past that evidence because
+        other families were diagnosed later.
+        """
+        knowledge = _make_knowledge(
+            families={
+                "sma_crossover|AAPL": _make_family("sma_crossover|AAPL"),
+            },
+            rejected=[
+                _make_rejected(tested_at="2026-07-10T00:00:00"),
+                _make_rejected(tested_at="2026-07-18T00:00:00",
+                               params={"fast_window": 20, "slow_window": 60}),
+            ],
+            review_state={
+                # Global watermark advanced past the 07-18 evidence.
+                "last_review_at": "2026-07-25T00:00:00",
+                "reviewed": {
+                    "sma_crossover|AAPL": {"last_diagnosed_at": "2026-07-15T00:00:00"},
+                },
+            },
+        )
+        candidates = sr.select_candidates(knowledge, "2026-07-30T00:00:00", max_families=3)
+        assert "sma_crossover|AAPL" in candidates
+
+    def test_stale_evidence_after_diagnosis_not_reselected(self):
+        """Invariant: a family diagnosed after all of its evidence is not
+        re-selected — the per-family gate matches the old behavior here.
+        """
+        knowledge = _make_knowledge(
+            families={
+                "sma_crossover|AAPL": _make_family("sma_crossover|AAPL"),
+            },
+            rejected=[
+                _make_rejected(tested_at="2026-07-10T00:00:00"),
+            ],
+            review_state={
+                "last_review_at": "2026-07-20T00:00:00",
+                "reviewed": {
+                    "sma_crossover|AAPL": {"last_diagnosed_at": "2026-07-15T00:00:00"},
+                },
+            },
+        )
+        candidates = sr.select_candidates(knowledge, "2026-07-25T00:00:00", max_families=3)
+        assert len(candidates) == 0
+
+    def test_failed_diagnosis_not_reselected_until_new_evidence(self):
+        """A family whose last diagnosis attempt errored after all known
+        evidence drops out of the candidate pool until new evidence arrives.
+
+        Under the per-family gate (no global watermark) this must be explicit:
+        the old code got this backoff implicitly from the advancing watermark.
+        """
+        knowledge = _make_knowledge(
+            families={
+                "sma_crossover|AAPL": _make_family("sma_crossover|AAPL"),
+            },
+            rejected=[
+                _make_rejected(tested_at="2026-07-10T00:00:00"),
+            ],
+            review_state={
+                "reviewed": {
+                    "sma_crossover|AAPL": {"last_diag_error_at": "2026-07-16T00:00:00"},
+                },
+            },
+        )
+        candidates = sr.select_candidates(knowledge, "2026-07-20T00:00:00", max_families=3)
+        assert len(candidates) == 0
+
+        # New evidence after the failed attempt → eligible again.
+        knowledge["rejected"].append(
+            _make_rejected(tested_at="2026-07-18T00:00:00",
+                           params={"fast_window": 20, "slow_window": 60})
+        )
+        candidates = sr.select_candidates(knowledge, "2026-07-20T00:00:00", max_families=3)
+        assert "sma_crossover|AAPL" in candidates
+
     def test_handles_near_misses_cross(self):
         """Cross-family near_misses_cross entries are found."""
         family_key = "manifest:xs_mom|universe:abc"

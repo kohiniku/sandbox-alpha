@@ -92,11 +92,25 @@ def _get_entry_timestamp(entry):
 
 
 def _family_has_new_evidence(family_key, knowledge):
-    """Check if family has rejected/near-miss entries after last_review_at."""
-    review_state = knowledge.get("review_state", {})
-    last_review = review_state.get("last_review_at", "1970-01-01T00:00:00")
+    """Check if family has rejected/near-miss entries after its own last diagnosis.
 
-    # Check last_diagnosed_at for this specific family
+    Per-family gate only. The old gate also required newest evidence to
+    postdate the *global* ``last_review_at`` watermark, which advances on
+    every review run. Once the watermark passed a family's newest evidence
+    (never-diagnosed families, or families that lost the per-run priority
+    cap), that family became permanently invisible to ``select_candidates``
+    — a one-way ratchet (issue #77). Eligibility now depends only on the
+    family's own state:
+
+    * never diagnosed (not in ``reviewed``): any evidence makes it eligible;
+    * previously diagnosed: eligible iff newest evidence postdates its own
+      ``last_diagnosed_at``;
+    * a diagnosis attempt that errored after all known evidence
+      (``last_diag_error_at``) makes the family ineligible until new
+      evidence arrives — this preserves the backoff the old global
+      watermark provided implicitly.
+    """
+    review_state = knowledge.get("review_state", {})
     reviewed = review_state.get("reviewed", {})
     family_review = reviewed.get(family_key, {})
     last_diagnosed = family_review.get("last_diagnosed_at", "1970-01-01T00:00:00")
@@ -133,14 +147,23 @@ def _family_has_new_evidence(family_key, knowledge):
         return False
 
     newest_failure = max(timestamps)
-    return newest_failure > last_review and newest_failure > last_diagnosed
+
+    # A diagnosis attempt that errored after all known evidence means there
+    # is nothing new to try — drop out until new evidence arrives.
+    last_diag_error = family_review.get("last_diag_error_at", "")
+    if last_diag_error and last_diag_error >= newest_failure:
+        return False
+
+    return newest_failure > last_diagnosed
 
 
 def select_candidates(knowledge, now, max_families=None):
     """
     Select up to max_families family keys eligible for diagnosis.
 
-    Eligible: lifecycle not KILLED, has new evidence since last review.
+    Eligible: lifecycle not KILLED, has new evidence since its own last
+    diagnosis (never-diagnosed families with any evidence are eligible —
+    see _family_has_new_evidence, issue #77).
     Priority: families appearing in near-misses first, then by best_val_sharpe desc.
     """
     if max_families is None:
@@ -481,6 +504,21 @@ def _update_review_state(knowledge, family_key, iso_timestamp):
     state["last_review_at"] = iso_timestamp
     reviewed = state.setdefault("reviewed", {})
     reviewed.setdefault(family_key, {})["last_diagnosed_at"] = iso_timestamp
+
+
+def _record_diag_error(knowledge, family_key, iso_timestamp):
+    """Record a failed diagnosis attempt for a family.
+
+    Mirrors _update_review_state, but marks ``last_diag_error_at`` instead
+    of ``last_diagnosed_at``: the family drops out of the candidate pool
+    (nothing new to try) and becomes eligible again as soon as new evidence
+    arrives. This preserves the backoff that the removed global
+    ``last_review_at`` watermark provided implicitly (issue #77).
+    """
+    state = knowledge.setdefault("review_state", {})
+    state["last_review_at"] = iso_timestamp
+    reviewed = state.setdefault("reviewed", {})
+    reviewed.setdefault(family_key, {})["last_diag_error_at"] = iso_timestamp
 
 
 # ============================================================================
@@ -866,6 +904,11 @@ def _main_inner():
         if error:
             errors += 1
             print(f"REVIEW_DIAG_ERROR {family_key} error={error}")
+            # Record the failed attempt so the family drops out of the
+            # candidate pool until new evidence arrives — without this the
+            # per-family gate would re-select it on every run (issue #77).
+            _record_diag_error(knowledge, family_key, now)
+            save_knowledge(knowledge)
             continue
 
         diagnosed += 1
