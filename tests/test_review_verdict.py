@@ -205,7 +205,7 @@ class TestApplyVerdictRefine:
             "verdict": "refine",
             "rationale": "cost_bound flag, try longer windows",
             "refine_proposal": {
-                "params": {"fast_window": 30, "slow_window": 80},
+                "params": {"fast_window": 25, "slow_window": 80},
                 "change_summary": "Longer windows to reduce cost impact",
             },
         }
@@ -241,7 +241,7 @@ class TestApplyVerdictRefine:
             "verdict": "refine",
             "rationale": "high turnover — reduce trade frequency",
             "refine_proposal": {
-                "params": {"fast_window": 40, "slow_window": 100},
+                "params": {"fast_window": 25, "slow_window": 99},
                 "change_summary": "Longer windows for fewer trades",
             },
         }
@@ -259,7 +259,7 @@ class TestApplyVerdictRefine:
         assert entry["source"]["ref"] == family_key
         assert entry["spec"]["strategy"] == "sma_crossover"
         assert entry["spec"]["symbol"] == "AAPL"
-        assert entry["spec"]["params"] == {"fast_window": 40, "slow_window": 100}
+        assert entry["spec"]["params"] == {"fast_window": 25, "slow_window": 99}
         assert "id" in entry
         assert len(entry["id"]) > 0  # uuid assigned
         assert entry["status"] == "pending"
@@ -286,7 +286,7 @@ class TestApplyVerdictRefine:
             "verdict": "refine",
             "rationale": "try again",
             "refine_proposal": {
-                "params": {"fast_window": 50, "slow_window": 120},
+                "params": {"fast_window": 29, "slow_window": 99},
                 "change_summary": "final attempt",
             },
         }
@@ -582,7 +582,7 @@ class TestFailOpen:
 
         monkeypatch.setattr(sr, "_call_review_llm",
                             lambda _: {"verdict": "refine", "rationale": "cost bound",
-                                       "refine_proposal": {"params": {"fast_window": 30, "slow_window": 80},
+                                       "refine_proposal": {"params": {"fast_window": 25, "slow_window": 80},
                                                            "change_summary": "Longer windows"}})
 
         report = _make_report()
@@ -591,7 +591,7 @@ class TestFailOpen:
 
         verdict = sr.judge_family(report, family, knowledge)
         assert verdict["verdict"] == "refine"
-        assert verdict["refine_proposal"]["params"]["fast_window"] == 30
+        assert verdict["refine_proposal"]["params"]["fast_window"] == 25
 
     def test_valid_kill_passes(self, tmp_path, monkeypatch):
         """Valid kill verdict passes through."""
@@ -1117,7 +1117,7 @@ class TestAuditTrail:
             "verdict": "refine",
             "rationale": "try again",
             "refine_proposal": {
-                "params": {"fast_window": 50, "slow_window": 120},
+                "params": {"fast_window": 29, "slow_window": 99},
                 "change_summary": "final attempt",
             },
         }
@@ -1157,7 +1157,7 @@ class TestRefineDuplicate:
             "verdict": "refine",
             "rationale": "cost bound",
             "refine_proposal": {
-                "params": {"fast_window": 30, "slow_window": 80},
+                "params": {"fast_window": 25, "slow_window": 80},
                 "change_summary": "Longer windows",
             },
         }
@@ -1203,7 +1203,7 @@ class TestRefineDuplicate:
             "verdict": "refine",
             "rationale": "cost bound",
             "refine_proposal": {
-                "params": {"fast_window": 30, "slow_window": 80},
+                "params": {"fast_window": 25, "slow_window": 80},
                 "change_summary": "Longer windows",
             },
         }
@@ -1239,7 +1239,7 @@ class TestRefineDuplicate:
             "verdict": "refine",
             "rationale": "cost bound",
             "refine_proposal": {
-                "params": {"fast_window": 30, "slow_window": 80},
+                "params": {"fast_window": 25, "slow_window": 80},
                 "change_summary": "Longer windows",
             },
         }
