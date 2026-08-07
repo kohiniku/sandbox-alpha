@@ -17,8 +17,12 @@ Pipeline
 Error taxonomy
 --------------
 - 'manifest': schema/validation failure.
-- 'infra': data loading failure (MissingDataError, I/O).
-- 'code': user code failure (missing entrypoint, runtime exception).
+- 'code': deterministic, non-retryable failures — user code failure, missing
+  symbol data, or an alignment/coverage failure (universe not backed by data
+  in the requested window).  Retrying these never succeeds, so they must not
+  be classified 'infra'.
+- 'infra': transient infrastructure problems (I/O, network, timeouts) that
+  may resolve on retry.
 """
 import argparse
 import base64
@@ -122,7 +126,8 @@ def _call_with_extras(
     return fn(data)
 
 
-def _error_json(error_type: str, error: str, tb: Optional[str] = None) -> str:
+def _error_json(error_type: str, error: str, tb: Optional[str] = None,
+                extra: Optional[Dict[str, Any]] = None) -> str:
     out: Dict[str, Any] = {
         "status": "error",
         "error_type": error_type,
@@ -130,7 +135,36 @@ def _error_json(error_type: str, error: str, tb: Optional[str] = None) -> str:
     }
     if tb:
         out["traceback"] = tb
+    if extra:
+        out.update(extra)
     return json.dumps(out)
+
+
+def _coverage_diagnostics(ohlcv_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    """Per-symbol coverage report for the alignment failure path.
+
+    *ohlcv_data* has already been date-sliced to the manifest's requested
+    window by :func:`load_ohlcv`.  For each symbol, report how many rows
+    actually fall inside the window and, when non-empty, the first/last
+    dates present.  A symbol with ``rows == 0`` has no data in the window at
+    all (absent cache entry, out-of-range dates, or a manifest window the
+    data does not cover) — this is what turns a bare "no common dates"
+    message into an actionable diagnostic that the loop, the delivery
+    digest, and the ideation LLM can learn from (issue #81).
+    """
+    report: Dict[str, Dict[str, Any]] = {}
+    for sym in sorted(ohlcv_data):
+        df = ohlcv_data[sym]
+        if df.empty:
+            report[sym] = {"rows": 0, "empty": True}
+        else:
+            report[sym] = {
+                "rows": int(len(df)),
+                "empty": False,
+                "first_date": str(df.index.min().date()),
+                "last_date": str(df.index.max().date()),
+            }
+    return report
 
 
 def _signals_to_weights(signals: pd.DataFrame) -> pd.DataFrame:
@@ -281,7 +315,12 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
                 )
                 all_data.update(loaded)
             except MissingDataError as e:
-                return _error_json("infra", str(e))
+                # Deterministic coverage failure: the symbol's CSV is absent
+                # from the cache.  Retrying cannot materialise it, so this is
+                # a 'code' (no-retry) error, not 'infra' (issue #81).
+                loaded = sorted(k for k in all_data if not k.startswith("_"))
+                extra = {"loaded_symbols": loaded} if loaded else None
+                return _error_json("code", str(e), extra=extra)
         elif isinstance(ds, NewsSentimentSource):
             try:
                 news_df = load_news_sentiment(
@@ -435,7 +474,23 @@ def run_manifest(manifest: StrategyManifest, data_dir: str) -> str:
 
     panel = align_universe(ohlcv_data)
     if panel.empty:
-        return _error_json("infra", "align_universe returned empty panel (no common dates)")
+        # Deterministic data-coverage failure, not an infra glitch: the
+        # universe has no common dates within the requested window, and no
+        # retry will change that.  Report it as 'code' (no retry) and attach
+        # per-symbol coverage diagnostics so the loop / delivery digest /
+        # ideation LLM can see exactly which symbols lack data (issue #81).
+        coverage = _coverage_diagnostics(ohlcv_data)
+        empty_symbols = [s for s, c in coverage.items() if c.get("empty")]
+        non_empty = {s: df for s, df in ohlcv_data.items() if not df.empty}
+        viable = len(align_universe(non_empty)) if non_empty else 0
+        msg = (
+            "align_universe returned empty panel (no common dates): "
+            f"{len(ohlcv_data)} symbols requested, {len(empty_symbols)} have "
+            f"no data in the requested window (rows=0: "
+            f"{', '.join(empty_symbols) or 'none'}). Excluding the empty "
+            f"symbols leaves {viable} common dates."
+        )
+        return _error_json("code", msg, extra={"coverage": coverage})
 
     # Extract Close prices from MultiIndex panel
     close_panel = panel.xs("Close", level="field", axis=1)
