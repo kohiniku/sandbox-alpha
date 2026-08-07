@@ -34,6 +34,12 @@ from backlog import Backlog, _new_entry as _bl_new_entry
 
 # Minimum trials before a family can be killed
 MIN_TRIALS_FOR_KILL = 3
+# Cross families cannot be refined (no manifest spec persisted) and only gain
+# trials through new ideation proposals of the exact same strategy+universe
+# hash, which is rare. Requiring MIN_TRIALS_FOR_KILL trials for them makes
+# kill verdicts permanently unreachable (issue #75) — one failed trial is
+# sufficient evidence to trust a kill verdict for a cross family.
+MIN_TRIALS_FOR_KILL_CROSS = 1
 
 REVIEW_REPORTS_DIR.mkdir(exist_ok=True)
 
@@ -794,7 +800,11 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
 
     if llm_verdict == "kill":
         n_trials = family.get("n_trials", 0)
-        if n_trials < MIN_TRIALS_FOR_KILL:
+        # Cross families can never accumulate trials via refinement, so one
+        # failed trial is enough evidence to trust a kill verdict for them
+        # (issue #75). Single families keep the stricter threshold.
+        min_trials = MIN_TRIALS_FOR_KILL_CROSS if family_type == "cross" else MIN_TRIALS_FOR_KILL
+        if n_trials < min_trials:
             # Downgrade: insufficient evidence
             final_rationale = rationale + " (格下げ: 試行数不足で証拠不十分)"
             applied_verdict = "keep"

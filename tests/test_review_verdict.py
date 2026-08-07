@@ -179,6 +179,72 @@ class TestApplyVerdictKill:
         assert "自動判定: enough evidence" in fam["kill_reason"]
 
 
+class TestApplyVerdictKillCross:
+    """Issue #75: cross families are structurally immortal.
+
+    Cross families cannot be refined (no manifest spec persisted), so they can
+    only accumulate trials through new ideation proposals of the exact same
+    strategy+universe hash — which is rare. Requiring MIN_TRIALS_FOR_KILL=3
+    trials for them means a kill verdict is always downgraded and the family
+    is never removed. One failed trial is sufficient evidence for a cross
+    family, so the kill threshold must be lower for family_type == "cross".
+    """
+
+    def _apply(self, tmp_path, monkeypatch, family_key, family, verdict):
+        monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+        monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
+        monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
+        monkeypatch.setattr("autonomous_loop.KNOWLEDGE_FILE", tmp_path / "knowledge.json")
+
+        from autonomous_loop import save_knowledge, load_knowledge
+        from backlog import Backlog
+
+        knowledge = _make_knowledge(families={family_key: family})
+        save_knowledge(knowledge)
+
+        backlog = Backlog(str(tmp_path / "backlog.json"))
+        result = sr.apply_verdict(family_key, verdict, knowledge, backlog)
+        save_knowledge(knowledge)
+
+        reloaded = load_knowledge()
+        return result, reloaded["families"][family_key]
+
+    def test_cross_kill_allowed_at_one_trial(self, tmp_path, monkeypatch):
+        """Cross family with n_trials=1 + kill verdict → KILLED (was immortal)."""
+        family_key = "manifest:xs_mom|universe:abc"
+        family = _make_family(family_key, family_type="cross", n_trials=1)
+        verdict = {"verdict": "kill", "rationale": "hopeless: NaN sharpe", "refine_proposal": None}
+
+        result, fam = self._apply(tmp_path, monkeypatch, family_key, family, verdict)
+
+        assert result == "kill"
+        assert fam["lifecycle"] == FamilyLifecycle.KILLED
+        assert fam["kill_reason"] == "自動判定: hopeless: NaN sharpe"
+
+    def test_single_kill_still_downgraded_at_one_trial(self, tmp_path, monkeypatch):
+        """Guard: single families still need MIN_TRIALS_FOR_KILL trials."""
+        family_key = "sma_crossover|AAPL"
+        family = _make_family(family_key, family_type="single", n_trials=1)
+        verdict = {"verdict": "kill", "rationale": "bad", "refine_proposal": None}
+
+        result, fam = self._apply(tmp_path, monkeypatch, family_key, family, verdict)
+
+        assert result == "keep"
+        assert fam["lifecycle"] != FamilyLifecycle.KILLED
+        assert fam["kill_reason"] == ""
+
+    def test_cross_kill_zero_trials_still_downgraded(self, tmp_path, monkeypatch):
+        """Boundary: a cross family with zero trials has no evidence at all."""
+        family_key = "manifest:xs_mom|universe:abc"
+        family = _make_family(family_key, family_type="cross", n_trials=0)
+        verdict = {"verdict": "kill", "rationale": "bad", "refine_proposal": None}
+
+        result, fam = self._apply(tmp_path, monkeypatch, family_key, family, verdict)
+
+        assert result == "keep"
+        assert fam["lifecycle"] != FamilyLifecycle.KILLED
+
+
 # ============================================================================
 # 2. Verdict application — refine
 # ============================================================================
