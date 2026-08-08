@@ -30,6 +30,26 @@ STRATEGIES_DIR.mkdir(exist_ok=True)
 # テスト対象の銘柄プール
 SYMBOL_POOL = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "SPY", "QQQ", "BTC-USD", "ETH-USD"]
 
+# Re-seed pool for the single-name search grid (issue #83): once killed-family
+# coverage of the base grid (STRATEGY_TEMPLATES x SYMBOL_POOL) crosses
+# RE_SEED_KILLED_COVERAGE, generate_hypothesis expands the symbol pool with
+# these liquid tickers so the search space cannot be consumed to zero. Kept
+# disjoint from SYMBOL_POOL. Symbols already present in the running universe
+# (GLD/META/AMD appear in knowledge.json families) are included first.
+EXTRA_SYMBOL_POOL = ["META", "AMD", "GLD", "NFLX", "XOM", "JPM", "WMT", "KO",
+                     "DIS", "V", "INTC", "CSCO", "ORCL", "ADBE", "PEP", "BAC",
+                     "UNH", "HD", "MCD", "NKE"]
+
+# Fraction of the base grid that must be killed before re-seeding kicks in.
+# Production hit 39/40 = 0.975 killed (issue #83).
+RE_SEED_KILLED_COVERAGE = 0.9
+
+# Per-run statistics accumulator for issue #83 (killed-skips, sources, tests).
+# Reset at the top of run_loop; also incremented from _consume_backlog_entry,
+# which run_loop calls. Module-level so the two functions share it without
+# threading a stats object through every call site.
+_RUN_STATS: dict = {}
+
 # 戦略テンプレート
 STRATEGY_TEMPLATES = {
     "sma_crossover": {
@@ -251,6 +271,40 @@ def get_killed_families(knowledge) -> dict[str, str]:
     }
 
 
+def _grid_killed_coverage(knowledge) -> float:
+    """Fraction of the base single-name grid (STRATEGY_TEMPLATES x SYMBOL_POOL)
+    whose families are currently killed (issue #83: production reached 39/40 =
+    0.975 and the random fallback degenerated into a KILLED_SKIP lottery)."""
+    killed = get_killed_families(knowledge)
+    grid = [(s, sym) for s in STRATEGY_TEMPLATES for sym in SYMBOL_POOL]
+    if not grid:
+        return 1.0
+    n_killed = sum(1 for s, sym in grid if _family_key(s, sym, "single") in killed)
+    return n_killed / len(grid)
+
+
+def _get_active_symbol_pool(knowledge) -> list:
+    """SYMBOL_POOL, expanded with EXTRA_SYMBOL_POOL once killed coverage of the
+    base grid crosses RE_SEED_KILLED_COVERAGE, so the single-name search space
+    cannot be consumed to zero."""
+    if _grid_killed_coverage(knowledge) >= RE_SEED_KILLED_COVERAGE:
+        return SYMBOL_POOL + [s for s in EXTRA_SYMBOL_POOL if s not in SYMBOL_POOL]
+    return list(SYMBOL_POOL)
+
+
+def _non_killed_grid(knowledge) -> list:
+    """(strategy, symbol) pairs from the active symbol pool whose family is not
+    killed. Empty when every family in the (possibly re-seeded) grid is dead."""
+    killed = get_killed_families(knowledge)
+    pool = _get_active_symbol_pool(knowledge)
+    return [
+        (s, sym)
+        for s in STRATEGY_TEMPLATES
+        for sym in pool
+        if _family_key(s, sym, "single") not in killed
+    ]
+
+
 def _apply_entry_to_family(families, key, entry, hyp, family_type="single"):
     """Incrementally update a single family aggregate record from one evaluation entry."""
     fam = families.setdefault(key, {
@@ -354,8 +408,18 @@ def generate_hypothesis(knowledge):
     ナレッジベースを参照して、まだ試していない戦略パラメータを生成。
     既にテスト済みの(strategy, symbol, params)の組み合わせはスキップ。
     30%の確率でadopted戦略のパラメータ近傍を探索する。
+    Killed family は決して選択しない (issue #83: グリッドの 97.5% が kill 済みで
+    ランダム生成が KILLED_SKIP の宝くじと化していた)。
     """
     max_attempts = 50  # 重複回避の試行上限
+    killed = get_killed_families(knowledge)
+    candidates = _non_killed_grid(knowledge)
+
+    if not candidates:
+        # 再シード後も全ファミリーが kill 済み — 下のフォールバックに落ちる。
+        # ループ側の KILLED_SKIP ガードと run_stats の ZERO_TESTS_ALERT が
+        # この状態を可視化する。
+        print("  ⚠️ 非killファミリー枯渇（再シード後も全滅）→ 重複許容フォールバック")
 
     for _ in range(max_attempts):
         # 30%の確率で adopted 戦略の近傍を探索
@@ -367,6 +431,9 @@ def generate_hypothesis(knowledge):
                 continue
             adopted_params = adopted["hypothesis"]["params"]
             symbol = adopted["hypothesis"]["symbol"]
+            # Skip adopted entries whose family has been killed (issue #83)
+            if _family_key(strategy_name, symbol, "single") in killed:
+                continue
             template = STRATEGY_TEMPLATES[strategy_name]
 
             # adoptedパラメータの近傍を生成
@@ -389,10 +456,9 @@ def generate_hypothesis(knowledge):
                     offset = random.randint(-2, 2)
                     new_idx = max(0, min(len(param_space) - 1, idx + offset))
                     params[param_name] = param_space[new_idx]
-        else:
-            strategy_name = random.choice(list(STRATEGY_TEMPLATES.keys()))
+        elif candidates:
+            strategy_name, symbol = random.choice(candidates)
             template = STRATEGY_TEMPLATES[strategy_name]
-            symbol = random.choice(SYMBOL_POOL)
 
             # パラメータをランダムサンプリング
             params = {}
@@ -401,6 +467,9 @@ def generate_hypothesis(knowledge):
                     params[param_name] = random.choice(list(param_space))
                 else:
                     params[param_name] = random.choice(param_space)
+        else:
+            # 非kill候補なし — フォールバックへ
+            break
 
         # 追加制約: SMA crossoverでは fast < slow
         if strategy_name == "sma_crossover":
@@ -431,9 +500,14 @@ def generate_hypothesis(knowledge):
         return hypothesis
 
     # 全組み合わせ枯渇時のフォールバック（重複許容）
-    strategy_name = random.choice(list(STRATEGY_TEMPLATES.keys()))
+    if candidates:
+        # 非kill候補が残っている場合はそちらを優先（kill済みファミリーを避ける）
+        strategy_name, symbol = random.choice(candidates)
+    else:
+        strategy_name = random.choice(list(STRATEGY_TEMPLATES.keys()))
+        # 再シード後のプールを使う（issue #83）
+        symbol = random.choice(_get_active_symbol_pool(knowledge))
     template = STRATEGY_TEMPLATES[strategy_name]
-    symbol = random.choice(SYMBOL_POOL)
     params = {}
     for param_name, param_space in template["param_space"].items():
         if isinstance(param_space, range):
@@ -1579,6 +1653,9 @@ def _consume_backlog_entry(knowledge):
 
     if bk_family_key and bk_family_key in get_killed_families(knowledge):
         print(f"KILLED_SKIP {bk_family_key}")
+        # Issue #83: count toward the run's killed_skips so a run that only
+        # skips is loud (RUN_SUMMARY / ZERO_TESTS_ALERT) instead of a silent no-op.
+        _RUN_STATS["killed_skips"] = _RUN_STATS.get("killed_skips", 0) + 1
         bl.mark(entry["id"], BacklogStatus.DONE_REJECTED,
                 result={"reason": "family_killed"})
         return None
@@ -1710,11 +1787,42 @@ def run_loop(num_iterations=3):
     print(f"   LLM仮説生成: {'有効' if use_llm else '無効'}")
     print(f"   Gate v2: {'有効' if gate_v2_enabled else '無効'}")
     print(f"CONFIG runner_url={'set' if config['runner_url'] else 'unset'} backlog_path={config['backlog_path']} use_llm={use_llm} gate_v2={'1' if gate_v2_enabled else '0'}")
+    if use_llm:
+        # Issue #83: HYPO_LLM_BASE_URL / HYPO_LLM_MODEL / HYPO_LLM_API_KEY_ENV come
+        # from independent env vars and nothing validated the combination — a
+        # deepseek model sent to an Alibaba/MaaS endpoint silently failed every
+        # call (403/429) and the loop fell back to random for 7+ days. Fail
+        # loudly at startup instead.
+        try:
+            from llm_hypothesis import validate_llm_config
+            _llm_cfg = validate_llm_config()
+            print(f"LLM_CONFIG base_url={_llm_cfg['base_url']} model={_llm_cfg['model']} "
+                  f"key_env={os.environ.get('HYPO_LLM_API_KEY_ENV', 'DEEPSEEK_API_KEY')}")
+        except Exception as e:
+            print(f"LLM_CONFIG_ERROR {type(e).__name__}: {e}")
+            raise
     print("=" * 60)
     
     knowledge = load_knowledge()
     # Snapshot error count so ERRORS_SUMMARY reports THIS RUN, not cumulative
     _errors_before = len(knowledge.get("errors", []))
+    # Snapshot tested count so RUN_SUMMARY reports THIS RUN, not cumulative
+    _tested_before = len(knowledge.get("tested", []))
+
+    # Issue #83: aggregate per-run KILLED_SKIP / source / test counts so a run
+    # that produced zero tests is loud (RUN_SUMMARY + ZERO_TESTS_ALERT + exit 3)
+    # instead of an indistinguishable [SILENT] no-op.
+    _RUN_STATS.clear()
+    _RUN_STATS.update({
+        "ts": datetime.now().isoformat(),
+        "iterations": num_iterations,
+        "killed_skips": 0,
+        "source_llm": 0,
+        "source_random": 0,
+        "tests_run": 0,
+        "tested": 0,
+        "zero_tests": False,
+    })
 
     for i in range(num_iterations):
         knowledge["iterations"] += 1
@@ -1725,6 +1833,7 @@ def run_loop(num_iterations=3):
         consumed = _consume_backlog_entry(knowledge)
         if consumed:
             entry_bk, hypothesis, result, verdict, evaluation = consumed
+            _RUN_STATS["tests_run"] = _RUN_STATS.get("tests_run", 0) + 1
 
             print(f"  📋 判定: {verdict.upper()}")
             if isinstance(evaluation, dict) and "reasons" in evaluation:
@@ -1771,12 +1880,17 @@ def run_loop(num_iterations=3):
         else:
             hypothesis = generate_hypothesis(knowledge)
             source_label = "(random)"
+        if source_label == "(llm)":
+            _RUN_STATS["source_llm"] = _RUN_STATS.get("source_llm", 0) + 1
+        else:
+            _RUN_STATS["source_random"] = _RUN_STATS.get("source_random", 0) + 1
 
         # 1a. KILLED family guard (defense in depth)
         param_family_key = _family_key(hypothesis["strategy"], hypothesis["symbol"],
                                        _derive_family_type(hypothesis))
         if param_family_key in get_killed_families(knowledge):
             print(f"KILLED_SKIP {param_family_key}")
+            _RUN_STATS["killed_skips"] = _RUN_STATS.get("killed_skips", 0) + 1
             save_knowledge(knowledge)
             continue
         
@@ -1815,6 +1929,7 @@ def run_loop(num_iterations=3):
 
         # 4. 評価
         verdict, evaluation = evaluate_result(hypothesis, result, knowledge)
+        _RUN_STATS["tests_run"] = _RUN_STATS.get("tests_run", 0) + 1
 
         print(f"  📋 判定: {verdict.upper()}")
         if isinstance(evaluation, dict) and "reasons" in evaluation:
@@ -1860,6 +1975,35 @@ def run_loop(num_iterations=3):
     n_infra = sum(1 for e in errors_this_run if e.get("evaluation", {}).get("error_type") == "infra")
     n_code = sum(1 for e in errors_this_run if e.get("evaluation", {}).get("error_type") == "code")
     print(f"ERRORS_SUMMARY infra={n_infra} code={n_code}")
+
+    # Issue #83: aggregate per-run stats into knowledge.json and make a run that
+    # produced zero tests loud (machine-greppable ZERO_TESTS_ALERT) instead of an
+    # indistinguishable [SILENT] no-op with last_status=ok.
+    tested_this_run = len(knowledge.get("tested", [])) - _tested_before
+    _RUN_STATS["tested"] = tested_this_run
+    _RUN_STATS["zero_tests"] = bool(
+        num_iterations > 0
+        and tested_this_run == 0
+        and _RUN_STATS.get("killed_skips", 0) > 0
+    )
+    knowledge["last_run_stats"] = dict(_RUN_STATS)
+    knowledge.setdefault("run_stats", []).append(dict(_RUN_STATS))
+    if len(knowledge["run_stats"]) > 100:
+        knowledge["run_stats"] = knowledge["run_stats"][-100:]
+    save_knowledge(knowledge)
+
+    print(
+        f"RUN_SUMMARY iterations={num_iterations} tested={tested_this_run} "
+        f"killed_skips={_RUN_STATS.get('killed_skips', 0)} "
+        f"source_llm={_RUN_STATS.get('source_llm', 0)} "
+        f"source_random={_RUN_STATS.get('source_random', 0)}"
+    )
+    if _RUN_STATS["zero_tests"]:
+        print(
+            f"ZERO_TESTS_ALERT reason=killed_grid_or_llm_failure "
+            f"iterations={num_iterations} tested=0 "
+            f"killed_skips={_RUN_STATS.get('killed_skips', 0)}"
+        )
 
     return knowledge
 
@@ -1955,16 +2099,30 @@ def run_revalidation(knowledge):
 if __name__ == "__main__":
     import cp_emit
     _cp_run_id = cp_emit.emit_run_started("9d6c833bd3c5", "autonomous_loop.py")
+    _exit_code = 0
     try:
         if "--revalidate" in sys.argv:
             knowledge = load_knowledge()
             run_revalidation(knowledge)
         else:
             iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-            run_loop(iterations)
-        cp_emit.emit_run_finished(_cp_run_id, "ok")
+            knowledge = run_loop(iterations)
+        # Issue #83 watchdog: a run that produced zero tests (killed-grid wall or
+        # LLM failure) must be loud — non-zero exit + cp_emit error — instead of
+        # [SILENT] with last_status=ok.
+        _run_stats = knowledge.get("last_run_stats", {})
+        if _run_stats.get("zero_tests"):
+            _exit_code = 3
+            cp_emit.emit_run_finished(
+                _cp_run_id, "error",
+                error=f"zero tests produced: killed_skips={_run_stats.get('killed_skips')} "
+                      f"iterations={_run_stats.get('iterations')}",
+            )
+        else:
+            cp_emit.emit_run_finished(_cp_run_id, "ok")
     except BaseException as _cp_exc:
         cp_emit.emit_run_finished(
             _cp_run_id, "error", error=f"{type(_cp_exc).__name__}: {_cp_exc}"
         )
         raise
+    sys.exit(_exit_code)
