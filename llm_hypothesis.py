@@ -88,6 +88,77 @@ def _get_config():
     }
 
 
+# Host markers for providers whose OpenAI-compatible endpoints do NOT serve
+# DeepSeek models. Sending a deepseek-* model name to one of these hosts fails
+# every call (403/429) — the drift that silently killed the validation loop for
+# 7+ days (issue #83): the ambient env exported HYPO_LLM_BASE_URL pointing at
+# an Alibaba/MaaS endpoint while the job command overrode only
+# HYPO_LLM_MODEL=deepseek-v4-flash, so the script sent a deepseek model name to
+# a provider that does not serve it, every call failed, and the loop silently
+# fell back to random.
+_ALIYUN_HOST_MARKERS = ("aliyuncs.com", "aliyun", "maas")
+
+
+def _host_of(base_url: str) -> str:
+    """Lowercased host portion of a base URL ('' when unparseable)."""
+    url = (base_url or "").strip().lower()
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc
+    except Exception:
+        return ""
+
+
+def validate_llm_config(cfg=None):
+    """Fail loudly when the LLM endpoint/model/key combo is incoherent.
+
+    The three config inputs (HYPO_LLM_BASE_URL, HYPO_LLM_MODEL,
+    HYPO_LLM_API_KEY_ENV) come from independent env vars with independent
+    defaults, and nothing validated the combination. The observed failure
+    (issue #83): a command line overriding only ``HYPO_LLM_MODEL`` while the
+    ambient env points ``HYPO_LLM_BASE_URL`` at an Alibaba/MaaS endpoint and
+    ``HYPO_LLM_API_KEY_ENV`` at an Alibaba credential — every LLM call fails
+    (403/429) and the loop silently falls back to random, reporting
+    ``last_status=ok`` with zero tests.
+
+    Returns the config dict on success; raises ValueError describing every
+    detected incoherence. ``run_loop`` calls this at startup when the LLM path
+    is enabled, so a bad combo is a loud startup failure instead of a silent
+    multi-day no-op.
+    """
+    cfg = cfg or _get_config()
+    model = (cfg.get("model") or "").strip().lower()
+    base_url = (cfg.get("base_url") or "").strip()
+    key_env_name = os.environ.get("HYPO_LLM_API_KEY_ENV", "DEEPSEEK_API_KEY")
+
+    problems = []
+    if model.startswith("deepseek"):
+        host = _host_of(base_url)
+        if host and any(m in host for m in _ALIYUN_HOST_MARKERS):
+            problems.append(
+                f"HYPO_LLM_MODEL={cfg.get('model')!r} is a DeepSeek model but "
+                f"HYPO_LLM_BASE_URL={base_url!r} points at an Alibaba/MaaS "
+                f"endpoint — every call fails (403/429) and the loop silently "
+                f"falls back to random. Override HYPO_LLM_BASE_URL to a "
+                f"DeepSeek-compatible endpoint (e.g. https://api.deepseek.com/v1) "
+                f"TOGETHER with HYPO_LLM_MODEL and HYPO_LLM_API_KEY_ENV."
+            )
+        key_l = key_env_name.lower()
+        if "alibaba" in key_l or "aliyun" in key_l:
+            problems.append(
+                f"HYPO_LLM_MODEL={cfg.get('model')!r} is a DeepSeek model but "
+                f"HYPO_LLM_API_KEY_ENV={key_env_name!r} names an Alibaba "
+                f"credential — it will not authenticate against a DeepSeek "
+                f"endpoint. Set HYPO_LLM_API_KEY_ENV to a DeepSeek key var "
+                f"(e.g. DEEPSEEK_API_KEY)."
+            )
+    if problems:
+        raise ValueError("; ".join(problems))
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
