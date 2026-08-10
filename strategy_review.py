@@ -1040,13 +1040,20 @@ def _main_inner():
         verdict_dict = judge_family(report, fam, knowledge)
         result = apply_verdict(family_key, verdict_dict, knowledge, backlog)
 
-        # Tally
-        v = verdict_dict["verdict"]
-        if v == "kill":
+        # Tally the APPLIED verdict returned by apply_verdict (issue #85).
+        # The raw LLM verdict (verdict_dict["verdict"]) can diverge from what
+        # was actually applied: kill is downgraded to keep when
+        # n_trials < MIN_TRIALS_FOR_KILL, refine is downgraded to keep for
+        # cross families, and refine at REFINE_CAP is applied as kill.
+        # Counting the raw verdict made REVIEW_SUMMARY contradict the
+        # per-item REVIEW_VERDICT lines printed by apply_verdict.
+        if result == "kill":
             kill_count += 1
-        elif v == "refine":
+        elif result == "refine":
             refine_count += 1
-        elif v == "keep":
+        elif result == "keep":
+            # fail-open keeps (judge_family LLM failure) carry an
+            # llm_failure rationale; count them separately from real keeps.
             if "llm_failure" in verdict_dict["rationale"]:
                 failopen_count += 1
             else:
