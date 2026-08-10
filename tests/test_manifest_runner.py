@@ -219,7 +219,10 @@ class TestMissingData:
         result = json.loads(run_manifest(manifest, str(tmp_path)))
 
         assert result["status"] == "error"
-        assert result["error_type"] == "infra"
+        # Issue #81: a missing symbol CSV is a deterministic coverage failure
+        # — retrying cannot materialise the file, so it must be classified
+        # 'code' (no retry), not 'infra'.
+        assert result["error_type"] == "code"
         assert "MSFT" in result["error"] or "GOOG" in result["error"]
 
 
