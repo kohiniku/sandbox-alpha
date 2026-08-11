@@ -1851,6 +1851,18 @@ def run_loop(num_iterations=3):
                     knowledge["errors"] = knowledge["errors"][-100:]
             elif verdict == Verdict.ADOPTED:
                 record["cluster_id"] = evaluation.get("cluster_id", "unknown")
+                # Issue #88: persist the consumed spec on the adopted record so
+                # the OOS monitor can re-run manifest/codegen strategies later
+                # without depending on backlog history surviving forever.
+                if entry_bk.get("type") == "manifest":
+                    record["manifest_spec"] = entry_bk.get("spec", {})
+                elif entry_bk.get("type") == "code":
+                    _bk_spec = entry_bk.get("spec", {})
+                    record["code_spec"] = {
+                        "name": _bk_spec.get("name"),
+                        "symbol": _bk_spec.get("symbol"),
+                        "code": _bk_spec.get("code"),
+                    }
                 knowledge["adopted"].append(record)
             else:
                 _record_near_miss(hypothesis, evaluation, knowledge)
