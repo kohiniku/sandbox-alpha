@@ -41,6 +41,23 @@ MIN_TRIALS_FOR_KILL = 3
 # sufficient evidence to trust a kill verdict for a cross family.
 MIN_TRIALS_FOR_KILL_CROSS = 1
 
+# Codegen families (execution_mode=code proposals) carry no params, their
+# code payload is not persisted in knowledge.json, and the runner has no
+# codegen schema on /run — so the param-based single-name diagnosis can never
+# run for them (issue #89). They get a baseline-only diagnosis path instead
+# (mirroring cross families) and refine is downgraded to keep in
+# apply_verdict.
+CODEGEN_FAMILY_PREFIX = "codegen|"
+
+# Diagnosis errors that are PERMANENT for the family class: no amount of new
+# evidence makes the family diagnosable (e.g. "no params recoverable from
+# evidence" is structurally true for a whole class of families). Families
+# with a permanent-class error are excluded from the candidate pool even when
+# new evidence arrives (issue #89) — the #77 backoff only re-admits transient
+# errors. A successful diagnosis (via _update_review_state) clears the
+# marker, so a future diagnosis path can revive the class.
+PERMANENT_DIAG_ERROR_PREFIXES = ("no params recoverable from evidence",)
+
 REVIEW_REPORTS_DIR.mkdir(exist_ok=True)
 
 # --- Flag thresholds (module constants) ---
@@ -153,6 +170,15 @@ def _family_has_new_evidence(family_key, knowledge):
         return False
 
     newest_failure = max(timestamps)
+
+    # A permanent-class diagnosis error (e.g. codegen "no params recoverable")
+    # means the family is structurally undiagnosable — new evidence never
+    # changes that, so it must stay out of the candidate pool until a
+    # successful diagnosis clears the marker (issue #89). Without this, the
+    # #77 backoff (below) re-admits the family on every new evidence item and
+    # a guaranteed-fail family is re-selected every review run, forever.
+    if family_review.get("diag_error_permanent"):
+        return False
 
     # A diagnosis attempt that errored after all known evidence means there
     # is nothing new to try — drop out until new evidence arrives.
@@ -372,6 +398,12 @@ def diagnose_family(family_key, knowledge, runner_url):
     try:
         if family_type == "cross":
             return _diagnose_cross_family(family_key, knowledge, evidence, runner_url, now_iso)
+        elif _is_codegen_family(family_key):
+            # codegen families can never satisfy the param-based single
+            # diagnosis (no params, no persisted code payload) — route them
+            # to a baseline-only path instead of erroring every cycle
+            # (issue #89).
+            return _diagnose_codegen_family(family_key, evidence, now_iso)
         else:
             return _diagnose_single_family(family_key, evidence, runner_url, now_iso)
     except Exception as e:
@@ -381,6 +413,16 @@ def diagnose_family(family_key, knowledge, runner_url):
             "family_key": family_key,
             "family_type": family_type,
         }, error_msg
+
+
+def _is_codegen_family(family_key):
+    """True for codegen (LLM-generated code) families.
+
+    codegen families are recorded with strategy='codegen' (see
+    autonomous_loop._consume_code_entry), so their family key is
+    'codegen|<symbol>'.
+    """
+    return family_key.startswith(CODEGEN_FAMILY_PREFIX)
 
 
 def _diagnose_single_family(family_key, evidence, runner_url, now_iso):
@@ -475,6 +517,47 @@ def _diagnose_cross_family(family_key, knowledge, evidence, runner_url, now_iso)
     return report, None
 
 
+def _diagnose_codegen_family(family_key, evidence, now_iso):
+    """Run diagnosis for a codegen (LLM-generated code) family.
+
+    Baseline-only, mirroring _diagnose_cross_family: codegen evidence
+    carries no params and the code payload is not persisted in
+    knowledge.json, so a faithful re-measurement is impossible (issue #89).
+    Zero HTTP calls. This replaces the guaranteed ValueError from
+    _diagnose_single_family ("no params recoverable from evidence") so the
+    class can finally receive verdicts instead of erroring every cycle.
+    """
+    if "evaluation" in evidence:
+        baseline_eval = evidence.get("evaluation", {})
+        source = "recorded_evaluation"
+    else:
+        # near_miss entry — use its val_sharpe as baseline
+        baseline_eval = {"sharpe_ratio": evidence.get("val_sharpe", 0.0)}
+        source = "recorded_near_miss"
+
+    baseline_val_sharpe = baseline_eval.get("sharpe_ratio", 0.0)
+
+    report = {
+        "family_key": family_key,
+        "family_type": "single",
+        "strategy_class": "codegen",
+        "diagnosed_at": now_iso,
+        "diagnosis_scope": "baseline_only",
+        "flags": [],
+        "baseline": {
+            "val_sharpe": baseline_val_sharpe,
+            "source": source,
+        },
+        "cost_free": None,
+        "folds_available": False,
+        "warnings": [
+            "code payload not persisted in knowledge; re-measurement and refine unavailable"
+        ],
+    }
+
+    return report, None
+
+
 # ============================================================================
 # Persistence
 # ============================================================================
@@ -509,10 +592,16 @@ def _update_review_state(knowledge, family_key, iso_timestamp):
     state = knowledge.setdefault("review_state", {})
     state["last_review_at"] = iso_timestamp
     reviewed = state.setdefault("reviewed", {})
-    reviewed.setdefault(family_key, {})["last_diagnosed_at"] = iso_timestamp
+    entry = reviewed.setdefault(family_key, {})
+    entry["last_diagnosed_at"] = iso_timestamp
+    # A successful diagnosis proves the family is diagnosable — clear any
+    # permanent-error marker and stale error timestamp so it can re-enter
+    # the candidate pool (issue #89).
+    entry.pop("diag_error_permanent", None)
+    entry.pop("last_diag_error_at", None)
 
 
-def _record_diag_error(knowledge, family_key, iso_timestamp):
+def _record_diag_error(knowledge, family_key, iso_timestamp, error_msg=None):
     """Record a failed diagnosis attempt for a family.
 
     Mirrors _update_review_state, but marks ``last_diag_error_at`` instead
@@ -520,11 +609,22 @@ def _record_diag_error(knowledge, family_key, iso_timestamp):
     (nothing new to try) and becomes eligible again as soon as new evidence
     arrives. This preserves the backoff that the removed global
     ``last_review_at`` watermark provided implicitly (issue #77).
+
+    Permanent-class errors (see PERMANENT_DIAG_ERROR_PREFIXES) additionally
+    stamp ``diag_error_permanent``: the family is structurally
+    undiagnosable, so new evidence must NOT re-admit it (issue #89). Only a
+    successful diagnosis (which clears the marker via _update_review_state)
+    brings it back.
     """
     state = knowledge.setdefault("review_state", {})
     state["last_review_at"] = iso_timestamp
     reviewed = state.setdefault("reviewed", {})
-    reviewed.setdefault(family_key, {})["last_diag_error_at"] = iso_timestamp
+    entry = reviewed.setdefault(family_key, {})
+    entry["last_diag_error_at"] = iso_timestamp
+    if error_msg and any(
+        error_msg.startswith(prefix) for prefix in PERMANENT_DIAG_ERROR_PREFIXES
+    ):
+        entry["diag_error_permanent"] = True
 
 
 # ============================================================================
@@ -858,6 +958,14 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
             final_rationale = rationale + " (格下げ: crossファミリーはrefine不可)"
             applied_verdict = "keep"
             print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+        elif _is_codegen_family(family_key):
+            # codegen families cannot be refined: no params exist and the
+            # runner has no codegen schema on /run, so a param backlog entry
+            # would be unexecutable (issue #89). Judge still gets to
+            # keep/kill — only refine is downgraded.
+            final_rationale = rationale + " (格下げ: codegenファミリーはrefine不可)"
+            applied_verdict = "keep"
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         else:
             refine_count = family.get("refine_count", 0)
             if refine_count >= REFINE_CAP:
@@ -1001,7 +1109,9 @@ def _main_inner():
             # Record the failed attempt so the family drops out of the
             # candidate pool until new evidence arrives — without this the
             # per-family gate would re-select it on every run (issue #77).
-            _record_diag_error(knowledge, family_key, now)
+            # Permanent-class errors (e.g. codegen "no params recoverable")
+            # are marked so new evidence does NOT re-admit them (issue #89).
+            _record_diag_error(knowledge, family_key, now, error)
             save_knowledge(knowledge)
             continue
 
