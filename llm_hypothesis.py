@@ -33,6 +33,52 @@ _STRATEGY_NAMES = {"sma_crossover", "mean_reversion", "momentum", "rsi"}
 _RETRYABLE_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
 
 
+class ContentLengthExhaustedError(Exception):
+    """HTTP 200 but the model exhausted its output-token budget.
+
+    DeepSeek v4-class reasoning models consume ``max_tokens`` in hidden
+    ``reasoning_content`` and return HTTP 200 with ``finish_reason="length"``
+    and EMPTY (or truncated) ``content``. This is the dominant ideation
+    failure mode (issue #90) and is invisible to the status-code retry
+    policy — the fix is to retry with a larger ``max_tokens`` budget.
+    """
+
+
+# Upper bound for the max_tokens escalation on content-exhaustion retries
+# (8192 → 16384 → 32768 → ...). Generous enough for any ideation prompt;
+# beyond this the model genuinely cannot produce output.
+_MAX_RETRY_MAX_TOKENS = 65536
+
+
+def _check_content_exhausted(envelope):
+    """Raise ContentLengthExhaustedError on the reasoning-exhaustion signature.
+
+    Detects HTTP 200 responses where ``choices[0].message.content`` is empty
+    or whitespace, or ``finish_reason == "length"`` (content truncated mid-
+    JSON — the 'Unterminated string' failure). Envelopes without a usable
+    ``choices[0]`` pass through unchanged: they are malformed in a different
+    way and the callers' existing error handling applies.
+    """
+    try:
+        choice = envelope["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError):
+        return
+    finish_reason = choice.get("finish_reason", "")
+    content = message.get("content")
+    if content is None:
+        # Some providers omit 'content' entirely when reasoning ate the
+        # budget — treat as empty.
+        content = ""
+    if not isinstance(content, str):
+        return
+    if not content.strip() or finish_reason == "length":
+        raise ContentLengthExhaustedError(
+            f"empty/truncated content (finish_reason={finish_reason!r}, "
+            f"content_len={len(content)})"
+        )
+
+
 def _http_post_json(url, headers, payload, timeout, retries=2):
     """POST with timeout AND rate-limit retries.
 
@@ -46,15 +92,41 @@ def _http_post_json(url, headers, payload, timeout, retries=2):
     limit, returned as 403 rather than 429). Genuinely terminal 4xx (400, 401,
     404, ...) still raise immediately -- retrying a bad request or bad
     credentials just wastes the retry budget.
+
+    Additionally detects the reasoning-token-exhaustion signature (HTTP 200
+    with empty/truncated content, issue #90) and retries with a DOUBLED
+    ``max_tokens`` budget per attempt — the documented in-repo mitigation
+    (llm_hypothesis.generate's 512→2048→8192 escalation note) applied
+    automatically instead of by hand. Raises ContentLengthExhaustedError
+    after retries are exhausted.
     """
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-    )
+    # We bump max_tokens on content-exhaustion retries; never mutate the
+    # caller's payload dict.
+    payload = dict(payload)
     last_err = None
     for attempt in range(retries + 1):
         try:
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+            )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                envelope = json.loads(resp.read().decode("utf-8"))
+            _check_content_exhausted(envelope)
+            return envelope
+        except ContentLengthExhaustedError as e:
+            # Reasoning-token exhaustion: the status-code retry policy can
+            # never see this (HTTP 200), and the parse-retry cascades fail in
+            # lockstep on the same config. Escalate the output budget instead
+            # (issue #90).
+            last_err = f"attempt {attempt + 1}/{retries + 1}: {e}"
+            if attempt < retries:
+                payload["max_tokens"] = min(
+                    int(payload.get("max_tokens") or 8192) * 2,
+                    _MAX_RETRY_MAX_TOKENS,
+                )
+                time.sleep(1)
+                continue
+            raise
         except urllib.error.HTTPError as e:
             if e.code in _RETRYABLE_HTTP_STATUSES and attempt < retries:
                 last_err = f"attempt {attempt + 1}/{retries + 1}: HTTP {e.code}"
