@@ -8,6 +8,7 @@ reports to an LLM judge for refine/keep/kill verdicts, and applies
 those verdicts mechanically.
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -34,12 +35,67 @@ from backlog import Backlog, _new_entry as _bl_new_entry
 
 # Minimum trials before a family can be killed
 MIN_TRIALS_FOR_KILL = 3
-# Cross families cannot be refined (no manifest spec persisted) and only gain
-# trials through new ideation proposals of the exact same strategy+universe
-# hash, which is rare. Requiring MIN_TRIALS_FOR_KILL trials for them makes
-# kill verdicts permanently unreachable (issue #75) — one failed trial is
-# sufficient evidence to trust a kill verdict for a cross family.
+# Cross families only gain trials through new ideation proposals of the exact
+# same strategy+universe hash, which is rare. Requiring MIN_TRIALS_FOR_KILL
+# trials for them makes kill verdicts permanently unreachable (issue #75) —
+# one failed trial is sufficient evidence to trust a kill verdict for a cross
+# family.
 MIN_TRIALS_FOR_KILL_CROSS = 1
+
+# Issue #92: cross-family refine support. refine_proposal.params from the LLM
+# judge refer to the manifest's top-level knobs (universe_size,
+# execution_mode, primary_metric) and evaluator.extras keys (e.g. cost_bps).
+# These are the only top-level fields a refine may override; identity and code
+# fields are never touched — the judge proposes parameter changes, not code
+# rewrites.
+MANIFEST_REFINABLE_TOP_LEVEL = frozenset({
+    "universe_size",      # informational: runner derives size from data_sources
+    "execution_mode",     # routed by manifest_runner (structured/expert)
+    "primary_metric",     # informational: evaluator config is authoritative
+})
+MANIFEST_PROTECTED_FIELDS = frozenset({
+    "name", "code_b64", "logic_spec", "data_sources",
+    "model_artifacts", "compute", "evaluator",
+})
+
+
+def _mutate_manifest_spec(last_spec, params):
+    """Build a mutated manifest spec for cross-family refinement (issue #92).
+
+    refine params are merged at the manifest top level for
+    MANIFEST_REFINABLE_TOP_LEVEL fields; any other key is applied under
+    evaluator.extras (e.g. cost_bps). code_b64/logic_spec and the identity
+    fields are never modified.
+
+    Returns (mutated_spec, None) on success, (None, error_msg) on failure.
+    """
+    if not isinstance(last_spec, dict):
+        return None, "last_manifest_spec is not a dict"
+    if not isinstance(params, dict) or not params:
+        return None, "refine_proposal.params is empty"
+    protected = set(params) & MANIFEST_PROTECTED_FIELDS
+    if protected:
+        return None, (
+            f"refine params must not override protected manifest fields: "
+            f"{sorted(protected)}"
+        )
+
+    mutated = copy.deepcopy(last_spec)
+    extras = {}
+    for k, v in params.items():
+        if k in MANIFEST_REFINABLE_TOP_LEVEL:
+            mutated[k] = v
+        else:
+            extras[k] = v
+    if extras:
+        evaluator = mutated.get("evaluator")
+        if not isinstance(evaluator, dict):
+            return None, "manifest evaluator is not a dict"
+        eval_extras = evaluator.setdefault("extras", {})
+        if not isinstance(eval_extras, dict):
+            return None, "manifest evaluator.extras is not a dict"
+        eval_extras.update(extras)
+    return mutated, None
 
 # Codegen families (execution_mode=code proposals) carry no params, their
 # code payload is not persisted in knowledge.json, and the runner has no
@@ -834,6 +890,24 @@ def _build_judge_prompt(report, family, knowledge):
     else:
         schema_section = ""
 
+    # Issue #92: cross families refine manifest knobs, not strategy hyperparams.
+    # Tell the judge what refine_proposal.params means for them so it does not
+    # propose single-style logic hyperparams (or code rewrites) that the
+    # manifest-refine path cannot execute.
+    if family_type == "cross":
+        manifest_note = (
+            "\n=== CROSS-SECTIONAL (manifest) FAMILY ===\n"
+            "This family runs a full strategy manifest (code_b64/logic_spec + "
+            "data_sources + evaluator). refine_proposal.params refer to the "
+            "manifest's top-level knobs: universe_size, execution_mode "
+            "(structured|expert), primary_metric, and evaluator.extras keys "
+            "(e.g. cost_bps). Do NOT propose strategy-code changes "
+            "(code_b64/logic_spec are never rewritten); only parameter-level "
+            "changes are executable.\n"
+        )
+    else:
+        manifest_note = ""
+
     user_prompt = f"""Diagnosis report for family: {family_key}
 
 Family aggregates:
@@ -846,8 +920,7 @@ Diagnosis:
   {cost_free_block}
 
 {near_miss_block}
-{schema_section}
-Rules:
+{schema_section}{manifest_note}Rules:
 - All arithmetic is precomputed — do not recompute anything.
 - Flags are ground truth. If a flag is active, it is real.
 - Choose exactly one verdict: refine, keep, or kill.
@@ -954,10 +1027,57 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
 
     elif llm_verdict == "refine":
         if family_type == "cross":
-            # Cross families cannot be refined (no manifest spec persisted)
-            final_rationale = rationale + " (格下げ: crossファミリーはrefine不可)"
-            applied_verdict = "keep"
-            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+            # Issue #92: cross families CAN be refined when the consumed
+            # manifest body was persisted (last_manifest_spec). The mutated
+            # manifest is queued as a "manifest" backlog entry, mirroring the
+            # single-family param-refine flow. Pre-fix families (no spec)
+            # cannot be re-proposed — downgrade with an explicit reason.
+            last_spec = family.get("last_manifest_spec")
+            if not last_spec:
+                final_rationale = rationale + " (格下げ: 元manifest未保存のためrefine不可)"
+                applied_verdict = "keep"
+                print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+            else:
+                refine_count = family.get("refine_count", 0)
+                if refine_count >= REFINE_CAP:
+                    # Auto-kill: refine cap exhausted (same as single families)
+                    family["lifecycle"] = FamilyLifecycle.KILLED
+                    family["kill_reason"] = "自動判定: refine回数上限に到達"
+                    applied_verdict = "kill"
+                    final_rationale = "refine回数上限に到達"
+                    print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
+                else:
+                    # Build the mutated manifest from the persisted spec.
+                    refine_proposal = verdict_dict.get("refine_proposal") or {}
+                    params = refine_proposal.get("params", {})
+                    change_summary = refine_proposal.get("change_summary", "")
+
+                    mutated, mutate_err = _mutate_manifest_spec(last_spec, params)
+                    if mutate_err is not None:
+                        final_rationale = rationale + f" (格下げ: refine提案のパラメータ不正: {mutate_err})"
+                        applied_verdict = "keep"
+                        print(f"REVIEW_REFINE_INVALID_PARAMS {family_key} error=\"{mutate_err}\"")
+                        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+                    else:
+                        backlog_entry = _bl_new_entry(
+                            "manifest",
+                            0.95,
+                            {"kind": "review_refine", "ref": family_key},
+                            mutated,
+                            {"extra_criteria": []},
+                        )
+                        backlog_entry["created_at"] = now_iso
+                        accepted, eid = backlog.add_entry(backlog_entry)
+
+                        if accepted:
+                            family["refine_count"] = refine_count + 1
+                            family["lifecycle"] = FamilyLifecycle.REFINING
+                            print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+                        else:
+                            final_rationale = rationale + " (refine重複 — 既にキュー済み)"
+                            applied_verdict = "keep"
+                            print(f"REVIEW_REFINE_DUPLICATE {family_key}")
+                            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         elif _is_codegen_family(family_key):
             # codegen families cannot be refined: no params exist and the
             # runner has no codegen schema on /run, so a param backlog entry

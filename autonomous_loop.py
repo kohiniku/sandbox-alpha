@@ -366,6 +366,12 @@ def update_family_aggregates(knowledge, record):
         return
     families = knowledge.setdefault("families", {})
     _apply_entry_to_family(families, key, record, hyp, _derive_family_type(hyp))
+    # Issue #92: persist the full consumed manifest body on cross families so
+    # the review loop can refine them. Same timing as the best_params update
+    # above. Pre-fix family records simply lack this key and fall back to the
+    # legacy keep-downgrade path in apply_verdict.
+    if _derive_family_type(hyp) == "cross" and record.get("manifest_spec"):
+        families[key]["last_manifest_spec"] = record["manifest_spec"]
 
 
 def _check_exhausted_cluster(hypothesis, knowledge):
@@ -1844,6 +1850,13 @@ def run_loop(num_iterations=3):
             record = save_result(hypothesis, result, verdict, evaluation)
             # Add source attribution from backlog entry
             record["source"] = entry_bk.get("source", {})
+            # Issue #92: persist the consumed manifest body on EVERY manifest
+            # trial (adopted and rejected alike) so the review loop can refine
+            # cross families. The family record otherwise only keeps the
+            # trimmed universe_size/execution_mode/primary_metric values,
+            # which is not enough to re-propose a mutated manifest.
+            if entry_bk.get("type") == "manifest":
+                record["manifest_spec"] = entry_bk.get("spec", {})
 
             if verdict in ("error", "code_error"):
                 knowledge.setdefault("errors", []).append(record)
