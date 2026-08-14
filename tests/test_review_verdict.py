@@ -1131,7 +1131,8 @@ class TestAuditTrail:
         assert "格下げ: 試行数不足で証拠不十分" in summary["rationale"]
 
     def test_summary_records_applied_verdict_on_cross_downgrade(self, tmp_path, monkeypatch):
-        """When cross refine is downgraded, summary records llm_verdict=refine, applied_verdict=keep."""
+        """When cross refine is downgraded (no persisted manifest spec), summary
+        records llm_verdict=refine, applied_verdict=keep (issue #92 reason)."""
         monkeypatch.setattr(sr, "KNOWLEDGE_FILE", tmp_path / "knowledge.json")
         monkeypatch.setattr(sr, "REVIEW_REPORTS_DIR", tmp_path / "review_reports")
         monkeypatch.setattr(sr, "BASE_DIR", tmp_path)
@@ -1160,7 +1161,9 @@ class TestAuditTrail:
         summary = reloaded["reviews"][0]
         assert summary["llm_verdict"] == "refine"
         assert summary["applied_verdict"] == "keep"
-        assert "格下げ: crossファミリーはrefine不可" in summary["rationale"]
+        # Issue #92: pre-fix families without a persisted manifest body cannot
+        # be refined; the downgrade reason must say so explicitly.
+        assert "格下げ: 元manifest未保存のためrefine不可" in summary["rationale"]
 
     def test_summary_records_applied_verdict_on_refine_cap(self, tmp_path, monkeypatch):
         """When refine cap triggers, summary has llm_verdict=refine, applied_verdict=kill."""
