@@ -192,6 +192,19 @@ def load_knowledge():
         # near_misses_cross alongside without touching the existing data.
         data.setdefault("near_misses_cross", [])
 
+        # Migration (issue #97): backfill family_key on adopted records that
+        # predate the join key, so the review loop's adoption guard works for
+        # existing adoptions without manual data surgery.
+        for entry in data.get("adopted", []):
+            if not entry.get("family_key"):
+                hyp = entry.get("hypothesis") or {}
+                strategy = hyp.get("strategy", "")
+                symbol = hyp.get("symbol", "")
+                if strategy and symbol:
+                    entry["family_key"] = _family_key(
+                        strategy, symbol, _derive_family_type(hyp)
+                    )
+
         # Migration: add lifecycle fields to families that lack them.
         for fam in data.get("families", {}).values():
             if "lifecycle" not in fam:
@@ -1876,6 +1889,13 @@ def run_loop(num_iterations=3):
                         "symbol": _bk_spec.get("symbol"),
                         "code": _bk_spec.get("code"),
                     }
+                # Issue #97: join key so the review loop can tell that this
+                # family has an adopted member and must not be killed.
+                record["family_key"] = _family_key(
+                    hypothesis.get("strategy", ""),
+                    hypothesis.get("symbol", ""),
+                    _derive_family_type(hypothesis),
+                )
                 knowledge["adopted"].append(record)
             else:
                 _record_near_miss(hypothesis, evaluation, knowledge)
@@ -1970,6 +1990,13 @@ def run_loop(num_iterations=3):
                 knowledge["errors"] = knowledge["errors"][-100:]
         elif verdict == Verdict.ADOPTED:
             record["cluster_id"] = evaluation.get("cluster_id", "unknown")
+            # Issue #97: join key so the review loop can tell that this
+            # family has an adopted member and must not be killed.
+            record["family_key"] = _family_key(
+                hypothesis.get("strategy", ""),
+                hypothesis.get("symbol", ""),
+                _derive_family_type(hypothesis),
+            )
             knowledge["adopted"].append(record)
         else:
             _record_near_miss(hypothesis, evaluation, knowledge)
