@@ -35,3 +35,7 @@ ideation_logs/
 Dockerfile.bak
 backlog.json
 review_reports/
+
+# Issue #96: sidecar lock / staging files for knowledge.json atomic writes
+knowledge.json.lock
+knowledge.json.tmp

@@ -4,6 +4,7 @@ Autonomous Alpha Discovery Loop
 エージェントが仮説生成→バックテスト→評価→蓄積を自律的に回す
 """
 import base64
+import fcntl
 import hashlib
 import json
 import math
@@ -167,50 +168,92 @@ def _update_param_clusters(fam, params, templates):
     fam["distinct_clusters"] = len(clusters)
 
 
+def _knowledge_lock_path():
+    """Sidecar lock file for knowledge.json (issue #96).
+
+    Deliberately a SEPARATE file that is never replaced: os.replace() swaps
+    the knowledge.json inode, so flock()ing knowledge.json itself would leave
+    concurrent lockers waiting on the old inode while a new one appears.
+    """
+    return KNOWLEDGE_FILE.with_name(KNOWLEDGE_FILE.name + ".lock")
+
+
+def _atomic_write_knowledge(data):
+    """Serialize + atomically replace knowledge.json under an exclusive lock.
+
+    Guards against the three-way race described in issue #96: concurrent
+    validation/review runs doing read-modify-write on the same 2.7MB file
+    (truncated JSON from a mid-write kill, interleaved writers, and readers
+    observing a half-written file). Mirrors backlog.py's flock discipline.
+    """
+    KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, default=str)
+    lock_path = _knowledge_lock_path()
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            tmp_path = KNOWLEDGE_FILE.with_name(KNOWLEDGE_FILE.name + ".tmp")
+            tmp_path.write_text(payload)
+            os.replace(tmp_path, KNOWLEDGE_FILE)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
+def save_knowledge(knowledge):
+    """ナレッジベースを更新 (issue #96: locked + atomic, no truncated/interleaved writes)"""
+    _atomic_write_knowledge(knowledge)
+
+
 def load_knowledge():
-    """過去の戦略テスト結果を読み込む"""
-    if KNOWLEDGE_FILE.exists():
-        data = json.loads(KNOWLEDGE_FILE.read_text())
-        # 後方互換: 古いナレッジファイルに不足キーを補完
-        data.setdefault("tested_combinations", [])
-        data.setdefault("superseded", [])
-        data.setdefault("errors", [])
-        # Migration: rebuild "families" from history if missing
-        if "families" not in data:
-            data["families"] = _rebuild_families_from_history(data)
-            # persist the rebuilt families immediately so the migration is idempotent
-            KNOWLEDGE_FILE.write_text(json.dumps(data, indent=2, default=str))
+    """過去の戦略テスト結果を読み込む (issue #96: shared lock during read)"""
+    if not KNOWLEDGE_FILE.exists():
+        return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
+                "superseded": [], "families": {}, "iterations": 0, "errors": []}
+    lock_path = _knowledge_lock_path()
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        try:
+            data = json.loads(KNOWLEDGE_FILE.read_text())
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    # 後方互換: 古いナレッジファイルに不足キーを補完
+    data.setdefault("tested_combinations", [])
+    data.setdefault("superseded", [])
+    data.setdefault("errors", [])
+    # Migration: rebuild "families" from history if missing
+    if "families" not in data:
+        data["families"] = _rebuild_families_from_history(data)
+        # persist the rebuilt families immediately so the migration is idempotent
+        _atomic_write_knowledge(data)
 
-        # Migration: stamp family_type on legacy family entries that lack it.
-        for key, fam in data.get("families", {}).items():
-            if "family_type" not in fam:
-                # Derive from key shape; keys of the form "manifest:...|universe:..."
-                # are cross, everything else is single.
-                fam["family_type"] = "cross" if key.startswith("manifest:") else "single"
+    # Migration: stamp family_type on legacy family entries that lack it.
+    for key, fam in data.get("families", {}).items():
+        if "family_type" not in fam:
+            # Derive from key shape; keys of the form "manifest:...|universe:..."
+            # are cross, everything else is single.
+            fam["family_type"] = "cross" if key.startswith("manifest:") else "single"
 
-        # Migration: legacy knowledge only had a single near_misses list; introduce
-        # near_misses_cross alongside without touching the existing data.
-        data.setdefault("near_misses_cross", [])
+    # Migration: legacy knowledge only had a single near_misses list; introduce
+    # near_misses_cross alongside without touching the existing data.
+    data.setdefault("near_misses_cross", [])
 
-        # Migration: add lifecycle fields to families that lack them.
-        for fam in data.get("families", {}).values():
-            if "lifecycle" not in fam:
-                fam["lifecycle"] = FamilyLifecycle.CANDIDATE
-                fam["refine_count"] = 0
-                fam["kill_reason"] = ""
-            
-            # Migration: add param_clusters and distinct_clusters for issue #66 fix
-            if "param_clusters" not in fam:
-                fam["param_clusters"] = []
-                fam["distinct_clusters"] = 0
-                # Rebuild clusters from best_params if available
-                if fam.get("best_params"):
-                    fam["param_clusters"].append(fam["best_params"])
-                    fam["distinct_clusters"] = 1
+    # Migration: add lifecycle fields to families that lack them.
+    for fam in data.get("families", {}).values():
+        if "lifecycle" not in fam:
+            fam["lifecycle"] = FamilyLifecycle.CANDIDATE
+            fam["refine_count"] = 0
+            fam["kill_reason"] = ""
+        
+        # Migration: add param_clusters and distinct_clusters for issue #66 fix
+        if "param_clusters" not in fam:
+            fam["param_clusters"] = []
+            fam["distinct_clusters"] = 0
+            # Rebuild clusters from best_params if available
+            if fam.get("best_params"):
+                fam["param_clusters"].append(fam["best_params"])
+                fam["distinct_clusters"] = 1
 
-        return data
-    return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
-            "superseded": [], "families": {}, "iterations": 0, "errors": []}
+    return data
 
 
 def _rebuild_families_from_history(knowledge):
@@ -395,11 +438,6 @@ def _check_exhausted_cluster(hypothesis, knowledge):
         return False, len(matching), best_sharpe
 
     return True, len(matching), best_sharpe
-
-
-def save_knowledge(knowledge):
-    """ナレッジベースを更新"""
-    KNOWLEDGE_FILE.write_text(json.dumps(knowledge, indent=2, default=str))
 
 
 def generate_hypothesis(knowledge):
