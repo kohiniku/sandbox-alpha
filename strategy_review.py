@@ -245,6 +245,31 @@ def _family_has_new_evidence(family_key, knowledge):
     return newest_failure > last_diagnosed
 
 
+def _adopted_family_keys(knowledge):
+    """Family keys that currently have an adopted member (issue #97).
+
+    Adoption and the review/kill lifecycle are two state machines over the
+    same families. An adopted member passed all adoption gates (validation,
+    deflation, holdout), so the family must never be killed — KILLED_SKIP
+    would poison the adopted parameter cluster forever. Prefer the
+    ``family_key`` field stamped on adopted records at creation
+    (autonomous_loop.py); fall back to deriving from hypothesis
+    ``{strategy, symbol}`` for legacy records (pre-#97 backfill).
+    """
+    keys = set()
+    for entry in knowledge.get("adopted", []):
+        fk = entry.get("family_key")
+        if fk:
+            keys.add(fk)
+            continue
+        hyp = entry.get("hypothesis") or {}
+        strategy = hyp.get("strategy", "")
+        symbol = hyp.get("symbol", "")
+        if strategy and symbol:
+            keys.add(_family_key(strategy, symbol, _derive_family_type(hyp)))
+    return keys
+
+
 def select_candidates(knowledge, now, max_families=None):
     """
     Select up to max_families family keys eligible for diagnosis.
@@ -261,6 +286,12 @@ def select_candidates(knowledge, now, max_families=None):
     near_set = set()
     candidate_set = set()
 
+    # Issue #97: families with an adopted member are immune to re-review.
+    # A kill verdict on them would apply lifecycle=KILLED and KILLED_SKIP
+    # would permanently poison the adopted parameter cluster, even though
+    # the adopted member passed all adoption gates.
+    adopted_keys = _adopted_family_keys(knowledge)
+
     # Collect families from near_misses and near_misses_cross
     for list_name in ("near_misses", "near_misses_cross"):
         for entry in knowledge.get(list_name, []):
@@ -268,7 +299,7 @@ def select_candidates(knowledge, now, max_families=None):
             symbol = entry.get("symbol", "")
             ft = _derive_family_type(entry)
             key = _family_key(strategy, symbol, ft)
-            if key in families:
+            if key in families and key not in adopted_keys:
                 fam = families[key]
                 if fam.get("lifecycle") != FamilyLifecycle.KILLED:
                     near_set.add(key)
@@ -280,7 +311,7 @@ def select_candidates(knowledge, now, max_families=None):
         symbol = hyp.get("symbol", "")
         ft = _derive_family_type(hyp)
         key = _family_key(strategy, symbol, ft)
-        if key in families:
+        if key in families and key not in adopted_keys:
             fam = families[key]
             if fam.get("lifecycle") != FamilyLifecycle.KILLED:
                 candidate_set.add(key)
@@ -1020,6 +1051,16 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
             final_rationale = rationale + " (格下げ: 試行数不足で証拠不十分)"
             applied_verdict = "keep"
             print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+        elif family_key in _adopted_family_keys(knowledge):
+            # Issue #97: never kill a family that currently has an adopted
+            # member — the adopted variant passed every adoption gate, and
+            # lifecycle=KILLED would poison it via KILLED_SKIP forever.
+            # Downgrade to keep and record the blocked attempt loudly.
+            final_rationale = rationale + " (格下げ: 採用済みfamilyはkill不可)"
+            applied_verdict = "keep"
+            family["kill_blocked_by_adoption"] = now_iso
+            print(f"REVIEW_KILL_BLOCKED_ADOPTED {family_key} rationale=\"{rationale}\"")
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         else:
             family["lifecycle"] = FamilyLifecycle.KILLED
             family["kill_reason"] = "自動判定: " + rationale
@@ -1040,12 +1081,21 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
             else:
                 refine_count = family.get("refine_count", 0)
                 if refine_count >= REFINE_CAP:
-                    # Auto-kill: refine cap exhausted (same as single families)
-                    family["lifecycle"] = FamilyLifecycle.KILLED
-                    family["kill_reason"] = "自動判定: refine回数上限に到達"
-                    applied_verdict = "kill"
-                    final_rationale = "refine回数上限に到達"
-                    print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
+                    if family_key in _adopted_family_keys(knowledge):
+                        # Issue #97: same guard as the LLM kill branch — an
+                        # adopted member makes the family unkillable.
+                        final_rationale = "refine回数上限に到達 (格下げ: 採用済みfamilyはkill不可)"
+                        applied_verdict = "keep"
+                        family["kill_blocked_by_adoption"] = now_iso
+                        print(f"REVIEW_KILL_BLOCKED_ADOPTED {family_key} rationale=\"refine cap exhausted\"")
+                        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+                    else:
+                        # Auto-kill: refine cap exhausted (same as single families)
+                        family["lifecycle"] = FamilyLifecycle.KILLED
+                        family["kill_reason"] = "自動判定: refine回数上限に到達"
+                        applied_verdict = "kill"
+                        final_rationale = "refine回数上限に到達"
+                        print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
                 else:
                     # Build the mutated manifest from the persisted spec.
                     refine_proposal = verdict_dict.get("refine_proposal") or {}
