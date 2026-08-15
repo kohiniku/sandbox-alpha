@@ -1537,7 +1537,22 @@ def _consume_manifest_entry(entry, spec, runner_url, bl):
     }
 
     url = f"{runner_url.rstrip('/')}/run_manifest"
-    body = json.dumps(manifest_spec).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99). The backlog entry keeps logic_spec as
+    # the canonical form; the prepared copy is what goes on the wire.
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_spec)
+    if prepared is None:
+        err_text = str(prep_err or "unknown")
+        print(f"  🚫 マニフェスト '{manifest_name}': runnerペイロード準備失敗 — {err_text}")
+        bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
+            "verdict": Verdict.CODE_ERROR,
+            "error": err_text[:200],
+            "summary": f"runnerペイロード準備失敗: {err_text[:180]}",
+            "finished_at": datetime.now().isoformat(),
+        })
+        return None
+    body = json.dumps(prepared).encode("utf-8")
 
     print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {universe_size} symbols...")
     result, _ = _http_post_for_result(url, body, 300)

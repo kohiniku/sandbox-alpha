@@ -1793,10 +1793,12 @@ def _validate_manifest_synthetic(manifest):
                 warnings = [f"run() metric '{k}' is not finite on synthetic data" for k in nf]
                 return json.dumps({"valid": True, "warnings": warnings})
         else:
-            fn = sandbox.get("generate_weights") or sandbox.get("generate_signals")
+            fn = (sandbox.get("generate_weights")
+                  or sandbox.get("generate_signals")
+                  or sandbox.get("generate_cross_signal"))
             if not callable(fn):
                 return json.dumps({"valid": False, "error_type": "code",
-                                   "error": "structured mode requires def generate_signals(data) or def generate_weights(data)"})
+                                   "error": "structured mode requires def generate_signals(data), generate_weights(data), or generate_cross_signal(data, extras)"})
             _out = fn(data)
             # Basic shape check
             if _out is None:

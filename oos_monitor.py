@@ -286,6 +286,15 @@ def _run_manifest_oos(entry, adoption_date, today):
     if not found_ohlcv:
         return None, "manifest_no_ohlcv_source"
 
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99). Adopted DSL manifests persist
+    # logic_spec in manifest_spec; the prepared copy is what goes on the wire.
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(spec2)
+    if prepared is None:
+        return None, f"runner_payload_prep_failed: {prep_err}"
+    spec2 = prepared
+
     result = _post_json(f"{runner_url.rstrip('/')}/run_manifest", spec2, timeout=300)
     if result.get("status") != "ok":
         error_type = result.get("error_type", "unknown")

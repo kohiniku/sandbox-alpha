@@ -1948,7 +1948,14 @@ def _preflight_manifest(manifest_dict):
     if not runner_url:
         return None, "skipped"
 
-    payload = json.dumps(manifest_dict).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99). The manifest dict keeps logic_spec as
+    # the canonical form; the prepared copy is what goes on the wire.
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_dict)
+    if prepared is None:
+        return False, f"runner payload prep failed: {prep_err}"
+    payload = json.dumps(prepared).encode("utf-8")
     try:
         req = urllib.request.Request(
             f"{runner_url}/run_manifest",
@@ -1974,12 +1981,37 @@ def _syntax_preflight_manifest(manifest_dict):
     skipped for cost). Catches SyntaxError before backlog investment so the
     validation loop doesn't waste an iteration compiling broken code.
 
+    DSL-aware (issue #99): a structured manifest carrying logic_spec (and no
+    code_b64) is compiled deterministically via
+    strategy_dsl.compile_logic_spec_to_code and the compiled source is
+    syntax-checked.  Pre-fix, every logic_spec manifest failed here with
+    "empty code_b64" and was dropped — the ideation prompt instructs the LLM
+    to prefer logic_spec, so that dropped 100% of DSL proposals.  The
+    manifest dict is NOT mutated: the backlog entry keeps logic_spec as the
+    canonical form; compilation is re-applied at every runner-facing POST.
+
     Returns (valid: bool, error_msg: str, source: str). Source is the
     decoded Python string (empty if decoding failed) — callers use it to
     request an LLM fix.
     """
     code_b64 = manifest_dict.get("code_b64", "")
     if not code_b64:
+        logic_spec = manifest_dict.get("logic_spec")
+        if logic_spec is not None:
+            # DSL path: compile deterministically, then syntax-check.
+            from strategy_dsl import compile_logic_spec_to_code, DslExecutionError
+            try:
+                source = compile_logic_spec_to_code(
+                    logic_spec, name=manifest_dict.get("name", "dsl_strategy"))
+            except DslExecutionError as e:
+                return False, f"logic_spec compile failed: {e}", ""
+            except Exception as e:
+                return False, f"logic_spec compile failed: {type(e).__name__}: {e}", ""
+            try:
+                compile(source, f"<manifest:{manifest_dict.get('name', '?')}>", "exec")
+            except SyntaxError as e:
+                return False, f"SyntaxError line {e.lineno}: {e.msg}", source
+            return True, "", source
         return False, "empty code_b64", ""
     try:
         source = base64.b64decode(code_b64).decode("utf-8", errors="replace")
@@ -2051,7 +2083,13 @@ def _runtime_preflight_manifest(manifest_dict):
     runner_url = _get_ideation_config()["runner_url"]
     if not runner_url:
         return None, "skipped (runner unreachable)", ""
-    payload = json.dumps(manifest_dict).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99).
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_dict)
+    if prepared is None:
+        return False, f"runner payload prep failed: {prep_err}", ""
+    payload = json.dumps(prepared).encode("utf-8")
     try:
         req = urllib.request.Request(
             f"{runner_url}/validate_manifest",
@@ -2120,6 +2158,12 @@ def _runtime_preflight_with_fix(manifest_dict, max_attempts=2):
     to ``max_attempts`` times. Mutates manifest_dict['code_b64'] on success.
 
     Returns (valid: bool, error_msg: str, fix_count: int).
+
+    DSL manifests (logic_spec, no code_b64) never enter the fix loop
+    (issue #99): the compiled code is a deterministic function of the spec,
+    so an LLM rewrite of it would silently diverge from the DSL the review
+    loop reads.  A runtime failure there means the spec itself is broken —
+    report it, drop the manifest.
     """
     name = manifest_dict.get("name", "?")
     valid, err, tb = _runtime_preflight_manifest(manifest_dict)
@@ -2129,6 +2173,9 @@ def _runtime_preflight_with_fix(manifest_dict, max_attempts=2):
         return True, "", 0
     if valid:
         return True, "", 0
+    if manifest_dict.get("logic_spec") is not None and not manifest_dict.get("code_b64"):
+        # DSL path — no LLM rewrite; the spec is the source of truth.
+        return False, f"logic_spec runtime failure: {err}", 0
 
     try:
         source = base64.b64decode(manifest_dict.get("code_b64", "")).decode("utf-8", errors="replace")
