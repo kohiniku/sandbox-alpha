@@ -670,6 +670,49 @@ def _run_backtest_subprocess(strategy, symbol, params, metrics_since=None):
 # ---------------------------------------------------------------------------
 
 
+def _local_git_head():
+    """Return the current git HEAD SHA of the sandbox-alpha checkout.
+    
+    Returns None if not in a git repo or git command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _check_engine_drift(result: dict):
+    """Check if deployed engine image lags behind local checkout.
+    
+    Returns a warning message if drift detected, None otherwise.
+    The warning includes both SHAs (short form) for easy comparison.
+    """
+    engine_rev = result.get("engine_git_rev")
+    if not engine_rev or engine_rev == "unknown":
+        return None
+    
+    local_rev = _local_git_head()
+    if not local_rev:
+        return None
+    
+    if engine_rev != local_rev:
+        return (
+            f"⚠️ ENGINE DRIFT: deployed engine is {engine_rev[:12]}, "
+            f"but local checkout is {local_rev[:12]} — "
+            f"merged fixes may not be present in production (issue #101)"
+        )
+    return None
+
+
 def _triage_eval_error(result):
     """If result carries an error, return (verdict, evaluation); else None."""
     if "error" not in result:
@@ -1441,6 +1484,11 @@ def _classify_runner_response(status, response_body):
     if not isinstance(parsed, dict):
         return {"error": "Malformed runner response (not a dict)",
                 "error_type": "infra"}, False
+
+    # Engine version drift check (issue #101) — emit warning if present
+    drift_msg = _check_engine_drift(parsed)
+    if drift_msg:
+        print(drift_msg)
 
     if parsed.get("status") == "error":
         # Table: runner error_type -> our classification
