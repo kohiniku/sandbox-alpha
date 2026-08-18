@@ -170,6 +170,63 @@ def _get_entry_timestamp(entry):
     return entry.get("tested_at") or entry.get("date", "")
 
 
+def _cross_family_bypass_eligible(family_key, family, family_review, knowledge):
+    """Check if a cross family qualifies for the evidence-gate bypass (issue #112).
+
+    Cross-sectional families are structurally one-shot: they get exactly one
+    trial from ideation, and after that single diagnosis their newest evidence
+    is permanently older than ``last_diagnosed_at``. Without a bypass, these
+    families — including the highest val_sharpe in the system — are locked out
+    of the review pool forever, and the refine path (#92) that would generate
+    new evidence can never fire (chicken-and-egg deadlock).
+
+    Bypass criteria (all must hold):
+    * family_type == "cross"
+    * has ``last_manifest_spec`` (required for #92 cross-family refine)
+    * ``refine_count < REFINE_CAP`` (can still be refined)
+    * no ``diag_error_permanent`` (structurally undiagnosable)
+    * has at least one evidence entry (near_miss or rejected) for this family
+    * ``last_bypass_refine_count`` != current ``refine_count`` (anti-loop:
+      the previous diagnosis was already a bypass at the same refine_count,
+      so re-selecting would create an infinite loop — cf. issue #89)
+    """
+    if family.get("family_type") != "cross":
+        return False
+    if not family.get("last_manifest_spec"):
+        return False
+    refine_count = family.get("refine_count", 0)
+    if refine_count >= REFINE_CAP:
+        return False
+    if family_review.get("diag_error_permanent"):
+        return False
+    # Anti-loop: if the last bypass was at the same refine_count, the family
+    # was already diagnosed via bypass and nothing has changed since (no
+    # refine happened to increment refine_count). Do not re-select.
+    last_bypass_rc = family_review.get("last_bypass_refine_count")
+    if last_bypass_rc is not None and last_bypass_rc == refine_count:
+        return False
+    # Must have at least one evidence entry (the bypass admits families whose
+    # evidence is stale, not families with no evidence at all).
+    has_any_evidence = False
+    for entry in knowledge.get("near_misses_cross", []):
+        strategy = entry.get("strategy", "")
+        symbol = entry.get("symbol", "")
+        ft = _derive_family_type(entry)
+        if _family_key(strategy, symbol, ft) == family_key:
+            has_any_evidence = True
+            break
+    if not has_any_evidence:
+        for entry in knowledge.get("rejected", []):
+            hyp = entry.get("hypothesis", {})
+            strategy = hyp.get("strategy", "")
+            symbol = hyp.get("symbol", "")
+            ft = _derive_family_type(hyp)
+            if _family_key(strategy, symbol, ft) == family_key:
+                has_any_evidence = True
+                break
+    return has_any_evidence
+
+
 def _family_has_new_evidence(family_key, knowledge):
     """Check if family has rejected/near-miss entries after its own last diagnosis.
 
@@ -188,17 +245,23 @@ def _family_has_new_evidence(family_key, knowledge):
       (``last_diag_error_at``) makes the family ineligible until new
       evidence arrives — this preserves the backoff the old global
       watermark provided implicitly.
+
+    Cross-family bypass (issue #112): cross-sectional families are one-shot
+    and can never accumulate new evidence after their first diagnosis. If
+    they have a persisted manifest spec and haven't exhausted refine
+    attempts, they bypass the evidence-age check so that refine (which
+    generates new evidence) can fire. See _cross_family_bypass_eligible.
     """
     review_state = knowledge.get("review_state", {})
     reviewed = review_state.get("reviewed", {})
     family_review = reviewed.get(family_key, {})
     last_diagnosed = family_review.get("last_diagnosed_at", "1970-01-01T00:00:00")
 
-    # Collect all evidence timestamps for this family
-    timestamps = []
-
     family = knowledge.get("families", {}).get(family_key, {})
     family_type = family.get("family_type", "single")
+
+    # Collect all evidence timestamps for this family
+    timestamps = []
 
     for entry in knowledge.get("rejected", []):
         hyp = entry.get("hypothesis", {})
@@ -242,7 +305,24 @@ def _family_has_new_evidence(family_key, knowledge):
     if last_diag_error and last_diag_error >= newest_failure:
         return False
 
-    return newest_failure > last_diagnosed
+    if newest_failure > last_diagnosed:
+        return True
+
+    # Issue #112: cross-family bypass. Cross families are one-shot and
+    # permanently fail the evidence-age check above. Allow them through if
+    # they can be refined (has manifest spec, under cap, not already bypassed
+    # at this refine_count). The bypass lets refine generate the new evidence
+    # that the normal gate requires — breaking the chicken-and-egg deadlock.
+    if _cross_family_bypass_eligible(family_key, family, family_review, knowledge):
+        # Stamp the anti-loop marker so the next call at the same
+        # refine_count won't re-select. Cleared automatically when
+        # refine_count increments (via apply_verdict) or when a successful
+        # diagnosis updates last_diagnosed_at past the evidence timestamp.
+        reviewed_entry = review_state.setdefault("reviewed", {}).setdefault(family_key, {})
+        reviewed_entry["last_bypass_refine_count"] = family.get("refine_count", 0)
+        return True
+
+    return False
 
 
 def _adopted_family_keys(knowledge):
