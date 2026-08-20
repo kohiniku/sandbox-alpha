@@ -8,6 +8,7 @@ reports to an LLM judge for refine/keep/kill verdicts, and applies
 those verdicts mechanically.
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -34,12 +35,67 @@ from backlog import Backlog, _new_entry as _bl_new_entry
 
 # Minimum trials before a family can be killed
 MIN_TRIALS_FOR_KILL = 3
-# Cross families cannot be refined (no manifest spec persisted) and only gain
-# trials through new ideation proposals of the exact same strategy+universe
-# hash, which is rare. Requiring MIN_TRIALS_FOR_KILL trials for them makes
-# kill verdicts permanently unreachable (issue #75) — one failed trial is
-# sufficient evidence to trust a kill verdict for a cross family.
+# Cross families only gain trials through new ideation proposals of the exact
+# same strategy+universe hash, which is rare. Requiring MIN_TRIALS_FOR_KILL
+# trials for them makes kill verdicts permanently unreachable (issue #75) —
+# one failed trial is sufficient evidence to trust a kill verdict for a cross
+# family.
 MIN_TRIALS_FOR_KILL_CROSS = 1
+
+# Issue #92: cross-family refine support. refine_proposal.params from the LLM
+# judge refer to the manifest's top-level knobs (universe_size,
+# execution_mode, primary_metric) and evaluator.extras keys (e.g. cost_bps).
+# These are the only top-level fields a refine may override; identity and code
+# fields are never touched — the judge proposes parameter changes, not code
+# rewrites.
+MANIFEST_REFINABLE_TOP_LEVEL = frozenset({
+    "universe_size",      # informational: runner derives size from data_sources
+    "execution_mode",     # routed by manifest_runner (structured/expert)
+    "primary_metric",     # informational: evaluator config is authoritative
+})
+MANIFEST_PROTECTED_FIELDS = frozenset({
+    "name", "code_b64", "logic_spec", "data_sources",
+    "model_artifacts", "compute", "evaluator",
+})
+
+
+def _mutate_manifest_spec(last_spec, params):
+    """Build a mutated manifest spec for cross-family refinement (issue #92).
+
+    refine params are merged at the manifest top level for
+    MANIFEST_REFINABLE_TOP_LEVEL fields; any other key is applied under
+    evaluator.extras (e.g. cost_bps). code_b64/logic_spec and the identity
+    fields are never modified.
+
+    Returns (mutated_spec, None) on success, (None, error_msg) on failure.
+    """
+    if not isinstance(last_spec, dict):
+        return None, "last_manifest_spec is not a dict"
+    if not isinstance(params, dict) or not params:
+        return None, "refine_proposal.params is empty"
+    protected = set(params) & MANIFEST_PROTECTED_FIELDS
+    if protected:
+        return None, (
+            f"refine params must not override protected manifest fields: "
+            f"{sorted(protected)}"
+        )
+
+    mutated = copy.deepcopy(last_spec)
+    extras = {}
+    for k, v in params.items():
+        if k in MANIFEST_REFINABLE_TOP_LEVEL:
+            mutated[k] = v
+        else:
+            extras[k] = v
+    if extras:
+        evaluator = mutated.get("evaluator")
+        if not isinstance(evaluator, dict):
+            return None, "manifest evaluator is not a dict"
+        eval_extras = evaluator.setdefault("extras", {})
+        if not isinstance(eval_extras, dict):
+            return None, "manifest evaluator.extras is not a dict"
+        eval_extras.update(extras)
+    return mutated, None
 
 # Codegen families (execution_mode=code proposals) carry no params, their
 # code payload is not persisted in knowledge.json, and the runner has no
@@ -114,6 +170,63 @@ def _get_entry_timestamp(entry):
     return entry.get("tested_at") or entry.get("date", "")
 
 
+def _cross_family_bypass_eligible(family_key, family, family_review, knowledge):
+    """Check if a cross family qualifies for the evidence-gate bypass (issue #112).
+
+    Cross-sectional families are structurally one-shot: they get exactly one
+    trial from ideation, and after that single diagnosis their newest evidence
+    is permanently older than ``last_diagnosed_at``. Without a bypass, these
+    families — including the highest val_sharpe in the system — are locked out
+    of the review pool forever, and the refine path (#92) that would generate
+    new evidence can never fire (chicken-and-egg deadlock).
+
+    Bypass criteria (all must hold):
+    * family_type == "cross"
+    * has ``last_manifest_spec`` (required for #92 cross-family refine)
+    * ``refine_count < REFINE_CAP`` (can still be refined)
+    * no ``diag_error_permanent`` (structurally undiagnosable)
+    * has at least one evidence entry (near_miss or rejected) for this family
+    * ``last_bypass_refine_count`` != current ``refine_count`` (anti-loop:
+      the previous diagnosis was already a bypass at the same refine_count,
+      so re-selecting would create an infinite loop — cf. issue #89)
+    """
+    if family.get("family_type") != "cross":
+        return False
+    if not family.get("last_manifest_spec"):
+        return False
+    refine_count = family.get("refine_count", 0)
+    if refine_count >= REFINE_CAP:
+        return False
+    if family_review.get("diag_error_permanent"):
+        return False
+    # Anti-loop: if the last bypass was at the same refine_count, the family
+    # was already diagnosed via bypass and nothing has changed since (no
+    # refine happened to increment refine_count). Do not re-select.
+    last_bypass_rc = family_review.get("last_bypass_refine_count")
+    if last_bypass_rc is not None and last_bypass_rc == refine_count:
+        return False
+    # Must have at least one evidence entry (the bypass admits families whose
+    # evidence is stale, not families with no evidence at all).
+    has_any_evidence = False
+    for entry in knowledge.get("near_misses_cross", []):
+        strategy = entry.get("strategy", "")
+        symbol = entry.get("symbol", "")
+        ft = _derive_family_type(entry)
+        if _family_key(strategy, symbol, ft) == family_key:
+            has_any_evidence = True
+            break
+    if not has_any_evidence:
+        for entry in knowledge.get("rejected", []):
+            hyp = entry.get("hypothesis", {})
+            strategy = hyp.get("strategy", "")
+            symbol = hyp.get("symbol", "")
+            ft = _derive_family_type(hyp)
+            if _family_key(strategy, symbol, ft) == family_key:
+                has_any_evidence = True
+                break
+    return has_any_evidence
+
+
 def _family_has_new_evidence(family_key, knowledge):
     """Check if family has rejected/near-miss entries after its own last diagnosis.
 
@@ -132,17 +245,23 @@ def _family_has_new_evidence(family_key, knowledge):
       (``last_diag_error_at``) makes the family ineligible until new
       evidence arrives — this preserves the backoff the old global
       watermark provided implicitly.
+
+    Cross-family bypass (issue #112): cross-sectional families are one-shot
+    and can never accumulate new evidence after their first diagnosis. If
+    they have a persisted manifest spec and haven't exhausted refine
+    attempts, they bypass the evidence-age check so that refine (which
+    generates new evidence) can fire. See _cross_family_bypass_eligible.
     """
     review_state = knowledge.get("review_state", {})
     reviewed = review_state.get("reviewed", {})
     family_review = reviewed.get(family_key, {})
     last_diagnosed = family_review.get("last_diagnosed_at", "1970-01-01T00:00:00")
 
-    # Collect all evidence timestamps for this family
-    timestamps = []
-
     family = knowledge.get("families", {}).get(family_key, {})
     family_type = family.get("family_type", "single")
+
+    # Collect all evidence timestamps for this family
+    timestamps = []
 
     for entry in knowledge.get("rejected", []):
         hyp = entry.get("hypothesis", {})
@@ -186,7 +305,49 @@ def _family_has_new_evidence(family_key, knowledge):
     if last_diag_error and last_diag_error >= newest_failure:
         return False
 
-    return newest_failure > last_diagnosed
+    if newest_failure > last_diagnosed:
+        return True
+
+    # Issue #112: cross-family bypass. Cross families are one-shot and
+    # permanently fail the evidence-age check above. Allow them through if
+    # they can be refined (has manifest spec, under cap, not already bypassed
+    # at this refine_count). The bypass lets refine generate the new evidence
+    # that the normal gate requires — breaking the chicken-and-egg deadlock.
+    if _cross_family_bypass_eligible(family_key, family, family_review, knowledge):
+        # Stamp the anti-loop marker so the next call at the same
+        # refine_count won't re-select. Cleared automatically when
+        # refine_count increments (via apply_verdict) or when a successful
+        # diagnosis updates last_diagnosed_at past the evidence timestamp.
+        reviewed_entry = review_state.setdefault("reviewed", {}).setdefault(family_key, {})
+        reviewed_entry["last_bypass_refine_count"] = family.get("refine_count", 0)
+        return True
+
+    return False
+
+
+def _adopted_family_keys(knowledge):
+    """Family keys that currently have an adopted member (issue #97).
+
+    Adoption and the review/kill lifecycle are two state machines over the
+    same families. An adopted member passed all adoption gates (validation,
+    deflation, holdout), so the family must never be killed — KILLED_SKIP
+    would poison the adopted parameter cluster forever. Prefer the
+    ``family_key`` field stamped on adopted records at creation
+    (autonomous_loop.py); fall back to deriving from hypothesis
+    ``{strategy, symbol}`` for legacy records (pre-#97 backfill).
+    """
+    keys = set()
+    for entry in knowledge.get("adopted", []):
+        fk = entry.get("family_key")
+        if fk:
+            keys.add(fk)
+            continue
+        hyp = entry.get("hypothesis") or {}
+        strategy = hyp.get("strategy", "")
+        symbol = hyp.get("symbol", "")
+        if strategy and symbol:
+            keys.add(_family_key(strategy, symbol, _derive_family_type(hyp)))
+    return keys
 
 
 def select_candidates(knowledge, now, max_families=None):
@@ -205,6 +366,12 @@ def select_candidates(knowledge, now, max_families=None):
     near_set = set()
     candidate_set = set()
 
+    # Issue #97: families with an adopted member are immune to re-review.
+    # A kill verdict on them would apply lifecycle=KILLED and KILLED_SKIP
+    # would permanently poison the adopted parameter cluster, even though
+    # the adopted member passed all adoption gates.
+    adopted_keys = _adopted_family_keys(knowledge)
+
     # Collect families from near_misses and near_misses_cross
     for list_name in ("near_misses", "near_misses_cross"):
         for entry in knowledge.get(list_name, []):
@@ -212,7 +379,7 @@ def select_candidates(knowledge, now, max_families=None):
             symbol = entry.get("symbol", "")
             ft = _derive_family_type(entry)
             key = _family_key(strategy, symbol, ft)
-            if key in families:
+            if key in families and key not in adopted_keys:
                 fam = families[key]
                 if fam.get("lifecycle") != FamilyLifecycle.KILLED:
                     near_set.add(key)
@@ -224,7 +391,7 @@ def select_candidates(knowledge, now, max_families=None):
         symbol = hyp.get("symbol", "")
         ft = _derive_family_type(hyp)
         key = _family_key(strategy, symbol, ft)
-        if key in families:
+        if key in families and key not in adopted_keys:
             fam = families[key]
             if fam.get("lifecycle") != FamilyLifecycle.KILLED:
                 candidate_set.add(key)
@@ -834,6 +1001,24 @@ def _build_judge_prompt(report, family, knowledge):
     else:
         schema_section = ""
 
+    # Issue #92: cross families refine manifest knobs, not strategy hyperparams.
+    # Tell the judge what refine_proposal.params means for them so it does not
+    # propose single-style logic hyperparams (or code rewrites) that the
+    # manifest-refine path cannot execute.
+    if family_type == "cross":
+        manifest_note = (
+            "\n=== CROSS-SECTIONAL (manifest) FAMILY ===\n"
+            "This family runs a full strategy manifest (code_b64/logic_spec + "
+            "data_sources + evaluator). refine_proposal.params refer to the "
+            "manifest's top-level knobs: universe_size, execution_mode "
+            "(structured|expert), primary_metric, and evaluator.extras keys "
+            "(e.g. cost_bps). Do NOT propose strategy-code changes "
+            "(code_b64/logic_spec are never rewritten); only parameter-level "
+            "changes are executable.\n"
+        )
+    else:
+        manifest_note = ""
+
     user_prompt = f"""Diagnosis report for family: {family_key}
 
 Family aggregates:
@@ -846,8 +1031,7 @@ Diagnosis:
   {cost_free_block}
 
 {near_miss_block}
-{schema_section}
-Rules:
+{schema_section}{manifest_note}Rules:
 - All arithmetic is precomputed — do not recompute anything.
 - Flags are ground truth. If a flag is active, it is real.
 - Choose exactly one verdict: refine, keep, or kill.
@@ -947,6 +1131,16 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
             final_rationale = rationale + " (格下げ: 試行数不足で証拠不十分)"
             applied_verdict = "keep"
             print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+        elif family_key in _adopted_family_keys(knowledge):
+            # Issue #97: never kill a family that currently has an adopted
+            # member — the adopted variant passed every adoption gate, and
+            # lifecycle=KILLED would poison it via KILLED_SKIP forever.
+            # Downgrade to keep and record the blocked attempt loudly.
+            final_rationale = rationale + " (格下げ: 採用済みfamilyはkill不可)"
+            applied_verdict = "keep"
+            family["kill_blocked_by_adoption"] = now_iso
+            print(f"REVIEW_KILL_BLOCKED_ADOPTED {family_key} rationale=\"{rationale}\"")
+            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         else:
             family["lifecycle"] = FamilyLifecycle.KILLED
             family["kill_reason"] = "自動判定: " + rationale
@@ -954,10 +1148,66 @@ def apply_verdict(family_key, verdict_dict, knowledge, backlog):
 
     elif llm_verdict == "refine":
         if family_type == "cross":
-            # Cross families cannot be refined (no manifest spec persisted)
-            final_rationale = rationale + " (格下げ: crossファミリーはrefine不可)"
-            applied_verdict = "keep"
-            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+            # Issue #92: cross families CAN be refined when the consumed
+            # manifest body was persisted (last_manifest_spec). The mutated
+            # manifest is queued as a "manifest" backlog entry, mirroring the
+            # single-family param-refine flow. Pre-fix families (no spec)
+            # cannot be re-proposed — downgrade with an explicit reason.
+            last_spec = family.get("last_manifest_spec")
+            if not last_spec:
+                final_rationale = rationale + " (格下げ: 元manifest未保存のためrefine不可)"
+                applied_verdict = "keep"
+                print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+            else:
+                refine_count = family.get("refine_count", 0)
+                if refine_count >= REFINE_CAP:
+                    if family_key in _adopted_family_keys(knowledge):
+                        # Issue #97: same guard as the LLM kill branch — an
+                        # adopted member makes the family unkillable.
+                        final_rationale = "refine回数上限に到達 (格下げ: 採用済みfamilyはkill不可)"
+                        applied_verdict = "keep"
+                        family["kill_blocked_by_adoption"] = now_iso
+                        print(f"REVIEW_KILL_BLOCKED_ADOPTED {family_key} rationale=\"refine cap exhausted\"")
+                        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+                    else:
+                        # Auto-kill: refine cap exhausted (same as single families)
+                        family["lifecycle"] = FamilyLifecycle.KILLED
+                        family["kill_reason"] = "自動判定: refine回数上限に到達"
+                        applied_verdict = "kill"
+                        final_rationale = "refine回数上限に到達"
+                        print(f"REVIEW_VERDICT {family_key} verdict=kill rationale=\"refine cap exhausted\"")
+                else:
+                    # Build the mutated manifest from the persisted spec.
+                    refine_proposal = verdict_dict.get("refine_proposal") or {}
+                    params = refine_proposal.get("params", {})
+                    change_summary = refine_proposal.get("change_summary", "")
+
+                    mutated, mutate_err = _mutate_manifest_spec(last_spec, params)
+                    if mutate_err is not None:
+                        final_rationale = rationale + f" (格下げ: refine提案のパラメータ不正: {mutate_err})"
+                        applied_verdict = "keep"
+                        print(f"REVIEW_REFINE_INVALID_PARAMS {family_key} error=\"{mutate_err}\"")
+                        print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
+                    else:
+                        backlog_entry = _bl_new_entry(
+                            "manifest",
+                            0.95,
+                            {"kind": "review_refine", "ref": family_key},
+                            mutated,
+                            {"extra_criteria": []},
+                        )
+                        backlog_entry["created_at"] = now_iso
+                        accepted, eid = backlog.add_entry(backlog_entry)
+
+                        if accepted:
+                            family["refine_count"] = refine_count + 1
+                            family["lifecycle"] = FamilyLifecycle.REFINING
+                            print(f"REVIEW_VERDICT {family_key} verdict=refine rationale=\"{rationale}\"")
+                        else:
+                            final_rationale = rationale + " (refine重複 — 既にキュー済み)"
+                            applied_verdict = "keep"
+                            print(f"REVIEW_REFINE_DUPLICATE {family_key}")
+                            print(f"REVIEW_VERDICT {family_key} verdict=keep rationale=\"{final_rationale}\"")
         elif _is_codegen_family(family_key):
             # codegen families cannot be refined: no params exist and the
             # runner has no codegen schema on /run, so a param backlog entry

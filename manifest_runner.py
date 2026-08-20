@@ -29,12 +29,39 @@ import base64
 import inspect
 import io
 import json
+import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Engine version handshake (issue #101)
+# ---------------------------------------------------------------------------
+# The Dockerfile bakes the sandbox-alpha git SHA into /backtest/git_rev at
+# build time.  This lets the loop detect when the deployed engine image
+# lags behind main (merged fixes not present in production).
+_GIT_REV_PATH = os.environ.get("ENGINE_GIT_REV_PATH", "/backtest/git_rev")
+
+
+def _engine_git_rev() -> str:
+    """Return the engine's git revision (baked at image build time).
+
+    Returns 'unknown' if the file is absent (e.g. running outside the
+    container, or image built without --build-arg GIT_REV).
+    """
+    try:
+        return Path(_GIT_REV_PATH).read_text().strip()
+    except Exception:
+        return "unknown"
+
+
+def _inject_engine_rev(result: Dict[str, Any]) -> None:
+    """Inject engine_git_rev into a result dict (mutates in-place)."""
+    result["engine_git_rev"] = _engine_git_rev()
 
 from manifest import (
     OhlcvSource, NewsSentimentSource, InsiderSource, MacroSource, Sec13FSource,
@@ -132,6 +159,7 @@ def _error_json(error_type: str, error: str, tb: Optional[str] = None,
         "status": "error",
         "error_type": error_type,
         "error": error,
+        "engine_git_rev": _engine_git_rev(),
     }
     if tb:
         out["traceback"] = tb
@@ -1147,6 +1175,7 @@ def _run_structured_mode(
             "train_end": train_end.isoformat(),
             "val_end": val_end.isoformat(),
         },
+        "engine_git_rev": _engine_git_rev(),
     }
     if benchmark_warning:
         result["warning"] = benchmark_warning
@@ -1313,6 +1342,7 @@ def _run_dsl_mode(
             "train_end": train_end.isoformat(),
             "val_end": val_end.isoformat(),
         },
+        "engine_git_rev": _engine_git_rev(),
     }
     if benchmark_warning:
         result["warning"] = benchmark_warning
@@ -1411,6 +1441,7 @@ def _run_expert_mode(
                 "train_end": train_end.isoformat(),
                 "val_end": val_end.isoformat(),
             },
+            "engine_git_rev": _engine_git_rev(),
         }
         if extras_dg:
             out_early["expert_extras"] = extras_dg
@@ -1665,6 +1696,7 @@ def _run_expert_mode(
             "train_end": train_end.isoformat(),
             "val_end": val_end.isoformat(),
         },
+        "engine_git_rev": _engine_git_rev(),
     }
     if extras:
         out["expert_extras"] = extras
@@ -1793,10 +1825,12 @@ def _validate_manifest_synthetic(manifest):
                 warnings = [f"run() metric '{k}' is not finite on synthetic data" for k in nf]
                 return json.dumps({"valid": True, "warnings": warnings})
         else:
-            fn = sandbox.get("generate_weights") or sandbox.get("generate_signals")
+            fn = (sandbox.get("generate_weights")
+                  or sandbox.get("generate_signals")
+                  or sandbox.get("generate_cross_signal"))
             if not callable(fn):
                 return json.dumps({"valid": False, "error_type": "code",
-                                   "error": "structured mode requires def generate_signals(data) or def generate_weights(data)"})
+                                   "error": "structured mode requires def generate_signals(data), generate_weights(data), or generate_cross_signal(data, extras)"})
             _out = fn(data)
             # Basic shape check
             if _out is None:

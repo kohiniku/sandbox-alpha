@@ -237,13 +237,26 @@ def load_knowledge():
     # near_misses_cross alongside without touching the existing data.
     data.setdefault("near_misses_cross", [])
 
+    # Migration (issue #97): backfill family_key on adopted records that
+    # predate the join key, so the review loop's adoption guard works for
+    # existing adoptions without manual data surgery.
+    for entry in data.get("adopted", []):
+        if not entry.get("family_key"):
+            hyp = entry.get("hypothesis") or {}
+            strategy = hyp.get("strategy", "")
+            symbol = hyp.get("symbol", "")
+            if strategy and symbol:
+                entry["family_key"] = _family_key(
+                    strategy, symbol, _derive_family_type(hyp)
+                )
+
     # Migration: add lifecycle fields to families that lack them.
     for fam in data.get("families", {}).values():
         if "lifecycle" not in fam:
             fam["lifecycle"] = FamilyLifecycle.CANDIDATE
             fam["refine_count"] = 0
             fam["kill_reason"] = ""
-        
+
         # Migration: add param_clusters and distinct_clusters for issue #66 fix
         if "param_clusters" not in fam:
             fam["param_clusters"] = []
@@ -409,6 +422,12 @@ def update_family_aggregates(knowledge, record):
         return
     families = knowledge.setdefault("families", {})
     _apply_entry_to_family(families, key, record, hyp, _derive_family_type(hyp))
+    # Issue #92: persist the full consumed manifest body on cross families so
+    # the review loop can refine them. Same timing as the best_params update
+    # above. Pre-fix family records simply lack this key and fall back to the
+    # legacy keep-downgrade path in apply_verdict.
+    if _derive_family_type(hyp) == "cross" and record.get("manifest_spec"):
+        families[key]["last_manifest_spec"] = record["manifest_spec"]
 
 
 def _check_exhausted_cluster(hypothesis, knowledge):
@@ -687,6 +706,49 @@ def _run_backtest_subprocess(strategy, symbol, params, metrics_since=None):
 # ---------------------------------------------------------------------------
 # Shared evaluation gate helpers (used by evaluate_result + _evaluate_manifest_result)
 # ---------------------------------------------------------------------------
+
+
+def _local_git_head():
+    """Return the current git HEAD SHA of the sandbox-alpha checkout.
+    
+    Returns None if not in a git repo or git command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _check_engine_drift(result: dict):
+    """Check if deployed engine image lags behind local checkout.
+    
+    Returns a warning message if drift detected, None otherwise.
+    The warning includes both SHAs (short form) for easy comparison.
+    """
+    engine_rev = result.get("engine_git_rev")
+    if not engine_rev or engine_rev == "unknown":
+        return None
+    
+    local_rev = _local_git_head()
+    if not local_rev:
+        return None
+    
+    if engine_rev != local_rev:
+        return (
+            f"⚠️ ENGINE DRIFT: deployed engine is {engine_rev[:12]}, "
+            f"but local checkout is {local_rev[:12]} — "
+            f"merged fixes may not be present in production (issue #101)"
+        )
+    return None
 
 
 def _triage_eval_error(result):
@@ -1461,6 +1523,11 @@ def _classify_runner_response(status, response_body):
         return {"error": "Malformed runner response (not a dict)",
                 "error_type": "infra"}, False
 
+    # Engine version drift check (issue #101) — emit warning if present
+    drift_msg = _check_engine_drift(parsed)
+    if drift_msg:
+        print(drift_msg)
+
     if parsed.get("status") == "error":
         # Table: runner error_type -> our classification
         # 'manifest'/'code' → agent's fault (code_error, do not retry as infra)
@@ -1556,7 +1623,22 @@ def _consume_manifest_entry(entry, spec, runner_url, bl):
     }
 
     url = f"{runner_url.rstrip('/')}/run_manifest"
-    body = json.dumps(manifest_spec).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99). The backlog entry keeps logic_spec as
+    # the canonical form; the prepared copy is what goes on the wire.
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_spec)
+    if prepared is None:
+        err_text = str(prep_err or "unknown")
+        print(f"  🚫 マニフェスト '{manifest_name}': runnerペイロード準備失敗 — {err_text}")
+        bl.mark(entry["id"], BacklogStatus.DONE_ERROR, {
+            "verdict": Verdict.CODE_ERROR,
+            "error": err_text[:200],
+            "summary": f"runnerペイロード準備失敗: {err_text[:180]}",
+            "finished_at": datetime.now().isoformat(),
+        })
+        return None
+    body = json.dumps(prepared).encode("utf-8")
 
     print(f"  🔬 マニフェスト実行中 (sandbox): {manifest_name} on {universe_size} symbols...")
     result, _ = _http_post_for_result(url, body, 300)
@@ -1882,6 +1964,13 @@ def run_loop(num_iterations=3):
             record = save_result(hypothesis, result, verdict, evaluation)
             # Add source attribution from backlog entry
             record["source"] = entry_bk.get("source", {})
+            # Issue #92: persist the consumed manifest body on EVERY manifest
+            # trial (adopted and rejected alike) so the review loop can refine
+            # cross families. The family record otherwise only keeps the
+            # trimmed universe_size/execution_mode/primary_metric values,
+            # which is not enough to re-propose a mutated manifest.
+            if entry_bk.get("type") == "manifest":
+                record["manifest_spec"] = entry_bk.get("spec", {})
 
             if verdict in ("error", "code_error"):
                 knowledge.setdefault("errors", []).append(record)
@@ -1901,6 +1990,13 @@ def run_loop(num_iterations=3):
                         "symbol": _bk_spec.get("symbol"),
                         "code": _bk_spec.get("code"),
                     }
+                # Issue #97: join key so the review loop can tell that this
+                # family has an adopted member and must not be killed.
+                record["family_key"] = _family_key(
+                    hypothesis.get("strategy", ""),
+                    hypothesis.get("symbol", ""),
+                    _derive_family_type(hypothesis),
+                )
                 knowledge["adopted"].append(record)
             else:
                 _record_near_miss(hypothesis, evaluation, knowledge)
@@ -1995,6 +2091,13 @@ def run_loop(num_iterations=3):
                 knowledge["errors"] = knowledge["errors"][-100:]
         elif verdict == Verdict.ADOPTED:
             record["cluster_id"] = evaluation.get("cluster_id", "unknown")
+            # Issue #97: join key so the review loop can tell that this
+            # family has an adopted member and must not be killed.
+            record["family_key"] = _family_key(
+                hypothesis.get("strategy", ""),
+                hypothesis.get("symbol", ""),
+                _derive_family_type(hypothesis),
+            )
             knowledge["adopted"].append(record)
         else:
             _record_near_miss(hypothesis, evaluation, knowledge)

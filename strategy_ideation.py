@@ -1392,11 +1392,27 @@ Return ONLY this JSON:
     raise RuntimeError(f"select failed after 2 attempts: {last_err}")
 
 
-def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report, selection_reasoning, final_proposals, fallback_used=False):
-    """Save full audit trail to ideation_logs/<UTC timestamp>.json."""
+def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report, selection_reasoning, final_proposals, fallback_used=False, n_accepted=None, proposal_outcomes=None):
+    """Save full audit trail to ideation_logs/<UTC timestamp>.json.
+
+    Issue #100: ``n_accepted`` (entries actually added to the backlog) and
+    ``proposal_outcomes`` are persisted alongside ``n_proposed`` (which counts
+    proposals BEFORE preflight/dedup drops them) so readers can distinguish
+    "proposed" from "actually entered the backlog".
+    """
     _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log_path = _IDEATION_LOG_DIR / f"{timestamp}.json"
+
+    stage3 = {
+        "reasoning": selection_reasoning,
+        "n_proposed": len(final_proposals),
+        "fallback_used": fallback_used,
+    }
+    if n_accepted is not None:
+        stage3["n_accepted"] = n_accepted
+    if proposal_outcomes is not None:
+        stage3["proposals"] = proposal_outcomes
 
     log = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1409,11 +1425,7 @@ def _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report
             "quant_report": quant_report,
             "judge_report": judge_report,
         },
-        "stage3_selection": {
-            "reasoning": selection_reasoning,
-            "n_proposed": len(final_proposals),
-            "fallback_used": fallback_used,
-        },
+        "stage3_selection": stage3,
         "final_proposals": final_proposals,
     }
 
@@ -1500,11 +1512,24 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
     pf_fixed = 0
     pf_dropped = 0
     pf_skipped = 0
+    # Issue #100: per-proposal preflight fate, persisted to the ideation log.
+    proposal_outcomes = []
+
+    def _record_outcome(i, p, status, accepted_flag, reason=""):
+        proposal_outcomes.append({
+            "index": i,
+            "type": p.get("type", "?"),
+            "name": p.get("spec", {}).get("name", p.get("spec", {}).get("strategy", "?")),
+            "preflight_status": status,
+            "accepted": accepted_flag,
+            "reason": reason,
+        })
 
     for i, p in enumerate(proposals):
         ok, reason = _validate_proposal(p, templates)
         if not ok:
             print(f"  ⚠️  Proposal {i+1} dropped: {reason}")
+            _record_outcome(i, p, "validation_failed", False, reason or "")
             continue
 
         ptype = p["type"]
@@ -1551,6 +1576,7 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
                     pf_dropped += 1
                     print(f"  🚫 Proposal {i+1} ({spec_context}): DROPPED — preflight failed after {_MAX_PREFLIGHT_FIX_ATTEMPTS} fix attempts")
                     print(f"     Last error: {error_msg}")
+                    _record_outcome(i, p, "preflight_failed", False, error_msg)
                     continue
 
         entry = {
@@ -1568,6 +1594,7 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
         if dry_run:
             entry["id"] = f"dry_{i}"
             accepted.append(entry)
+            _record_outcome(i, p, "passed", True)
             spec = entry["spec"]
             if ptype == "param":
                 desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
@@ -1579,6 +1606,7 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
             if ok_add:
                 accepted.append(entry)
                 entry["id"] = result_id
+                _record_outcome(i, p, "passed", True)
                 spec = entry["spec"]
                 if ptype == "param":
                     desc = f"{spec['strategy']}/{spec['symbol']} params={json.dumps(spec['params'])}"
@@ -1586,6 +1614,7 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
                     desc = f"{spec.get('name','?')}/{spec.get('symbol','?')}"
                 print(f"  ✅ {ptype} | {desc} | priority={entry['priority']:.2f} | src={entry['source']['ref']}")
             else:
+                _record_outcome(i, p, "duplicate", False, f"duplicate of entry {result_id}")
                 print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
 
     # ── Observability ──
@@ -1596,14 +1625,18 @@ def _run_ideation_v2(knowledge, templates, research_docs, backlog, max_proposals
     try:
         _save_ideation_log(brainstorm_ideas, risk_report, quant_report, judge_report,
                           f"Selected {len(proposals)} from {n_survived} survivors", proposals,
-                          fallback_used=select_fallback_used)
+                          fallback_used=select_fallback_used,
+                          n_accepted=len(accepted), proposal_outcomes=proposal_outcomes)
     except Exception as e:
         print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
 
     # ── Summary ──
     n_survived = sum(1 for r in debate_results if r.get("survive"))
     n_accepted = len(accepted)
-    print(f"IDEATION_V2 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={n_accepted}")
+    print(f"IDEATION_V2 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={len(proposals)} accepted={n_accepted}")
+    # Issue #100: machine-readable marker for full-issuance-failure cycles.
+    if len(proposals) > 0 and n_accepted == 0:
+        print("ISSUANCE_FULL_FAILURE proposed=%d accepted=0" % len(proposals))
     n_code = sum(1 for p in proposals if p.get("type") == "code")
     if n_code > 0:
         print(f"PREFLIGHT passed={pf_passed} fixed={pf_fixed} dropped={pf_dropped} skipped={pf_skipped}")
@@ -1948,7 +1981,14 @@ def _preflight_manifest(manifest_dict):
     if not runner_url:
         return None, "skipped"
 
-    payload = json.dumps(manifest_dict).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99). The manifest dict keeps logic_spec as
+    # the canonical form; the prepared copy is what goes on the wire.
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_dict)
+    if prepared is None:
+        return False, f"runner payload prep failed: {prep_err}"
+    payload = json.dumps(prepared).encode("utf-8")
     try:
         req = urllib.request.Request(
             f"{runner_url}/run_manifest",
@@ -1974,12 +2014,37 @@ def _syntax_preflight_manifest(manifest_dict):
     skipped for cost). Catches SyntaxError before backlog investment so the
     validation loop doesn't waste an iteration compiling broken code.
 
+    DSL-aware (issue #99): a structured manifest carrying logic_spec (and no
+    code_b64) is compiled deterministically via
+    strategy_dsl.compile_logic_spec_to_code and the compiled source is
+    syntax-checked.  Pre-fix, every logic_spec manifest failed here with
+    "empty code_b64" and was dropped — the ideation prompt instructs the LLM
+    to prefer logic_spec, so that dropped 100% of DSL proposals.  The
+    manifest dict is NOT mutated: the backlog entry keeps logic_spec as the
+    canonical form; compilation is re-applied at every runner-facing POST.
+
     Returns (valid: bool, error_msg: str, source: str). Source is the
     decoded Python string (empty if decoding failed) — callers use it to
     request an LLM fix.
     """
     code_b64 = manifest_dict.get("code_b64", "")
     if not code_b64:
+        logic_spec = manifest_dict.get("logic_spec")
+        if logic_spec is not None:
+            # DSL path: compile deterministically, then syntax-check.
+            from strategy_dsl import compile_logic_spec_to_code, DslExecutionError
+            try:
+                source = compile_logic_spec_to_code(
+                    logic_spec, name=manifest_dict.get("name", "dsl_strategy"))
+            except DslExecutionError as e:
+                return False, f"logic_spec compile failed: {e}", ""
+            except Exception as e:
+                return False, f"logic_spec compile failed: {type(e).__name__}: {e}", ""
+            try:
+                compile(source, f"<manifest:{manifest_dict.get('name', '?')}>", "exec")
+            except SyntaxError as e:
+                return False, f"SyntaxError line {e.lineno}: {e.msg}", source
+            return True, "", source
         return False, "empty code_b64", ""
     try:
         source = base64.b64decode(code_b64).decode("utf-8", errors="replace")
@@ -2051,7 +2116,13 @@ def _runtime_preflight_manifest(manifest_dict):
     runner_url = _get_ideation_config()["runner_url"]
     if not runner_url:
         return None, "skipped (runner unreachable)", ""
-    payload = json.dumps(manifest_dict).encode("utf-8")
+    # Runner validates code_b64 only (no logic_spec support) — compile DSL to
+    # code before sending (issue #99).
+    from strategy_dsl import prepare_spec_for_runner
+    prepared, prep_err = prepare_spec_for_runner(manifest_dict)
+    if prepared is None:
+        return False, f"runner payload prep failed: {prep_err}", ""
+    payload = json.dumps(prepared).encode("utf-8")
     try:
         req = urllib.request.Request(
             f"{runner_url}/validate_manifest",
@@ -2120,6 +2191,12 @@ def _runtime_preflight_with_fix(manifest_dict, max_attempts=2):
     to ``max_attempts`` times. Mutates manifest_dict['code_b64'] on success.
 
     Returns (valid: bool, error_msg: str, fix_count: int).
+
+    DSL manifests (logic_spec, no code_b64) never enter the fix loop
+    (issue #99): the compiled code is a deterministic function of the spec,
+    so an LLM rewrite of it would silently diverge from the DSL the review
+    loop reads.  A runtime failure there means the spec itself is broken —
+    report it, drop the manifest.
     """
     name = manifest_dict.get("name", "?")
     valid, err, tb = _runtime_preflight_manifest(manifest_dict)
@@ -2129,6 +2206,9 @@ def _runtime_preflight_with_fix(manifest_dict, max_attempts=2):
         return True, "", 0
     if valid:
         return True, "", 0
+    if manifest_dict.get("logic_spec") is not None and not manifest_dict.get("code_b64"):
+        # DSL path — no LLM rewrite; the spec is the source of truth.
+        return False, f"logic_spec runtime failure: {err}", 0
 
     try:
         source = base64.b64decode(manifest_dict.get("code_b64", "")).decode("utf-8", errors="replace")
@@ -2183,11 +2263,30 @@ def _syntax_preflight_with_fix(manifest_dict, max_attempts=3):
 
 
 def _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
-                          selection_reasoning, manifest_dicts, fallback_used=False):
-    """Save full audit trail for v3 (manifest-emitting) ideation."""
+                          selection_reasoning, manifest_dicts, fallback_used=False,
+                          n_accepted=None, proposal_outcomes=None):
+    """Save full audit trail for v3 (manifest-emitting) ideation.
+
+    Issue #100: ``n_accepted`` (entries actually added to the backlog) and
+    ``proposal_outcomes`` (per-manifest preflight fate) are persisted so the
+    delivery layer can distinguish "proposed" from "actually entered the
+    backlog" without reading stdout. ``n_proposed`` counts manifests BEFORE
+    preflight drops them; historically only it was persisted, so delivered
+    "発行 N" headlines contradicted the run's own manifest_count=0.
+    """
     _IDEATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log_path = _IDEATION_LOG_DIR / f"{timestamp}_v3.json"
+
+    stage3 = {
+        "reasoning": selection_reasoning,
+        "n_proposed": len(manifest_dicts),
+        "fallback_used": fallback_used,
+    }
+    if n_accepted is not None:
+        stage3["n_accepted"] = n_accepted
+    if proposal_outcomes is not None:
+        stage3["proposals"] = proposal_outcomes
 
     log = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -2201,11 +2300,7 @@ def _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_rep
             "quant_report": quant_report,
             "judge_report": judge_report,
         },
-        "stage3_selection": {
-            "reasoning": selection_reasoning,
-            "n_proposed": len(manifest_dicts),
-            "fallback_used": fallback_used,
-        },
+        "stage3_selection": stage3,
         "final_proposals": manifest_dicts,
     }
 
@@ -2310,6 +2405,19 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
     pf_passed = 0
     pf_skipped = 0
     manifest_dicts = []
+    # Issue #100: per-manifest preflight fate, persisted to the ideation log so
+    # the delivery layer can tell "proposed" from "actually entered the backlog".
+    proposal_outcomes = []
+
+    def _record_outcome(i, name, mode, status, accepted_flag, reason=""):
+        proposal_outcomes.append({
+            "index": i,
+            "name": name,
+            "execution_mode": mode,
+            "preflight_status": status,
+            "accepted": accepted_flag,
+            "reason": reason,
+        })
 
     for i, manifest in enumerate(manifests):
         manifest_dict = manifest.to_dict()
@@ -2326,6 +2434,7 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
             print(f"  🔧 Manifest {i+1} '{manifest_name}': syntax fixed after {_syn_fix_n} attempt(s)")
         if not syn_valid:
             print(f"  🚫 Manifest {i+1} '{manifest_name}': syntax preflight FAILED — {syn_err}")
+            _record_outcome(i, manifest_name, execution_mode, "syntax_preflight_failed", False, syn_err)
             continue
 
         # ── Stage B: runtime preflight (synthetic execution) with fix-retry ──
@@ -2337,6 +2446,7 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
             print(f"  🔧 Manifest {i+1} '{manifest_name}': runtime fixed after {_rt_fix_n} attempt(s)")
         if not rt_valid:
             print(f"  🚫 Manifest {i+1} '{manifest_name}': runtime preflight FAILED — {rt_err[:120]}")
+            _record_outcome(i, manifest_name, execution_mode, "runtime_preflight_failed", False, rt_err[:120])
             continue
 
         # ── Legacy structured full-preflight kept as belt-and-suspenders ──
@@ -2349,6 +2459,7 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
                 print(f"  ✅ Manifest {i+1} '{manifest_name}': structured preflight passed")
             else:
                 print(f"  🚫 Manifest {i+1} '{manifest_name}': structured preflight FAILED — {error}")
+                _record_outcome(i, manifest_name, execution_mode, "structured_preflight_failed", False, error)
                 continue
         else:
             print(f"  ✅ Manifest {i+1} '{manifest_name}' (expert): syntax+runtime preflight passed")
@@ -2371,14 +2482,18 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
         if dry_run:
             entry["id"] = f"dry_v3_{i}"
             accepted.append(entry)
+            _record_outcome(i, manifest_name, execution_mode, "passed", True)
             print(f"  [DRY-RUN] manifest | {manifest_name} | execution_mode={execution_mode} | priority={entry['priority']:.2f}")
         else:
             ok_add, result_id = backlog.add_entry(entry)
             if ok_add:
                 accepted.append(entry)
                 entry["id"] = result_id
+                _record_outcome(i, manifest_name, execution_mode, "passed", True)
                 print(f"  ✅ manifest | {manifest_name} | execution_mode={execution_mode} | priority={entry['priority']:.2f}")
             else:
+                _record_outcome(i, manifest_name, execution_mode, "duplicate", False,
+                                f"duplicate of entry {result_id}")
                 print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
 
     # ── Observability ──
@@ -2389,7 +2504,8 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
     try:
         _save_ideation_log_v3(brainstorm_ideas, risk_report, quant_report, judge_report,
                               f"Selected {len(manifests)} from {n_survived} survivors",
-                              manifest_dicts, fallback_used=select_fallback_used)
+                              manifest_dicts, fallback_used=select_fallback_used,
+                              n_accepted=len(accepted), proposal_outcomes=proposal_outcomes)
     except Exception as e:
         print(f"⚠️  Failed to save ideation log: {e}", file=sys.stderr)
 
@@ -2403,7 +2519,12 @@ def _run_ideation_v3(knowledge, templates, research_docs, backlog, max_proposals
     n_accepted = len(accepted)
     n_structured = sum(1 for m in manifests if m.execution_mode == "structured")
     n_expert = sum(1 for m in manifests if m.execution_mode == "expert")
-    print(f"IDEATION_V3 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={len(manifests)} manifest_count={n_accepted}")
+    print(f"IDEATION_V3 brainstormed={len(brainstorm_ideas)} survived={n_survived} proposed={len(manifests)} manifest_count={n_accepted} accepted={n_accepted}")
+    # Issue #100: machine-readable marker — a cycle that proposed manifests but
+    # issued zero (all dropped by preflight / dedup) must be distinguishable
+    # from a legitimately empty cycle without reading prose.
+    if len(manifests) > 0 and n_accepted == 0:
+        print("ISSUANCE_FULL_FAILURE proposed=%d accepted=0" % len(manifests))
     if n_structured > 0 or n_expert > 0:
         print(f"PREFLIGHT passed={pf_passed} skipped={pf_skipped}")
     print(f"  structured={n_structured} expert={n_expert}")
@@ -2601,6 +2722,10 @@ def run(max_proposals=5, dry_run=False):
                 print(f"  ⚠️  Duplicate (spec matches entry {result_id}), skipped")
 
     print(f"\n📊 Accepted: {len(accepted)}/{len(proposals)} proposals")
+
+    # Issue #100: machine-readable marker for full-issuance-failure cycles.
+    if len(proposals) > 0 and len(accepted) == 0:
+        print("ISSUANCE_FULL_FAILURE proposed=%d accepted=0" % len(proposals))
 
     # Preflight summary line (machine-greppable)
     n_code_proposals = sum(1 for p in proposals if p.get("type") == "code")
