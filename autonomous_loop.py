@@ -178,6 +178,12 @@ def _knowledge_lock_path():
     return KNOWLEDGE_FILE.with_name(KNOWLEDGE_FILE.name + ".lock")
 
 
+# Issue #116: track load-time baseline per knowledge object so save_knowledge
+# can compute a delta and merge it into the current disk state, preventing
+# lost-update races when concurrent writers overlap.
+_KNOWLEDGE_BASELINES = {}  # id(knowledge_dict) -> baseline snapshot
+
+
 def _atomic_write_knowledge(data):
     """Serialize + atomically replace knowledge.json under an exclusive lock.
 
@@ -187,7 +193,10 @@ def _atomic_write_knowledge(data):
     observing a half-written file). Mirrors backlog.py's flock discipline.
     """
     KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, default=str)
+    # Issue #117: sanitize NaN/Inf to null before serialization so strict
+    # parsers (jq, JS JSON.parse) accept the file.
+    _sanitized = _sanitize_non_finite(data)
+    payload = json.dumps(_sanitized, indent=2, default=str)
     lock_path = _knowledge_lock_path()
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -199,16 +208,222 @@ def _atomic_write_knowledge(data):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
+def _sanitize_non_finite(obj):
+    """Recursively replace NaN/±Inf floats with None (JSON null).
+
+    Issue #117: json.dumps emits bare NaN/Infinity tokens by default, which
+    violate the JSON spec and break strict parsers. This pass converts them
+    to null at the serialization boundary.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_non_finite(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+
+def _merge_knowledge_delta(baseline, current, disk):
+    """Merge changes from baseline→current into disk state.
+
+    For list keys (tested, adopted, rejected, reviews, etc.): append items
+    that are in current but not in baseline.
+    For dict keys (families, review_state): deep-merge per-key changes.
+    For scalar keys (iterations, last_review_at): use current's value if it
+    differs from baseline.
+
+    Issue #116: prevents lost-update when two writers load concurrently,
+    each modifies different parts, then each saves.
+    """
+    result = copy.deepcopy(disk)
+    
+    # List keys: append new items from current that aren't in baseline
+    # For 'adopted' list, also merge in-place changes by matching on 'id'
+    for key in ["tested", "tested_combinations", "adopted", "rejected",
+                "superseded", "reviews", "errors", "run_stats",
+                "near_misses", "near_misses_cross"]:
+        base_list = baseline.get(key, [])
+        curr_list = current.get(key, [])
+        # Only process if the key exists in at least one of baseline/current/disk
+        if key not in baseline and key not in current and key not in result:
+            continue
+        disk_list = result.get(key, [])
+        
+        # For 'adopted' list, handle in-place modifications by id FIRST
+        # to avoid treating modified items as "new"
+        if key == "adopted":
+            base_by_id = {item.get("id"): item for item in base_list if "id" in item}
+            curr_by_id = {item.get("id"): item for item in curr_list if "id" in item}
+            disk_by_id = {item.get("id"): i for i, item in enumerate(disk_list) if "id" in item}
+            
+            # Track which item_ids we've handled via id-merge
+            handled_ids = set()
+            
+            for item_id, curr_item in curr_by_id.items():
+                if item_id in base_by_id:
+                    base_item = base_by_id[item_id]
+                    # Check if item changed
+                    if json.dumps(curr_item, sort_keys=True, default=str) != json.dumps(base_item, sort_keys=True, default=str):
+                        # Item was modified — merge into disk if it exists there
+                        if item_id in disk_by_id:
+                            disk_idx = disk_by_id[item_id]
+                            # Deep merge: update nested dicts/lists from current
+                            _deep_merge_dict(disk_list[disk_idx], curr_item, base_item)
+                            handled_ids.add(item_id)
+            
+            # Now compute truly new items (those with ids not in baseline)
+            base_set = set(json.dumps(item, sort_keys=True, default=str) for item in base_list)
+            new_items = [
+                item for item in curr_list
+                if item.get("id") not in base_by_id  # Truly new (no id match in baseline)
+                and json.dumps(item, sort_keys=True, default=str) not in base_set
+            ]
+        else:
+            # For other list keys, compute new items normally
+            base_set = set(json.dumps(item, sort_keys=True, default=str) for item in base_list)
+            new_items = [
+                item for item in curr_list
+                if json.dumps(item, sort_keys=True, default=str) not in base_set
+            ]
+        
+        # Append new items to disk state (avoid duplicates already in disk)
+        disk_set = set(json.dumps(item, sort_keys=True, default=str) for item in disk_list)
+        for item in new_items:
+            item_key = json.dumps(item, sort_keys=True, default=str)
+            if item_key not in disk_set:
+                disk_list.append(item)
+                disk_set.add(item_key)
+        
+        result[key] = disk_list
+    
+    # Dict keys: merge per-key changes
+    for key in ["families", "review_state"]:
+        # Only process if the key exists in baseline or current
+        if key not in baseline and key not in current:
+            continue
+        base_dict = baseline.get(key, {})
+        curr_dict = current.get(key, {})
+        disk_dict = result.setdefault(key, {})
+        
+        # New keys in current that weren't in baseline
+        for k, v in curr_dict.items():
+            if k not in base_dict:
+                disk_dict[k] = copy.deepcopy(v)
+            elif k in disk_dict and json.dumps(v, sort_keys=True, default=str) != json.dumps(base_dict[k], sort_keys=True, default=str):
+                # Key exists in baseline and changed in current — merge recursively if dict
+                if isinstance(v, dict) and isinstance(disk_dict[k], dict):
+                    _deep_merge_dicts(disk_dict[k], v, base_dict[k])
+                else:
+                    disk_dict[k] = copy.deepcopy(v)
+            elif k not in disk_dict:
+                # Key was deleted from disk but changed in current — add it
+                disk_dict[k] = copy.deepcopy(v)
+    
+    # Scalar keys: use current if changed from baseline
+    for key in ["iterations", "last_run_stats"]:
+        base_val = baseline.get(key)
+        curr_val = current.get(key)
+        if curr_val != base_val:
+            result[key] = copy.deepcopy(curr_val)
+    
+    return result
+
+
+def _deep_merge_dicts(disk_dict, curr_dict, base_dict):
+    """Merge changes from base→curr into disk (dict case).
+    
+    For nested dicts, recurse. For lists, append new items.
+    For scalars, use curr if it differs from base.
+    """
+    for k, curr_val in curr_dict.items():
+        if k not in base_dict:
+            # New key in current
+            disk_dict[k] = copy.deepcopy(curr_val)
+        else:
+            base_val = base_dict[k]
+            if json.dumps(curr_val, sort_keys=True, default=str) == json.dumps(base_val, sort_keys=True, default=str):
+                # No change in current, keep disk as-is
+                continue
+            # Current changed from base
+            if isinstance(curr_val, dict) and k in disk_dict and isinstance(disk_dict[k], dict):
+                _deep_merge_dicts(disk_dict[k], curr_val, base_val)
+            elif isinstance(curr_val, list) and k in disk_dict and isinstance(disk_dict[k], list):
+                # Append new items from curr that aren't in base
+                base_set = set(json.dumps(item, sort_keys=True, default=str) for item in base_val)
+                disk_set = set(json.dumps(item, sort_keys=True, default=str) for item in disk_dict[k])
+                for item in curr_val:
+                    item_key = json.dumps(item, sort_keys=True, default=str)
+                    if item_key not in base_set and item_key not in disk_set:
+                        disk_dict[k].append(item)
+                        disk_set.add(item_key)
+            else:
+                # Scalar or type mismatch — use current
+                disk_dict[k] = copy.deepcopy(curr_val)
+
+
+def _deep_merge_dict(disk_item, curr_item, base_item):
+    """Merge changes from base→curr into a single disk item (dict case)."""
+    if isinstance(disk_item, dict) and isinstance(curr_item, dict):
+        _deep_merge_dicts(disk_item, curr_item, base_item)
+    else:
+        # Non-dict item, just replace
+        pass
+
+
 def save_knowledge(knowledge):
-    """ナレッジベースを更新 (issue #96: locked + atomic, no truncated/interleaved writes)"""
-    _atomic_write_knowledge(knowledge)
+    """ナレッジベースを更新 (issue #116: delta-merge to prevent lost-update races).
+    
+    Computes the delta between the caller's current state and the baseline
+    captured at load time, then merges only that delta into the current disk
+    state. This ensures concurrent writers don't clobber each other's changes.
+    """
+    # Issue #116: if we have a baseline, merge the delta into disk state
+    baseline = _KNOWLEDGE_BASELINES.get(id(knowledge))
+    if baseline is not None:
+        # Hold exclusive lock through the entire read-merge-write cycle
+        KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = _knowledge_lock_path()
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                # Read current disk state under exclusive lock
+                if KNOWLEDGE_FILE.exists():
+                    disk_state = json.loads(KNOWLEDGE_FILE.read_text())
+                else:
+                    disk_state = {
+                        "tested": [], "tested_combinations": [], "adopted": [],
+                        "rejected": [], "superseded": [], "families": {},
+                        "iterations": 0, "errors": [],
+                    }
+                # Merge caller's delta into disk state
+                merged = _merge_knowledge_delta(baseline, knowledge, disk_state)
+                # Serialize + write atomically while still holding the lock
+                _sanitized = _sanitize_non_finite(merged)
+                payload = json.dumps(_sanitized, indent=2, default=str)
+                tmp_path = KNOWLEDGE_FILE.with_name(KNOWLEDGE_FILE.name + ".tmp")
+                tmp_path.write_text(payload)
+                os.replace(tmp_path, KNOWLEDGE_FILE)
+                # Update baseline to current state (so next save sees no delta)
+                _KNOWLEDGE_BASELINES[id(knowledge)] = copy.deepcopy(knowledge)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    else:
+        # No baseline (e.g., knowledge dict created outside load_knowledge)
+        # Fall back to direct write (old behavior)
+        _atomic_write_knowledge(knowledge)
 
 
 def load_knowledge():
-    """過去の戦略テスト結果を読み込む (issue #96: shared lock during read)"""
+    """過去の戦略テスト結果を読み込む (issue #116: captures baseline for delta-merge on save)"""
     if not KNOWLEDGE_FILE.exists():
-        return {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
+        data = {"tested": [], "tested_combinations": [], "adopted": [], "rejected": [],
                 "superseded": [], "families": {}, "iterations": 0, "errors": []}
+        _KNOWLEDGE_BASELINES[id(data)] = copy.deepcopy(data)
+        return data
     lock_path = _knowledge_lock_path()
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
@@ -265,6 +480,10 @@ def load_knowledge():
             if fam.get("best_params"):
                 fam["param_clusters"].append(fam["best_params"])
                 fam["distinct_clusters"] = 1
+
+    # Issue #116: capture baseline AFTER migrations so migration-added keys
+    # don't appear as deltas on subsequent save_knowledge calls
+    _KNOWLEDGE_BASELINES[id(data)] = copy.deepcopy(data)
 
     return data
 
